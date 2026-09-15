@@ -16,6 +16,7 @@ function App() {
   const [search, setSearch] = useState('')
   const [menu, setMenu] = useState(false)
   const [auth, setAuth] = useState<'login' | 'register' | null>(null)
+  const [uploadOpen, setUploadOpen] = useState(false)
 
   const bg = dark ? 'bg-[#090b10] text-white' : 'bg-[#f7f8fa] text-slate-900'
   const panel = dark ? 'bg-white/[.055] border-white/10' : 'bg-white border-slate-200 shadow-sm'
@@ -38,7 +39,7 @@ function App() {
             <Search size={18} className="opacity-50"/>
             <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Rechercher une vidéo..." className="w-full bg-transparent px-3 py-2.5 text-sm outline-none"/>
           </div>
-          <button className="rounded-xl p-2 hover:bg-white/10"><Upload size={20}/></button>
+          <button onClick={()=>setUploadOpen(true)} className="rounded-xl p-2 hover:bg-white/10" aria-label="Uploader une vidéo"><Upload size={20}/></button>
           <button className="rounded-xl p-2 hover:bg-white/10"><Bell size={20}/></button>
           <button onClick={()=>setDark(!dark)} className="rounded-xl p-2 hover:bg-white/10" aria-label="Theme">
             {dark ? <Sun size={20}/> : <Moon size={20}/>}
@@ -101,6 +102,7 @@ function App() {
       </div>
 
       {auth && <AuthModal type={auth} onClose={()=>setAuth(null)} onSwitch={()=>setAuth(auth==='login'?'register':'login')} dark={dark}/>}
+      {uploadOpen && <UploadModal onClose={()=>setUploadOpen(false)} dark={dark}/>}
     </div>
   )
 }
@@ -124,3 +126,43 @@ function AuthModal({type,onClose,onSwitch,dark}:{type:'login'|'register',onClose
 }
 
 export default App
+
+
+function UploadModal({onClose,dark}:{onClose:()=>void,dark:boolean}) {
+  const [fileName,setFileName]=useState('')
+  const [title,setTitle]=useState('')
+  const [description,setDescription]=useState('')
+  const [category,setCategory]=useState('Général')
+  const [message,setMessage]=useState('')
+
+  function submit(e:React.FormEvent){
+    e.preventDefault()
+    if(!fileName || !title.trim()){ setMessage('Sélectionnez une vidéo et renseignez son titre.'); return }
+    setMessage('Formulaire prêt. Connectez Supabase Storage pour publier réellement la vidéo.')
+  }
+
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-md">
+    <form onSubmit={submit} className={`w-full max-w-xl rounded-3xl border p-6 shadow-2xl ${dark?'bg-[#11141b] border-white/10':'bg-white border-slate-200'}`}>
+      <div className="flex items-start justify-between">
+        <div><p className="text-xs font-bold uppercase tracking-[.18em] text-orange-500">Creator Studio</p><h2 className="mt-1 text-2xl font-black">Publier une vidéo</h2></div>
+        <button type="button" onClick={onClose} className="rounded-xl p-2 hover:bg-white/10"><X size={20}/></button>
+      </div>
+      <div className="mt-6 space-y-4">
+        <label className="block rounded-2xl border border-dashed border-orange-500/50 p-6 text-center">
+          <Upload className="mx-auto mb-2 text-orange-500"/>
+          <span className="block text-sm font-bold">Choisir une vidéo</span>
+          <span className="mt-1 block text-xs opacity-60">MP4, WebM ou MOV</span>
+          <input type="file" accept="video/*" className="mt-4 block w-full text-sm" onChange={e=>setFileName(e.target.files?.[0]?.name||'')}/>
+          {fileName && <p className="mt-2 text-xs text-orange-500">{fileName}</p>}
+        </label>
+        <input required value={title} onChange={e=>setTitle(e.target.value)} placeholder="Titre de la vidéo" className="w-full rounded-xl border border-white/10 bg-black/10 px-4 py-3 outline-none focus:border-orange-500"/>
+        <textarea value={description} onChange={e=>setDescription(e.target.value)} placeholder="Description" rows={3} className="w-full rounded-xl border border-white/10 bg-black/10 px-4 py-3 outline-none focus:border-orange-500"/>
+        <select value={category} onChange={e=>setCategory(e.target.value)} className="w-full rounded-xl border border-white/10 bg-black/10 px-4 py-3 outline-none">
+          <option>Général</option><option>Musique</option><option>Éducation</option><option>Divertissement</option><option>Sport</option><option>Actualités</option>
+        </select>
+        {message && <p className="rounded-xl bg-orange-500/10 p-3 text-sm text-orange-500">{message}</p>}
+        <button className="w-full rounded-xl bg-orange-500 py-3 font-bold text-white">Préparer la publication</button>
+      </div>
+    </form>
+  </div>
+}
