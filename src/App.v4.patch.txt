@@ -1,0 +1,17 @@
+Integration notes:
+1. In src/App.tsx add:
+   import CreatorStudio from './components/CreatorStudio'
+   import ProfilePanel from './components/ProfilePanel'
+2. Add state:
+   const [studioOpen,setStudioOpen] = useState(false)
+   const [profileOpen,setProfileOpen] = useState(false)
+3. On your Creator Studio button:
+   onClick={() => setStudioOpen(true)}
+4. On your Profile button:
+   onClick={() => setProfileOpen(true)}
+5. Near the end of the returned JSX:
+   {studioOpen && <CreatorStudio onClose={() => setStudioOpen(false)} />}
+   {profileOpen && <ProfilePanel onClose={() => setProfileOpen(false)} />}
+6. For video playback, after a successful open, call:
+   await supabase.rpc('increment_video_view', { video_id: video.id })
+   This is atomic and avoids client-side read/write races.
