@@ -1,26 +1,24 @@
-# TafaTube v4 — Profile + Creator Studio
+# TafaTube v5 — Engagement + Realtime
 
-This package adds the real profile system and creator dashboard on top of v3.
+## Real features
+- Likes/unlikes
+- Comments CRUD foundations
+- Share tracking + copy link
+- Subscribe/unsubscribe to creators
+- Live Realtime refresh for likes/comments/shares/subscriptions
+- RLS for all engagement tables
+- Atomic/derived engagement counts via RPC
 
-## Included
-- `profiles` table linked to Supabase Auth
-- automatic profile creation trigger
-- profile RLS
-- real profile loading/updating
-- avatar upload to `avatars` bucket
-- Creator Studio
-- My Videos list
-- edit title/description/category/visibility
-- delete video + storage file
-- view counter RPC
-- dashboard statistics
-- owner-only management policies
+## Install
+1. Keep v1-v4 as the base.
+2. Add `src/engagement.ts`.
+3. Add `src/components/EngagementPanel.tsx`.
+4. Run `supabase/004_engagement_realtime.sql`.
+5. Import `EngagementPanel` into the video player/detail view:
+   `<EngagementPanel videoId={video.id} channelId={video.owner_id} />`
 
-## Setup
-1. Keep the v3 project as the base.
-2. Replace/add the files from this ZIP.
-3. Run `supabase/003_profiles_creator_studio.sql` in Supabase SQL Editor.
-4. Refresh the app.
+## Realtime
+The SQL adds the four tables to `supabase_realtime`. The component subscribes only to the current video's events and the current creator's subscription events.
 
-### Important
-The SQL creates the `profiles` table and an `avatars` storage bucket. It does not remove existing tables.
+## Security
+A user can only create/delete their own like/subscription/share/comment. Public reading is enabled for engagement data. Database policies remain the authority; client-side checks are only UX.
