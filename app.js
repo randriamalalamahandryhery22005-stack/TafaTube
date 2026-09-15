@@ -1,0 +1,9427 @@
+
+/* ============================================================
+   TAFAß V53.1 — SINGLE VERSION / DUPLICATE GUARD
+   Keep one active frontend build and prevent repeated patch mounts.
+   This is client-side cache/build hygiene only; Supabase remains
+   the authority for data and RLS.
+============================================================ */
+(() => {
+  "use strict";
+  const BUILD_ID = "TAFAß-V85";
+  const BUILD_KEY = "tafa_active_build";
+  const previous = String(localStorage.getItem(BUILD_KEY) || "");
+  if (previous !== BUILD_ID) {
+    localStorage.setItem(BUILD_KEY, BUILD_ID);
+    // Remove legacy app caches left by older service-worker builds.
+    if (window.caches?.keys) {
+      caches.keys().then(keys => Promise.all(
+        keys.filter(k => /^tafass-v/i.test(k) && k !== "tafass-v83-production-core").map(k => caches.delete(k))
+      )).catch(() => {});
+    }
+  }
+  // One-time DOM de-duplication for accidentally duplicated static assets.
+  const dedupe = (selector, keep = "first") => {
+    const nodes = [...document.querySelectorAll(selector)];
+    if (nodes.length <= 1) return;
+    const ordered = keep === "last" ? nodes.reverse() : nodes;
+    ordered.slice(1).forEach(n => n.remove());
+  };
+  dedupe('link[rel="stylesheet"][href*="style.css"]', "last");
+  dedupe('script[src*="app.js"]', "last");
+  window.__TAFA_SINGLE_BUILD__ = BUILD_ID;
+})();
+
+document.documentElement.classList.add("app-boot");
+(() => {
+  "use strict";
+
+  const SUPABASE_URL = "https://qvxmaeepwrprtoaipoir.supabase.co";
+  const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_OxmDXLn69jclSWnYtdjsxQ_TMfMI4X-";
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+  });
+
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));
+  const routes = ["home","friends","search","messages","notifications","profile","reels","groups","saved","menu","tafab","events","studio","settings","creator","ai","music","business","admin","verification"];
+
+  // V19 production upload guard: client-side validation is UX protection only;
+  // Supabase Storage policies/server-side validation must remain the authority.
+  const UPLOAD_LIMITS = Object.freeze({ imageBytes: 20 * 1024 * 1024, videoBytes: 150 * 1024 * 1024 });
+  function validateMediaFile(file) {
+    if (!file) return { ok: true };
+    const type = String(file.type || "").toLowerCase();
+    const isImage = type.startsWith("image/");
+    const isVideo = type.startsWith("video/");
+    if (!isImage && !isVideo) return { ok: false, message: "Format non pris en charge. Utilisez une image ou une vidéo." };
+    const max = isImage ? UPLOAD_LIMITS.imageBytes : UPLOAD_LIMITS.videoBytes;
+    if (Number(file.size || 0) > max) return { ok: false, message: `Fichier trop volumineux. Limite : ${isImage ? "20 Mo" : "150 Mo"}.` };
+    return { ok: true };
+  }
+  async function uploadPostMedia(path, file, options = {}) {
+    const check = validateMediaFile(file);
+    if (!check.ok) return { data: null, error: new Error(check.message) };
+    return sb.storage.from("posts").upload(path, file, { upsert: false, ...options, contentType: options.contentType || file.type || undefined });
+  }
+  const state = {
+    voiceDraft: null,
+    voicePreviewUrl: null,
+    user: null, profile: null, route: "home", navStack: ["home"], backOverride: null, posts: [], friends: [], stories: [],
+    channel: null, theme: "dark", entering: false, loggingOut: false, composerOpen: false, composerBackground: "plain", composerLocation: "",
+    composerDraftText: "", composerFile: null, composerVisibility: "public", composerMeta: {}, profileWallOwnerId:null, profileWallRequireApproval:true, profileWallRows:[],
+    liveFeedChannel: null, conversationChannel: null, presenceChannel: null, activeLive: null, adminDashboardChannel:null, adminDashboardTimer:null, adminDashboardRefreshing:false, adminDashboardRefreshTimer:null,
+    profileTab: "posts", reactionSettingsCache:new Map(), locationWatchId:null, timeLimitRuntime:null, timeLimitTimer:null, timeLimitOverlay:null, friendsTab: "suggestions", pagesTab: "mine", groupsTab: "mine", groupSort: "recent", selectedConversation: null, viewingProfileId: null, renderToken: 0, activePage: null, entityBackRoute: null, pushLoginPromptOpen:false
+  };
+
+  // Production network/realtime guard: keeps the UI honest when connectivity changes.
+  const realtimeRuntime = { retryTimer:null, retryCount:0, lastStatus:"", reconnecting:false };
+
+
+  // Tafaß V86.2 — Premium Web Push activation.
+  // Permission is requested only from an explicit user action. Existing
+  // granted subscriptions are refreshed silently after authentication.
+  const TAFA_PUSH_VAPID_PUBLIC_KEY = "BDKj0LueFYNPlQdnGr_IE0slPUgHwgkPvNwP_1zxmZOGYMj9t20upWUtHVaK_z5LGBXy77p8oXdiY4Tkd4osEMs";
+  function tafaBase64ToUint8Array(base64String){
+    const padding="=".repeat((4-(base64String.length%4))%4);
+    const base64=(base64String+padding).replace(/-/g,"+").replace(/_/g,"/");
+    const raw=atob(base64);
+    return Uint8Array.from([...raw].map(c=>c.charCodeAt(0)));
+  }
+  async function setupTafaPushNotifications({requestPermission=false}={}){
+    try{
+      if(!state.user) return {ok:false,reason:"no_user",message:"Session introuvable."};
+      if(!window.isSecureContext && location.hostname!=="localhost") return {ok:false,reason:"insecure",message:"Les notifications sécurisées nécessitent HTTPS."};
+      if(!("serviceWorker" in navigator)) return {ok:false,reason:"no_service_worker",message:"Le navigateur ne prend pas en charge les notifications en arrière-plan."};
+      if(!("PushManager" in window)) return {ok:false,reason:"no_push",message:"Les notifications Push ne sont pas disponibles dans ce navigateur."};
+      if(!("Notification" in window)) return {ok:false,reason:"no_notification",message:"Les notifications système ne sont pas disponibles sur cet appareil."};
+
+      let permission=Notification.permission;
+      if(permission==="default" && requestPermission){
+        permission=await Notification.requestPermission();
+      }
+      if(permission!=="granted"){
+        return {ok:false,reason:permission==="denied"?"denied":"permission_pending",message:permission==="denied"?"Les notifications sont bloquées. Autorisez-les dans les paramètres du navigateur pour Tafaß.":"Autorisation des notifications en attente."};
+      }
+
+      let registration=await navigator.serviceWorker.getRegistration("./");
+      if(!registration) registration=await navigator.serviceWorker.register("sw.js",{scope:"./"});
+      await navigator.serviceWorker.ready;
+      registration=await navigator.serviceWorker.getRegistration("./") || registration;
+
+      let subscription=await registration.pushManager.getSubscription();
+      if(!subscription){
+        subscription=await registration.pushManager.subscribe({
+          userVisibleOnly:true,
+          applicationServerKey:tafaBase64ToUint8Array(TAFA_PUSH_VAPID_PUBLIC_KEY)
+        });
+      }
+      const j=subscription.toJSON();
+      if(!j.endpoint || !j.keys?.p256dh || !j.keys?.auth) return {ok:false,reason:"invalid_subscription",message:"La souscription Push est incomplète."};
+      const {error}=await sb.from("push_subscriptions").upsert({
+        user_id:state.user.id,
+        endpoint:j.endpoint,
+        p256dh:j.keys.p256dh,
+        auth:j.keys.auth,
+        user_agent:navigator.userAgent.slice(0,500),
+        updated_at:new Date().toISOString()
+      },{onConflict:"user_id,endpoint"});
+      if(error) return {ok:false,reason:"database",message:error.message};
+      return {ok:true,subscription};
+    }catch(e){
+      console.warn("Tafaß push setup:",e?.message||e);
+      return {ok:false,reason:"exception",message:e?.message||"Impossible d'activer les notifications sur cet appareil."};
+    }
+  }
+  function closeLoginPushPrompt(){
+    document.getElementById("tafaLoginPushPrompt")?.remove();
+    state.pushLoginPromptOpen=false;
+  }
+  function showLoginPushPrompt(){
+    if(!state.user || document.getElementById("tafaLoginPushPrompt")) return;
+    if(!("Notification" in window)) return;
+    // Do not interrupt users who already granted notifications.
+    if(Notification.permission==="granted") return;
+    const o=document.createElement("div");
+    o.id="tafaLoginPushPrompt";
+    o.className="tafa-login-push-overlay";
+    o.innerHTML=`<div class="tafa-login-push-card" role="dialog" aria-modal="true" aria-labelledby="tafaLoginPushTitle">
+      <div class="tafa-login-push-icon" aria-hidden="true">♢</div>
+      <span class="eyebrow">TAFAß • NOTIFICATIONS</span>
+      <h2 id="tafaLoginPushTitle">Ne manquez plus rien</h2>
+      <p>Activez les notifications Tafaß pour recevoir immédiatement les messages, réactions, commentaires, demandes d’amis et autres alertes, même lorsque l’application est en arrière-plan.</p>
+      <div class="tafa-login-push-benefits">
+        <div><span>✓</span><b>Messages en temps réel</b></div>
+        <div><span>✓</span><b>Réactions et commentaires</b></div>
+        <div><span>✓</span><b>Demandes et alertes importantes</b></div>
+      </div>
+      <div class="tafa-login-push-status" id="tafaLoginPushStatus"></div>
+      <button type="button" class="primary big tafa-login-push-enable" data-action="enable-push-notifications">Activer les notifications</button>
+      <button type="button" class="tafa-login-push-later" data-action="skip-login-push">Continuer sans activer</button>
+      <small class="tafa-login-push-note">Une fenêtre d’autorisation Android/navigateur peut apparaître. Appuyez simplement sur « Autoriser ».</small>
+    </div>`;
+    document.body.appendChild(o);
+    state.pushLoginPromptOpen=true;
+  }
+  async function enableTafaPushNotifications(){
+    const btn=document.querySelector('[data-action="enable-push-notifications"]');
+    const status=document.getElementById("tafaLoginPushStatus");
+    if(btn){btn.disabled=true;btn.classList.add("is-loading");btn.setAttribute("aria-busy","true");}
+    if(status) status.textContent="Activation des notifications…";
+    try{
+      const result=await setupTafaPushNotifications({requestPermission:true});
+      if(result.ok){
+        toast("Notifications activées sur cet appareil");
+        if(document.getElementById("tafaLoginPushPrompt")){
+          closeLoginPushPrompt();
+        }else{
+          return openAdvancedSetting("notifications-settings");
+        }
+        return;
+      }
+      if(result.reason==="denied"){
+        if(status) status.textContent="Les notifications sont bloquées. Ouvrez les paramètres du navigateur/appareil et autorisez Tafaß, puis revenez ici.";
+        toast("Notifications bloquées. Autorisez-les dans les paramètres, puis réessayez.");
+      }else{
+        if(status) status.textContent=result.message||"Impossible d'activer les notifications.";
+        toast(result.message||"Impossible d'activer les notifications.");
+      }
+    }finally{
+      if(btn){btn.disabled=false;btn.classList.remove("is-loading");btn.removeAttribute("aria-busy");}
+    }
+  }
+  async function removeTafaPushSubscription(){
+    try{
+      if(!state.user || !("serviceWorker" in navigator)) return;
+      const registration=await navigator.serviceWorker.ready;
+      const subscription=await registration.pushManager.getSubscription();
+      if(subscription?.endpoint) await sb.from("push_subscriptions").delete().eq("user_id",state.user.id).eq("endpoint",subscription.endpoint);
+    }catch(_){}
+  }
+  // Tafaß V84 notification audio: robust mobile/WebView sound engine.
+  // Client-side only: no Supabase schema/backend changes.
+  const notificationSound = {
+    ctx:null, master:null, unlocked:false, lastAt:0, cooldown:260, pending:[], pollTimer:null,
+    lastNotificationId:null, lastMessageId:null, initialized:false, lastNotificationCreatedAt:null, lastMessageCreatedAt:null
+  };
+  function ensureNotificationAudio(){
+    try{
+      const AC=window.AudioContext||window.webkitAudioContext;
+      if(!AC) return null;
+      if(!notificationSound.ctx){
+        notificationSound.ctx=new AC();
+        notificationSound.master=notificationSound.ctx.createGain();
+        notificationSound.master.gain.setValueAtTime(.28,notificationSound.ctx.currentTime);
+        notificationSound.master.connect(notificationSound.ctx.destination);
+      }
+      if(notificationSound.ctx.state==='suspended') notificationSound.ctx.resume().catch(()=>{});
+      notificationSound.unlocked=notificationSound.ctx.state==='running';
+      return notificationSound.ctx;
+    }catch(_){ return null; }
+  }
+  function unlockNotificationAudio(){
+    const ctx=ensureNotificationAudio();
+    if(!ctx)return;
+    try{
+      // Tiny silent oscillator makes the first AudioContext usable on Android WebView.
+      const o=ctx.createOscillator(), g=ctx.createGain();
+      g.gain.setValueAtTime(.00001,ctx.currentTime); o.connect(g).connect(ctx.destination);
+      o.start(); o.stop(ctx.currentTime+.015);
+    }catch(_){ }
+    if(notificationSound.pending.length){
+      const q=notificationSound.pending.splice(0,notificationSound.pending.length);
+      q.forEach(k=>setTimeout(()=>playNotificationSound(k),20));
+    }
+  }
+  function playNotificationSound(kind='notification', force=false){
+    const now=Date.now();
+    if(!force && now-notificationSound.lastAt<notificationSound.cooldown)return;
+    const ctx=ensureNotificationAudio();
+    if(!ctx || !notificationSound.master || ctx.state!=='running'){
+      if(notificationSound.pending.length<2) notificationSound.pending.push(kind);
+      return;
+    }
+    notificationSound.lastAt=now;
+    const patterns={
+      message:[{f:784,t:0,d:.12},{f:1046,t:.13,d:.18}],
+      call:[{f:659,t:0,d:.14},{f:880,t:.17,d:.14},{f:659,t:.35,d:.16},{f:880,t:.53,d:.14}],
+      friend:[{f:523,t:0,d:.12},{f:784,t:.14,d:.18}],
+      notification:[{f:659,t:0,d:.11},{f:880,t:.13,d:.18}]
+    };
+    const list=patterns[kind]||patterns.notification;
+    const start=ctx.currentTime+.01;
+    list.forEach(x=>{
+      const o=ctx.createOscillator(), g=ctx.createGain();
+      o.type='sine'; o.frequency.setValueAtTime(x.f,start+x.t);
+      g.gain.setValueAtTime(.0001,start+x.t);
+      g.gain.exponentialRampToValueAtTime(.62,start+x.t+.018);
+      g.gain.exponentialRampToValueAtTime(.0001,start+x.t+x.d);
+      o.connect(g).connect(notificationSound.master);
+      o.start(start+x.t); o.stop(start+x.t+x.d+.025);
+    });
+    try{ if(navigator.vibrate) navigator.vibrate(kind==='call'?[90,50,90]:45); }catch(_){ }
+  }
+  if(!window.__tafaNotificationAudioBound){
+    window.__tafaNotificationAudioBound=true;
+    ['pointerdown','touchstart','mousedown','keydown','click'].forEach(ev=>window.addEventListener(ev,unlockNotificationAudio,{passive:true}));
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState==='visible')ensureNotificationAudio();
+    });
+  }
+  // Fallback watcher: protects notification sounds on installations where a
+  // Realtime postgres channel is delayed/suspended. It only reads the user's
+  // own rows and never changes the database.
+  function startNotificationSoundFallback(){
+    if(notificationSound.pollTimer || !state.user)return;
+    const check=async()=>{
+      if(!state.user || !navigator.onLine)return;
+      try{
+        // Poll very frequently as a safety net for Android/WebView installs where
+        // Supabase Realtime can arrive late. Only the current user's rows are read.
+        const since=new Date(Date.now()-30000).toISOString();
+        const [nr,mr]=await Promise.all([
+          sb.from('notifications').select('id,type,actor_id,is_read,created_at,title,message,entity_type,entity_id').eq('user_id',state.user.id).gte('created_at',since).order('created_at',{ascending:false}).limit(10),
+          sb.from('messages').select('id,sender_id,recipient_id,is_read,created_at,conversation_id,content').eq('recipient_id',state.user.id).gte('created_at',since).order('created_at',{ascending:false}).limit(10)
+        ]);
+        const ns=(nr.data||[]).filter(x=>x.id && String(x.actor_id||'')!==String(state.user.id));
+        const ms=(mr.data||[]).filter(x=>x.id && String(x.sender_id||'')!==String(state.user.id));
+        const newestN=ns[0]||null, newestM=ms[0]||null;
+        const firstRun=!notificationSound.initialized;
+        if(firstRun){
+          notificationSound.initialized=true;
+          notificationSound.lastNotificationId=newestN?String(newestN.id):null;
+          notificationSound.lastNotificationCreatedAt=newestN?.created_at||null;
+          notificationSound.lastMessageId=newestM?String(newestM.id):null;
+          notificationSound.lastMessageCreatedAt=newestM?.created_at||null;
+          return;
+        }
+        if(newestN && String(newestN.id)!==String(notificationSound.lastNotificationId||'')){
+          notificationSound.lastNotificationId=String(newestN.id);
+          notificationSound.lastNotificationCreatedAt=newestN.created_at||null;
+          const t=String(newestN.type||'').toLowerCase();
+          playNotificationSound(/call|appel/.test(t)?'call':/friend|follow|request/.test(t)?'friend':'notification');
+          updateBadges();
+          if(state.route==='notifications') notificationsPage();
+          else if(newestN.title) toast(newestN.title);
+        }
+        if(newestM && String(newestM.id)!==String(notificationSound.lastMessageId||'')){
+          notificationSound.lastMessageId=String(newestM.id);
+          notificationSound.lastMessageCreatedAt=newestM.created_at||null;
+          playNotificationSound('message');
+          updateBadges();
+          if(state.route==='messages') state.selectedConversation ? openConversation(state.selectedConversation) : messagesPage();
+        }
+      }catch(_){ }
+    };
+    check();
+    notificationSound.pollTimer=setInterval(check,1200);
+  }
+  function networkBanner(message, mode="") {
+    // V73: no reconnect/offline banner is rendered over the application.
+    const el=$("networkStatus"); if(el){ el.hidden=true; el.className="network-status"; el.textContent=""; }
+  }
+  function scheduleRealtimeReconnect(){
+    if(!state.user || realtimeRuntime.retryTimer)return;
+    const delay=Math.min(30000,1000*Math.pow(2,Math.min(realtimeRuntime.retryCount,5)));
+    realtimeRuntime.retryCount++; realtimeRuntime.reconnecting=true;
+    networkBanner("");
+    realtimeRuntime.retryTimer=setTimeout(async()=>{
+      realtimeRuntime.retryTimer=null;
+      try{ await setupRealtime(); realtimeRuntime.retryCount=0; realtimeRuntime.reconnecting=false; networkBanner(""); }
+      catch(e){ console.warn("Tafaß realtime reconnect:",e); realtimeRuntime.reconnecting=false; scheduleRealtimeReconnect(); }
+    },delay);
+  }
+  function handleConnectivity(){
+    if(!navigator.onLine){ networkBanner("Hors connexion — vos données seront resynchronisées au retour du réseau.","offline"); return; }
+    if(state.user){ scheduleRealtimeReconnect(); } else networkBanner("");
+  }
+  window.addEventListener("offline",handleConnectivity);
+  window.addEventListener("online",()=>{ networkBanner(""); realtimeRuntime.retryCount=0; realtimeRuntime.reconnecting=false; if(state.user) setupRealtime().catch(()=>{}); });
+
+  // Mobile/PWA foreground recovery: Android may suspend sockets while the app is
+  // backgrounded. On return, verify the session and rebuild realtime channels
+  // without forcing a logout or resetting the current route/conversation.
+  let foregroundRecoveryTimer = null;
+  let presenceHeartbeatTimer = null;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || !state.user) return;
+    // V73: returning from background must never replace the current page with
+    // a reconnect/loading screen. Realtime is allowed to recover silently.
+    if (foregroundRecoveryTimer) clearTimeout(foregroundRecoveryTimer);
+    foregroundRecoveryTimer = setTimeout(() => {
+      foregroundRecoveryTimer = null;
+      sb.auth.getSession().then(({data}) => {
+        if (data?.session?.user) state.user = data.session.user;
+        if (state.user && navigator.onLine && !state.presenceChannel) setupRealtime().catch(()=>{});
+      }).catch(()=>{});
+    }, 0);
+  });
+
+  const DEFAULT_AVATAR = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%2319f58a'/%3E%3Cstop offset='.55' stop-color='%23088f52'/%3E%3Cstop offset='1' stop-color='%23ff9f1c'/%3E%3C/linearGradient%3E%3ClinearGradient id='h' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%23ffffff' stop-opacity='.9'/%3E%3Cstop offset='1' stop-color='%23dce8ff' stop-opacity='.7'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='256' height='256' rx='128' fill='url(%23g)'/%3E%3Ccircle cx='128' cy='101' r='47' fill='url(%23h)'/%3E%3Cpath d='M52 218c10-47 38-70 76-70s66 23 76 70' fill='url(%23h)'/%3E%3Ccircle cx='128' cy='128' r='112' fill='none' stroke='%23ffffff' stroke-opacity='.22' stroke-width='5'/%3E%3C/svg%3E";
+  function avatarHTML(p, cls = "avatar") {
+    const url = p?.avatar_url || DEFAULT_AVATAR;
+    return `<span class="${cls} default-avatar-image"><img src="${esc(url)}" alt="Avatar"></span>`;
+  }
+  function entityAvatarHTML(entity, type = "page", cls = "entity-logo") {
+    const url = entity?.logo_url || entity?.avatar_url || entity?.cover_url || DEFAULT_AVATAR;
+    return `<div class="${cls} entity-default-avatar-image ${type}"><img src="${esc(url)}" alt="Avatar"></div>`;
+  }
+
+  const PAGE_CATEGORIES = [
+    "Agriculture et élevage","Alimentation et boissons","Animaux","Art et culture","Automobile","Beauté et soins","Blog personnel","Commerce","Communauté","Conseil et services","Cuisine et gastronomie","Éducation","Électronique","Entreprise","Événementiel","Finance","Fitness et sport","Formation professionnelle","Hôtellerie","Immobilier","Informatique","Internet et technologie","Jeux vidéo","Juridique","Maison et décoration","Mode et vêtements","Médias et actualités","Musique","Organisation","Photographie","Politique et société","Produits locaux","Publicité et marketing","Restaurant","Santé et bien-être","Sciences","Services professionnels","Shopping","Tourisme et voyage","Transport","Vente au détail","Vidéos et créateurs","Association","Artisanat","Banque et assurance","Cinéma","Club","Cosmétiques","Développement personnel","Éditions et livres","Environnement","Famille et parentalité","Industrie","Journalisme","Librairie","Logistique","Marché et marketplace","Musée","Non lucratif","Parc et loisirs","Podcast","Radio","Recherche","Réseaux sociaux","Sécurité","Télécommunications","Université","Autre"
+  ];
+  function pageCategoryOptions(selected = "") {
+    return PAGE_CATEGORIES.map(c => `<option value="${esc(c)}" ${String(selected||"") === c ? "selected" : ""}>${esc(c)}</option>`).join("");
+  }
+
+  function nameOf(p) {
+    const full=[p?.first_name,p?.last_name].map(x=>String(x||'').trim()).filter(Boolean).join(" ");
+    const generic=/^membre\s+tafaß$/i.test(full)||/^membre\s+tafa(?:ss|ß)$/i.test(full);
+    return (!generic && full) || p?.username || (p?.email ? String(p.email).split('@')[0] : '') || "Membre Tafaß";
+  }
+  function isAdminProfile(p){ return p?.is_admin===true || p?.admin_badge===true; }
+  function verifiedBadgeHTML(p){ if(!p || (!p.is_verified && !isAdminProfile(p))) return ""; const admin=isAdminProfile(p); return `<span class="tafa-verified-badge ${admin?"tafa-admin-badge":""}" title="${admin?"Administrateur officiel Tafaß":"Compte vérifié"}">✓</span>`; }
+  function displayNameHTML(p){ return `<span class="tafa-display-name"><span>${esc(nameOf(p))}</span>${verifiedBadgeHTML(p)}</span>`; }
+  function presenceBadgeHTML(p, extraClass=""){
+    if(!p?.id || String(p.id)===String(state.user?.id)) return "";
+    const online=window.tafaOnlineIds?.has?.(String(p.id));
+    const seen=p.last_seen_at||p.lastSeenAt||null;
+    if(online) return `<span class="tafa-presence-dot online ${extraClass}" title="En ligne" aria-label="En ligne"></span>`;
+    if(!seen) return "";
+    return `<span class="tafa-presence-offline ${extraClass}" title="Dernière activité : ${esc(timeAgo(seen))}">il y a ${esc(timeAgo(seen))}</span>`;
+  }
+  function profilePresenceHTML(p){ return presenceBadgeHTML(p,"profile-presence"); }
+  async function sha256File(file){ const b=await file.arrayBuffer(),h=await crypto.subtle.digest("SHA-256",b); return Array.from(new Uint8Array(h)).map(x=>x.toString(16).padStart(2,"0")).join(""); }
+  async function moderationCheckMedia(file,kind){
+    if(!file) return {ok:true,hash:null};
+    try{
+      const hash=await sha256File(file);
+      const r=await sb.rpc("tafa_moderation_check_media",{p_sha256:hash,p_kind:kind});
+      if(r.error){
+        console.error("Tafaß media moderation:",r.error);
+        return {ok:false,hash,message:"Vérification de sécurité impossible. Le média n’a pas été envoyé."};
+      }
+      if(r.data?.ok===false){
+        const message=r.data.message||"Ce média est protégé par l’administration Tafaß.";
+        toast(message);
+        return {ok:false,hash,message};
+      }
+      return {ok:true,hash};
+    }catch(err){
+      console.error("Tafaß media moderation:",err);
+      return {ok:false,hash:null,message:"Vérification de sécurité impossible. Le média n’a pas été envoyé."};
+    }
+  }
+  async function registerAdminMediaHash(hash,kind,url){
+    if(!hash || !/^[a-f0-9]{64}$/i.test(String(hash).trim())) {
+      throw new Error("Hash SHA-256 invalide : le média protégé n’a pas été enregistré.");
+    }
+    if(state.__isAdmin!==true){
+      try{
+        const adminCheck=await sb.rpc("tafa_is_admin",{p_user_id:state.user?.id});
+        if(!adminCheck.error) state.__isAdmin=adminCheck.data===true;
+      }catch(_){}
+    }
+    if(state.__isAdmin!==true) return;
+    const r=await sb.rpc("tafa_admin_register_media_hash",{
+      p_sha256:String(hash).trim().toLowerCase(),
+      p_kind:kind,
+      p_url:url||null
+    });
+    if(r.error || r.data!==true){
+      throw new Error(r.error?.message||"Impossible d’enregistrer le média protégé de l’administration.");
+    }
+  }
+  async function identityProtectionCheck({first_name="",last_name="",username="",mediaHash="",context="content"}={}){
+    try{
+      const r=await sb.rpc("tafa_identity_guard",{p_user_id:state.user.id,p_first_name:first_name,p_last_name:last_name,p_username:username,p_media_hash:mediaHash||null,p_context:context});
+      if(r.error) return {allowed:true};
+      if(r.data?.allowed===false){
+        state.profile={...(state.profile||{}),account_status:"restricted"};
+        toast(r.data.message||"Compte suspendu pour protection d’une identité officielle Tafaß.");
+        return {allowed:false, message:r.data.message};
+      }
+      return {allowed:true};
+    }catch(_){ return {allowed:true}; }
+  }
+  const blockedCache={ids:new Set(),loadedAt:0,promise:null};
+  async function getBlockedIds(force=false){
+    if(!state.user)return new Set();
+    if(!force&&blockedCache.promise)return blockedCache.promise;
+    if(!force&&Date.now()-blockedCache.loadedAt<15000)return blockedCache.ids;
+    blockedCache.promise=(async()=>{const q=await sb.from("blocked_profiles").select("blocker_id,blocked_id").or(`blocker_id.eq.${state.user.id},blocked_id.eq.${state.user.id}`);const ids=new Set();(q.data||[]).forEach(x=>{if(x.blocker_id===state.user.id)ids.add(x.blocked_id);else if(x.blocked_id===state.user.id)ids.add(x.blocker_id)});blockedCache.ids=ids;blockedCache.loadedAt=Date.now();blockedCache.promise=null;return ids})().catch(()=>{blockedCache.promise=null;return blockedCache.ids});
+    return blockedCache.promise;
+  }
+  async function isBlockedBetween(id){if(!state.user||!id||id===state.user.id)return false;return (await getBlockedIds()).has(id)}
+  async function denyIfBlocked(id,msg="Cette personne est bloquée. Les interactions sont indisponibles."){if(await isBlockedBetween(id)){toast(msg);return true}return false}
+  const filterBlocked=(rows,field="user_id")=>(rows||[]).filter(x=>!blockedCache.ids.has(x?.[field]));
+  const MG_CITIES = [
+    "Antananarivo","Ambohimanambola","Ambohidratrimo","Andramasina","Anjozorobe","Ankazobe","Manjakandriana","Arivonimamo","Miarinarivo","Soavinandriana","Tsiroanomandidy","Antsirabe","Betafo","Ambatolampy","Fianarantsoa","Ambalavao","Manakara","Mananjary","Farafangana","Toamasina","Fenerive Est","Vatomandry","Brickaville","Mahajanga","Marovoay","Mitsinjo","Antsiranana","Ambilobe","Nosy Be","Sambava","Antalaha","Toliara","Morondava","Belo sur Tsiribihina","Miandrivazo","Taolagnaro","Amboasary","Ihosy","Ambovombe"
+  ];
+  const MG_PROVINCES = ["Antananarivo","Antsiranana","Fianarantsoa","Mahajanga","Toamasina","Toliara"];
+  const COUNTRY_META = {
+    MG:{name:"Madagascar",code:"+261",digits:9,placeholder:"330000000",test:/^[3-9]\d{8}$/},
+    FR:{name:"France",code:"+33",digits:9,placeholder:"600000000",test:/^[1-9]\d{8}$/},
+    US:{name:"États-Unis",code:"+1",digits:10,placeholder:"2025550123",test:/^[2-9]\d{9}$/}
+  };
+  function detectCountry(){
+    const lang=(navigator.language||"").toUpperCase();
+    if(/(^|[-_])MG\b/.test(lang)) return "MG";
+    if(/(^|[-_])FR\b/.test(lang)) return "FR";
+    if(/(^|[-_])(US|CA)\b/.test(lang)) return "US";
+    const tz=Intl.DateTimeFormat().resolvedOptions().timeZone||"";
+    if(tz.startsWith("Africa/")) return "MG";
+    return "MG";
+  }
+  function phoneMeta(){ return COUNTRY_META[state.detectedCountry||detectCountry()] || COUNTRY_META.MG; }
+  function normalizePhone(value, meta=phoneMeta()){
+    let d=String(value||"").replace(/\D/g,"");
+    if(d.startsWith(meta.code.replace("+",""))) d=d.slice(meta.code.length-1);
+    return d;
+  }
+  function internationalPhone(value, meta=phoneMeta()){
+    const d=normalizePhone(value,meta); return d ? meta.code+d : "";
+  }
+  function cityListHTML(id, values){ return `<datalist id="${id}">${values.map(v=>`<option value="${esc(v)}"></option>`).join("")}</datalist>`; }
+  function validCity(value){ return MG_CITIES.some(c=>c.toLowerCase()===String(value||"").trim().toLowerCase()); }
+  function validProvince(value){ return MG_PROVINCES.some(c=>c.toLowerCase()===String(value||"").trim().toLowerCase()); }
+
+  let placeSearchTimer = null;
+  let placeSearchController = null;
+  function placeLabel(item){
+    const a=item?.address||{};
+    const parts=[a.city||a.town||a.municipality||a.village||a.county||a.state_district||a.state, a.state&&a.state!==(a.city||a.town||a.municipality||a.village||a.county||a.state_district)?a.state:null, a.country].filter(Boolean);
+    return [...new Set(parts)].join(", ");
+  }
+  function placeDisplay(item){
+    return String(item?.display_name || placeLabel(item) || "").trim();
+  }
+  function installPlaceSearch(inputId, listId){
+    const input=$(inputId), list=$(listId);
+    if(!input||!list) return;
+    input.dataset.placeValid = input.value.trim() ? "true" : "false";
+    const close=()=>{list.classList.remove("show"); list.innerHTML="";};
+    const render=(items)=>{
+      list.innerHTML = items.length ? items.map((x,i)=>`<button type="button" class="place-result" data-place-index="${i}"><b>${esc(placeLabel(x)||x.name||"Lieu")}</b><small>${esc(placeDisplay(x))}</small></button>`).join("") : `<div class="place-empty">Aucun lieu réel trouvé à Madagascar.</div>`;
+      list._items=items; list.classList.add("show");
+      list.querySelectorAll("[data-place-index]").forEach(btn=>btn.addEventListener("click",()=>{
+        const x=list._items[Number(btn.dataset.placeIndex)];
+        input.value=placeDisplay(x); input.dataset.placeValid="true"; input.dataset.placeLat=x.lat||""; input.dataset.placeLon=x.lon||""; input.dispatchEvent(new Event("change",{bubbles:true})); close();
+      }));
+    };
+    input.addEventListener("input",()=>{
+      input.dataset.placeValid="false";
+      const q=input.value.trim(); clearTimeout(placeSearchTimer);
+      if(q.length<2){close();return;}
+      placeSearchTimer=setTimeout(async()=>{
+        try{
+          placeSearchController?.abort(); placeSearchController=new AbortController();
+          const url=`https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=8&countrycodes=mg&q=${encodeURIComponent(q)}`;
+          const r=await fetch(url,{signal:placeSearchController.signal,headers:{"Accept":"application/json","Accept-Language":"fr"}});
+          if(!r.ok) throw new Error("Recherche indisponible");
+          const items=await r.json(); render(Array.isArray(items)?items:[]);
+        }catch(e){ if(e.name!=="AbortError") render([]); }
+      },350);
+    });
+    input.addEventListener("focus",()=>{ if(input.value.trim().length>=2) input.dispatchEvent(new Event("input")); });
+    document.addEventListener("click",e=>{ if(!input.contains(e.target)&&!list.contains(e.target)) close(); },{once:false});
+  }
+  function notificationAction(n) {
+    const map = {
+      reaction: "a réagi à votre publication.",
+      comment: "a commenté votre publication.",
+      share: "a partagé votre publication.",
+      friend_request: "vous a envoyé une demande d’ami.",
+      friend_accepted: "a accepté votre demande d’ami.",
+      message: "vous a envoyé un message.",
+      follow: "vous suit maintenant.",
+      page_follow: "s’est abonné à votre Page.",
+      page_follow_invite: "vous invite à suivre une Page.",
+      group_join: "a rejoint votre groupe.",
+      comment_like: "a réagi à votre commentaire."
+    };
+    return map[n?.type] || n?.message || "a effectué une nouvelle activité.";
+  }
+  function notificationTarget(n, actor) {
+    if (n?.type === "message" && n?.entity_id) return { action:"open-conversation", id:n.entity_id };
+    if (["page_follow","page_follow_invite"].includes(n?.type) && n?.entity_id) return { action:"page-open", id:n.entity_id };
+    if (["group_join"].includes(n?.type) && n?.entity_id) return { action:"group-open", id:n.entity_id };
+    if (n?.entity_type === "post" || n?.post_id) return { action:"open-notification-post", id:n.post_id || n.entity_id };
+    if (actor?.id) return { action:"view-profile", id:actor.id };
+    return null;
+  }
+  function profileLink(p, inner, cls="profile-link") {
+    if (!p?.id) return inner;
+    return `<button type="button" class="${cls}" data-action="view-profile" data-id="${esc(p.id)}">${inner}</button>`;
+  }
+  function timeAgo(date) {
+    const t = new Date(date || Date.now()).getTime(), d = Math.max(0, Date.now() - t);
+    const m = Math.floor(d / 60000);
+    if (m < 1) return "à l'instant";
+    if (m < 60) return `${m} min`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h} h`;
+    return `${Math.floor(h / 24)} j`;
+  }
+  function toast(msg) {
+    const el = $("toast"); if (!el) return;
+    el.textContent = msg; el.classList.add("show");
+    clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove("show"), 2200);
+  }
+  function setLoading(button, loading, label) {
+    if (!button) return;
+    button.disabled = loading; if (loading) button.dataset.oldLabel = button.textContent;
+    button.textContent = loading ? "Patientez…" : (button.dataset.oldLabel || label || button.textContent);
+  }
+
+  async function loadProfile() {
+    if (!state.user) return;
+    const previousProfile=state.profile;
+    const profileResult=await sb.from("profiles").select("*").eq("id", state.user.id).maybeSingle();
+    const data=profileResult.data;
+    const authEmail = state.user.email || "";
+    // Pendant une réactivation, une réponse réseau temporairement vide ne doit
+    // jamais remplacer le profil existant par un profil incomplet.
+    state.profile = data || previousProfile || {
+      id: state.user.id, first_name: state.user.user_metadata?.first_name || "",
+      last_name: state.user.user_metadata?.last_name || "", email: authEmail
+    };
+    // The authenticated email is the source of truth for the UI.
+    // Do not write to profiles during every app bootstrap: this can be blocked by RLS
+    // and can make OAuth onboarding appear frozen. Email synchronization is handled
+    // by the dedicated onboarding/account RPC instead.
+    if (authEmail) state.profile.email = authEmail;
+    const md=state.user?.user_metadata||{};
+    if ((!String(state.profile.first_name||'').trim() || /^membre$/i.test(String(state.profile.first_name||'').trim())) && md.first_name) state.profile.first_name=md.first_name;
+    if ((!String(state.profile.last_name||'').trim() || /^tafaß$/i.test(String(state.profile.last_name||'').trim())) && md.last_name) state.profile.last_name=md.last_name;
+    // Tafaß uses the dark premium interface as the single supported theme.
+    state.theme = "dark";
+    if (state.user) await sb.from("user_settings").upsert({user_id:state.user.id,theme:"dark"},{onConflict:"user_id"});
+    const sideName = $("sideName"); if (sideName) sideName.textContent = nameOf(state.profile);
+    const sideAvatar = $("sideAvatar"); if (sideAvatar) { sideAvatar.outerHTML = avatarHTML(state.profile, "avatar").replace("<span ", '<span id="sideAvatar" '); }
+  }
+
+  async function loadPosts() {
+    if (!state.user) return;
+    await getBlockedIds();
+    const { data, error } = await sb.from("posts").select("*").order("created_at", { ascending: false }).limit(100);
+    if (error) { state.posts = []; return; }
+    let rows = filterBlocked(data || [], "user_id");
+
+    // Fil Actualités : vos publications + celles de vos amis + les publications
+    // publiques qui dépassent 100 réactions. Cela permet à une publication
+    // vraiment populaire d'être découverte même sans relation d'amitié.
+    const fr = await sb.from("friendships").select("user_id,friend_id")
+      .or(`user_id.eq.${state.user.id},friend_id.eq.${state.user.id}`).limit(500);
+    const friendIds = new Set((fr.data || []).map(x =>
+      String(x.user_id) === String(state.user.id) ? String(x.friend_id) : String(x.user_id)
+    ));
+    friendIds.add(String(state.user.id));
+
+    const ids = rows.map(x => x.id).filter(Boolean);
+    const reactionTotals = new Map();
+    if (ids.length) {
+      const rr = await sb.from("post_reactions").select("post_id").in("post_id", ids);
+      for (const r of (rr.data || [])) reactionTotals.set(String(r.post_id), (reactionTotals.get(String(r.post_id)) || 0) + 1);
+    }
+    rows = rows.filter(post => {
+      const owner = String(post.user_id || "");
+      const publicPost = String(post.visibility || "public").toLowerCase() === "public";
+      return friendIds.has(owner) || (publicPost && (reactionTotals.get(String(post.id)) || 0) > 100);
+    });
+    state.posts = rows;
+    await hydratePosts();
+    await loadV80FollowedEntityFeed();
+  }
+
+  async function loadV80FollowedEntityFeed(){
+    // V97: Page content is intentionally excluded from the main feed.
+    state.v80EntityFeed=[];
+    if(!state.user?.id) return;
+    try{
+      const gm=await sb.from('group_members').select('group_id').eq('user_id',state.user.id);
+      const groupIds=[...(gm.data||[])].map(x=>x.group_id).filter(Boolean);
+      if(!groupIds.length) return;
+      const gr=await sb.from('group_posts').select('id,group_id,user_id,content,media_url,media_type,created_at,visibility').in('group_id',groupIds).order('created_at',{ascending:false}).limit(60);
+      const gids=[...(gr.data||[])].map(x=>x.group_id);
+      const groups=gid=>sb.from('groups').select('id,name,logo_url').in('id',gid);
+      const g=await groups(gids);
+      const gm2=new Map((g.data||[]).map(x=>[String(x.id),x]));
+      state.v80EntityFeed=(gr.data||[]).map(x=>({...x,entity_kind:'group',entity:gm2.get(String(x.group_id))})).filter(x=>x.entity).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).slice(0,60);
+    }catch(_){ state.v80EntityFeed=[]; }
+  }
+
+  function v80EntityFeedHTML(rows){
+    if(!rows?.length) return '';
+    return `<section class="tfa-v80-follow-feed"><header><div><span class="eyebrow">TAFAß • ABONNEMENTS</span><h3>Pages et Groupes suivis</h3><small>Les nouvelles publications apparaissent automatiquement ici.</small></div><span class="tfa-v80-live">● EN DIRECT</span></header><div class="tfa-v80-follow-list">${rows.map(p=>{const e=p.entity||{}, isPage=p.entity_kind==='page';return `<article class="tfa-v80-follow-post"><div class="tfa-v80-follow-head">${entityAvatarHTML(e,isPage?'page':'group','tfa-v80-follow-avatar')}<div><b>${esc(e.name||'Communauté Tafaß')}</b><small>${isPage?'Page':'Groupe'} · ${timeAgo(p.created_at)}</small></div></div>${p.content?`<div class="tfa-v80-follow-text">${esc(p.content)}</div>`:''}${p.media_url?(String(p.media_type||'').startsWith('video')?`<video class="post-media" src="${esc(p.media_url)}" controls playsinline preload="metadata"></video>`:`<img class="post-media" src="${esc(p.media_url)}" alt="Publication" loading="lazy">`):''}</article>`;}).join('')}</div></section>`;
+  }
+
+  async function loadMyPosts() {
+    if (!state.user) return [];
+    const { data, error } = await sb.from("posts").select("*")
+      .eq("user_id", state.user.id)
+      .order("created_at", { ascending: false })
+      .limit(100);
+    if (error) return [];
+    const rows = data || [];
+    const ids = [...new Set(rows.map(x => x.user_id).filter(Boolean))];
+    if (!ids.length) return rows;
+    const { data: profiles } = await sb.from("profiles").select("*").in("id", ids);
+    const map = new Map((profiles || []).map(x => [x.id, x]));
+    return rows.map(x => ({ ...x, author: map.get(x.user_id) || state.profile }));
+  }
+
+  async function hydratePosts() {
+    const ids = [...new Set(state.posts.map(p => p.user_id).filter(Boolean))];
+    if (!ids.length) return;
+    const { data } = await sb.from("profiles").select("*").in("id", ids);
+    const map = new Map((data || []).map(p => [p.id, p]));
+    state.posts = state.posts.map(p => ({ ...p, author: map.get(p.user_id) }));
+  }
+
+  const reactionMeta = {
+    like: ["J’aime", "👍"], love: ["J’adore", "❤️"], haha: ["Haha", "😂"],
+    wow: ["Waouh", "😮"], sad: ["Triste", "😢"], angry: ["En colère", "😡"],
+    care: ["J’adore 🥰", "🥰"], eye_roll: ["🙄", "🙄"]
+  };
+  async function reactionsFor(postId) {
+    const { data } = await sb.from("post_reactions").select("reaction_type,user_id").eq("post_id", postId);
+    return data || [];
+  }
+  async function commentsFor(postId) {
+    const { data } = await sb.from("comments").select("*").eq("post_id", postId).order("created_at", { ascending: true }).limit(100);
+    const rows = data || [];
+    const ids = [...new Set(rows.map(c => c.user_id).filter(Boolean))];
+    const { data: profiles } = ids.length ? await sb.from("profiles").select("*").in("id", ids) : { data: [] };
+    const map = new Map((profiles || []).map(x => [x.id, x]));
+    return rows.map(c => ({ ...c, author: map.get(c.user_id) }));
+  }
+  async function sharersFor(postId) {
+    const { data } = await sb.from("post_shares").select("user_id,created_at").eq("post_id", postId).order("created_at", { ascending: false }).limit(20);
+    const rows = data || [];
+    const ids = [...new Set(rows.map(x => x.user_id).filter(Boolean))];
+    const { data: profiles } = ids.length ? await sb.from("profiles").select("*").in("id", ids) : { data: [] };
+    const map = new Map((profiles || []).map(x => [x.id, x]));
+    return rows.map(x => ({ ...x, user: map.get(x.user_id) })).filter(x => x.user);
+  }
+
+  function pageModeActive(){ state.activePage=null; return false; }
+  function pageModeLabel(){ return "Mon compte"; }
+  function navBadge(route){ return `<span class="nav-badge hidden" data-badge-route="${esc(route)}" aria-label="Notifications ${esc(route)}"></span>`; }
+  function navButton(route, icon, label, mobile=false){
+    return `<button class="tafa-premium-nav-item" data-route="${esc(route)}" aria-label="${esc(label)}"><span class="${mobile?'nav-svg':'nav-ico'} tafa-premium-nav-icon">${menuIcon(icon)}</span>${mobile?`<small>${esc(label)}</small>`:`<span class="tafa-premium-nav-label">${esc(label)}</span>`}${navBadge(route)}</button>`;
+  }
+  function formatBadgeCount(value){ const n=Number(value||0); return n>10 ? "10+" : String(n); }
+  function setNavBadge(route, value){
+    const n=Number(value||0);
+    document.querySelectorAll(`[data-badge-route="${CSS.escape(String(route))}"]`).forEach(el=>{
+      el.textContent=formatBadgeCount(n);
+      el.classList.toggle("hidden", n<=0);
+    });
+  }
+  async function countUnreadNotificationsForRoutes(){
+    const result={home:0, friends:0, notifications:0, pages:0, groups:0, reels:0, events:0, tafab:0, studio:0, creator:0, ai:0, music:0, business:0, saved:0, settings:0, menu:0};
+    const r=await sb.from("notifications").select("type,entity_type").eq("user_id",state.user.id).eq("is_read",false).limit(1000);
+    if(r.error) return result;
+    for(const n of (r.data||[])){
+      const t=String(n.type||"").toLowerCase(), e=String(n.entity_type||"").toLowerCase();
+      result.notifications++;
+      if(/friend|follow|request/.test(t) || /friend|follow/.test(e)) result.friends++;
+      if(/page/.test(t) || /page/.test(e)) result.pages++;
+      if(/group/.test(t) || /group/.test(e)) result.groups++;
+      if(/reel/.test(t) || /reel/.test(e)) result.reels++;
+      if(/event/.test(t) || /event/.test(e)) result.events++;
+      if(/listing|order|market|tafab/.test(t) || /listing|order|market|tafab/.test(e)) result.tafab++;
+      if(/creator|gift|withdraw|subscription/.test(t) || /creator|gift|withdraw|subscription/.test(e)) result.creator++;
+      if(/ai/.test(t) || /ai/.test(e)) result.ai++;
+      if(/music/.test(t) || /music/.test(e)) result.music++;
+      if(/business|ad/.test(t) || /business|ad/.test(e)) result.business++;
+      if(/post|comment|reaction|share|story|follow/.test(t) || /post|comment|reaction|share|story/.test(e)) result.home++;
+      if(/studio|draft/.test(t) || /studio|draft/.test(e)) result.studio++;
+    }
+    return result;
+  }
+  async function updateBadges(){
+    if(!state.user) return;
+    try{
+      const [notif, msg]=await Promise.all([
+        countUnreadNotificationsForRoutes(),
+        sb.from("messages").select("id",{count:"exact",head:true}).neq("sender_id",state.user.id).eq("is_read",false)
+      ]);
+      const n=notif||{};
+      // Badges represent NEW/unseen items, not permanent pending totals.
+      setNavBadge("home",n.home);
+      setNavBadge("friends",n.friends);
+      setNavBadge("messages",msg.count||0);
+      setNavBadge("notifications",n.notifications);
+      ["groups","reels","events","tafab","studio","creator","ai","music","business","saved","settings","menu"].forEach(r=>setNavBadge(r,n[r]||0));
+      if(state.__isAdmin===true){ adminBadgeCount().then(c=>{ document.querySelectorAll('[data-admin-badge]').forEach(el=>{el.textContent=c>0?String(c):''; el.classList.toggle('hidden',c<=0);}); setNavBadge('menu',Math.max(Number(n.menu||0),c)); }).catch(()=>{}); }
+    }catch(e){ console.warn("Tafaß badges:",e); }
+  }
+
+  async function markRouteBadgeSeen(route){
+    if(!state.user || !route) return;
+    // Clear the visible badge immediately, then persist the read state.
+    setNavBadge(route, 0);
+    try{
+      if(route === "messages") {
+        // Use the existing security-definer RPC instead of a broad client-side
+        // UPDATE, so RLS cannot reject the badge-read operation.
+        const {data: memberships}=await sb.from("conversation_members")
+          .select("conversation_id").eq("user_id",state.user.id);
+        const ids=[...new Set((memberships||[]).map(x=>x.conversation_id).filter(Boolean))];
+        if(ids.length) await Promise.all(ids.map(id=>sb.rpc("tafa_mark_conversation_read",{p_conversation_id:id})));
+        return;
+      }
+      const notificationRoutes = {
+        home: /post|comment|reaction|share|story/i,
+        friends: /friend|follow|request/i,
+        pages: /page/i,
+        groups: /group/i,
+        reels: /reel/i,
+        events: /event/i,
+        tafab: /listing|order|market|tafab/i,
+        studio: /studio|draft/i,
+        creator: /creator|gift|withdraw|subscription/i,
+        ai: /ai/i,
+        music: /music/i,
+        business: /business|ad/i,
+        saved: /saved|bookmark/i,
+        settings: /setting|security|privacy/i,
+        menu: /menu|system/i
+      };
+      const matcher=notificationRoutes[route];
+      if(route === "notifications") {
+        await sb.from("notifications").update({is_read:true})
+          .eq("user_id",state.user.id).eq("is_read",false);
+        return;
+      }
+      if(!matcher) return;
+      const {data}=await sb.from("notifications").select("id,type,entity_type")
+        .eq("user_id",state.user.id).eq("is_read",false).limit(1000);
+      const ids=(data||[]).filter(n=>matcher.test(String(n.type||"")+' '+String(n.entity_type||""))).map(n=>n.id);
+      if(ids.length) await sb.from("notifications").update({is_read:true}).in("id",ids).eq("user_id",state.user.id);
+    }catch(e){ console.warn("Tafaß badge seen:",route,e); }
+    finally{ updateBadges(); }
+  }
+  function syncIdentityUI(){
+    document.body.classList.toggle("page-mode-active", pageModeActive());
+    const p = pageModeActive() ? state.activePage : state.profile;
+    const nameEl = $("sideName"), avatarEl = $("sideAvatar");
+    if(nameEl) nameEl.textContent = pageModeActive() ? p.name : nameOf(p);
+    if(avatarEl) avatarEl.outerHTML = entityAvatarHTML(p, "page", "avatar").replace("<div ", '<span id="sideAvatar" ').replace("</div>", "</span>");
+    const logo = document.querySelector(".logo-button strong"); if(logo) logo.textContent = pageModeActive() ? p.name : "Tafaß";
+    const logoMark = document.querySelector(".logo-button .mini-logo"); if(logoMark) logoMark.textContent = pageModeActive() ? "▣" : "T";
+    // V64: navigation structure is immutable. Page mode may change the identity/logo,
+    // but it must never replace the account navigation DOM. This prevents the old
+    // Page-mode navigation from removing Reels or switching back unexpectedly.
+    const left=document.querySelector(".left-sidebar"), bottom=document.querySelector(".bottom-nav");
+    if(left) left.dataset.navOwner = pageModeActive() ? "page-identity" : "account";
+    if(bottom) bottom.dataset.navOwner = pageModeActive() ? "page-identity" : "account";
+    document.querySelectorAll("[data-route]").forEach(el => {
+      el.classList.toggle("page-mode-identity", pageModeActive());
+    });
+  }
+  function restoreAccountNavigation(){
+    const left=document.querySelector(".left-sidebar"), bottom=document.querySelector(".bottom-nav");
+    if(left) left.innerHTML=`<button data-route="profile" class="profile-shortcut"><span id="sideAvatar" class="avatar">T</span><span><b id="sideName">Mon profil</b><small>Voir mon profil</small></span></button>${navButton("home","home","Actualités")}${navButton("friends","friends","Amis")}${navButton("messages","messages","Messages")}${navButton("notifications","notifications","Notifications")}${navButton("groups","groups","Groupes")}${navButton("reels","reels","Reels")}${navButton("events","history","Évènements")}${navButton("studio","videos","Studio")}${navButton("tafab","tafab","Tafaß")}${navButton("saved","saved","Enregistrements")}${navButton("menu","settings","Menu")}`;
+    if(bottom) bottom.innerHTML=`${navButton("home","home","Actualités",true)}${navButton("friends","friends","Amis",true)}${navButton("messages","messages","Messages",true)}${navButton("groups","groups","Groupes",true)}${navButton("reels","reels","Reels",true)}`;
+    const nameEl=$("sideName"), avatarEl=$("sideAvatar"); if(nameEl) nameEl.textContent=nameOf(state.profile); if(avatarEl) avatarEl.outerHTML=avatarHTML(state.profile,"avatar").replace("<span ", '<span id="sideAvatar" ');
+  }
+  function pageContextBanner(){
+    if(!pageModeActive()) return "";
+    return `<div class="page-context-banner"><div class="page-context-identity">${entityAvatarHTML(state.activePage,"page","page-context-avatar")}<div><span>MODE PAGE</span><b>${esc(state.activePage.name)}</b></div></div><button class="page-context-exit" data-action="page-exit-mode">↩ Compte</button></div>`;
+  }
+  async function renderPageFeed(){
+    const pg=state.activePage; if(!pg) return renderFeed();
+    const token=state.renderToken;
+    const [postsR, followersR, membersR]=await Promise.all([
+      sb.from("page_posts").select("*").eq("page_id",pg.id).order("created_at",{ascending:false}).limit(50),
+      sb.from("page_followers").select("page_id",{count:"exact",head:true}).eq("page_id",pg.id),
+      sb.from("page_members").select("user_id,role").eq("page_id",pg.id)
+    ]);
+    if(token!==state.renderToken || state.route!=="home") return;
+    if(postsR.error) return simplePage("Actualités", pageContextBanner()+`<div class="empty-block"><b>Impossible de charger les actualités de la Page.</b><small>${esc(postsR.error.message)}</small></div>`);
+    const posts=postsR.data||[], ownerMe=pg.owner_id===state.user.id;
+    const role=(membersR.data||[]).find(m=>m.user_id===state.user.id)?.role||null;
+    const canManage=ownerMe||['owner','admin'].includes(role);
+    const followerCount=followersR.count||0;
+    const mediaCount=posts.filter(p=>p.media_url).length;
+    const recent=posts.slice(0,3);
+    const quick=(action,title,sub,icon)=>`<button class="page-quick-card" data-action="${action}" data-id="${esc(pg.id)}"><span class="page-quick-icon">${icon}</span><span><b>${title}</b><small>${sub}</small></span><strong>›</strong></button>`;
+    let html=pageContextBanner()+`<section class="page-mode-feed page-mode-feed-premium">
+      <div class="page-feed-hero-premium">
+        <div class="page-feed-cover" ${pg.cover_url?`style="background-image:url('${esc(pg.cover_url)}')"`:''}><div class="page-feed-cover-shade"></div></div>
+        <div class="page-feed-identity">${entityAvatarHTML(pg,"page","page-feed-avatar")}<div class="grow"><span class="eyebrow">MODE PAGE • ACTUALITÉS</span><h2>${esc(pg.name)}</h2><p>${esc(pg.bio||"Votre espace professionnel Tafaß.")}</p></div><button class="page-profile-mini" data-action="page-open" data-id="${esc(pg.id)}">Profil</button></div>
+        <div class="page-feed-stats"><div><b>${followerCount}</b><small>Abonnés</small></div><div><b>${posts.length}</b><small>Publications</small></div><div><b>${mediaCount}</b><small>Médias</small></div><div><b>${canManage?'Gestion':'Lecture'}</b><small>Accès</small></div></div>
+      </div>
+      <div class="page-quick-grid">${quick('page-open','Profil de la Page','Voir la Page comme un visiteur',menuIcon('pages'))}${quick('page-invite-friends','Inviter des amis','Inviter vos amis à suivre',menuIcon('friends'))}${canManage?quick('page-settings','Paramètres','Configurer toute la Page',menuIcon('settings')):quick('page-share','Partager','Partager cette Page',menuIcon('share'))}</div>
+      ${ownerMe?`<div class="composer composer-clean page-mode-composer page-mode-composer-premium"><div class="composer-top">${entityAvatarHTML(pg,"page","avatar")}<div><b>Publier au nom de ${esc(pg.name)}</b><small>Votre publication sera publiée comme une Page</small></div></div><textarea id="pageModePostText" maxlength="5000" placeholder="Quoi de neuf sur votre Page ?"></textarea><div class="composer-actions"><button type="button" class="primary" data-action="page-mode-publish" data-id="${esc(pg.id)}">Publier</button></div></div>`:""}
+      <div class="page-feed-section-head"><div><span class="eyebrow">TAFAß • PAGE</span><h3>Publications récentes</h3></div><span>${posts.length} au total</span></div>`;
+    if(!posts.length) html+=`<div class="page-feed-empty-premium"><div>✦</div><b>Aucune publication pour le moment</b><span>Les actualités de ${esc(pg.name)} apparaîtront ici.</span>${ownerMe?`<button class="primary" data-action="page-mode-focus">Créer la première publication</button>`:''}</div>`;
+    else for(const p of posts){ html+=`<article class="post page-mode-post page-mode-post-premium"><div class="post-head">${entityAvatarHTML(pg,"page","avatar")}<div class="meta"><b class="post-author-name">${esc(pg.name)}</b><span class="post-time"><small>${timeAgo(p.created_at)} · Page</small></span></div>${ownerMe?`<button class="post-menu" data-action="delete-page-post" data-id="${esc(p.id)}" data-entity-id="${esc(pg.id)}">⋯</button>`:""}</div>${p.content?`<div class="post-body">${esc(p.content)}</div>`:""}${p.media_url?(String(p.media_type||"").startsWith("video")?`<video class="post-media" src="${esc(p.media_url)}" controls playsinline preload="metadata"></video>`:`<img class="post-media" src="${esc(p.media_url)}" alt="${esc(pg.name)}" loading="lazy">`):""}<div class="page-mode-post-footer"><span>Publication officielle</span><span>${timeAgo(p.created_at)}</span></div></article>`; }
+    if(recent.length>1) html+=`<div class="page-feed-bottom-note">✓ Votre fil Page est synchronisé avec les publications de ${esc(pg.name)}.</div>`;
+    html+=`</section>`;
+    $("content").innerHTML=html;
+  }
+
+  async function loadActiveStories() {
+    if (!state.user) return [];
+    const now = new Date().toISOString();
+    const r = await sb.from("stories")
+      .select("id,user_id,media_url,media_type,text_overlay,visibility,expires_at,created_at")
+      .or(`visibility.eq.public,user_id.eq.${state.user.id}`)
+      .gt("expires_at", now)
+      .order("created_at",{ascending:false})
+      .limit(40);
+    if (r.error) { console.warn("Tafaß stories:", r.error.message); return []; }
+    await getBlockedIds();
+    const visibleStories=filterBlocked(r.data||[],"user_id");
+    const ids=[...new Set(visibleStories.map(x=>x.user_id).filter(Boolean))];
+    const profiles=ids.length ? (await sb.from("profiles").select("id,first_name,last_name,avatar_url").in("id",ids)).data||[] : [];
+    const pm=new Map(profiles.map(p=>[p.id,p]));
+    return visibleStories.map(s=>({...s,author:pm.get(s.user_id)||state.profile}));
+  }
+
+async function createStory() {
+    const file=$("storyFile")?.files?.[0];
+    const text=$("storyText")?.value.trim()||"";
+    const btn=document.querySelector('[data-action="create-story"]');
+    if(!file && !text) return toast("Ajoutez une photo, une vidéo ou un texte à votre story.");
+    setLoading(btn,true,"Publier la story");
+    toast("Publication de la story en cours…");
+    try {
+      let media_url=null, media_type="text";
+      if(file){
+        const moderation=await moderationCheckMedia(file,file.type.startsWith("video/")?"story_video":"story_image");
+        if(!moderation.ok) throw new Error("Story refusée : média protégé de l’administration Tafaß.");
+        const identity=await identityProtectionCheck({first_name:state.profile?.first_name,last_name:state.profile?.last_name,username:state.profile?.username,mediaHash:moderation.hash||"",context:"story_media"});
+        if(!identity.allowed) throw new Error(identity.message||"Story refusée : violation de l’identité protégée.");
+        const ext=(file.name.split(".").pop()||"bin").toLowerCase();
+        const path=`${state.user.id}/story-${crypto.randomUUID()}.${ext}`;
+        const up=await uploadPostMedia(path,file,{upsert:false,contentType:file.type||undefined});
+        if(up.error) throw new Error("Upload : "+up.error.message);
+        media_url=sb.storage.from("posts").getPublicUrl(path).data.publicUrl;
+        media_type=file.type.startsWith("video/")?"video":"image";
+        await registerAdminMediaHash(moderation.hash,media_type.startsWith("video")?"story_video":"story_image",media_url);
+      }
+      const r=await sb.from("stories").insert({
+        user_id:state.user.id, media_url:media_url||"data:text/plain;charset=utf-8,story",
+        media_type, text_overlay:text, visibility:"public",
+        expires_at:new Date(Date.now()+24*60*60*1000).toISOString()
+      }).select().single();
+      if(r.error) throw new Error(r.error.message);
+      closeModal();
+      toast("✓ Story publiée pendant 24 h.");
+      await render();
+    } catch(e) {
+      toast("✕ Story non publiée : "+(e?.message||"Erreur inconnue."));
+    } finally {
+      setLoading(btn,false,"Publier la story");
+    }
+}
+
+async function storyComposer() {
+    openModal(`<div class="modal-box story-create-modal story-create-modal-v33">
+      <button class="modal-close story-close" data-action="close-modal" aria-label="Fermer">×</button>
+      <div class="story-create-head"><div><span class="eyebrow">TAFAß • STORIES</span><h3>Créer une story</h3><p>Partagez un moment. Votre story sera visible pendant 24 heures.</p></div><span class="story-create-badge">24 h</span></div>
+      <label class="story-text-field"><span>Votre story</span><textarea id="storyText" maxlength="500" placeholder="Écrivez quelque chose…"></textarea><small><b id="storyTextCount">0</b>/500</small></label>
+      <label class="story-upload story-upload-v33" for="storyFile"><span class="story-upload-icon">＋</span><span><b>Ajouter une photo ou une vidéo</b><small>JPG, PNG, WEBP ou vidéo</small></span><strong>Choisir</strong><input id="storyFile" type="file" accept="image/*,video/*" hidden></label>
+      <div id="storyPreview" class="story-preview-v33"><div class="story-preview-empty"><span>◉</span><b>Aperçu de votre story</b><small>Le média ou le texte apparaîtra ici avant publication.</small></div></div>
+      <div class="story-create-footer"><span>🌐 Public · expire dans 24 h</span><button class="primary big" data-action="create-story">Publier la story</button></div>
+    </div>`);
+    const text=$("storyText"), file=$("storyFile"), preview=$("storyPreview"), count=$("storyTextCount");
+    const update=()=>{
+      if(count) count.textContent=String((text?.value||"").length);
+      const f=file?.files?.[0], t=(text?.value||"").trim();
+      if(!preview)return;
+      if(f){
+        const url=URL.createObjectURL(f);
+        preview.innerHTML=f.type.startsWith("video/")?`<video src="${url}" controls muted playsinline></video>`:`<img src="${url}" alt="Aperçu de la story">`;
+        if(t) preview.insertAdjacentHTML("beforeend",`<div class="story-preview-caption">${esc(t)}</div>`);
+      }else if(t){
+        preview.innerHTML=`<div class="story-text-live-preview">${esc(t)}</div>`;
+      }else {
+        preview.innerHTML=`<div class="story-preview-empty"><span>◉</span><b>Aperçu de votre story</b><small>Le média ou le texte apparaîtra ici avant publication.</small></div>`;
+      }
+    };
+    text?.addEventListener("input",update); file?.addEventListener("change",update); update();
+}
+
+function openMoodComposer(){openModal(`<div class="modal-box composer-modal-premium mood-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • HUMEUR</span><h3>Comment vous sentez-vous ?</h3><p class="muted">Ajoutez une humeur ou une activité à votre publication.</p><div class="mood-grid">${[["😊","Heureux / Heureuse"],["😍","Amoureux / Amoureuse"],["🥳","En fête"],["😎","Détendu(e)"],["🤩","Enthousiaste"],["😌","Serein(e)"],["💪","Motivé(e)"],["😢","Triste"],["😡","En colère"],["🤔","En réflexion"],["❤️","Avec mes proches"],["🙏","Reconnaissant(e)"]].map(([e,l])=>`<button class="mood-choice" data-action="select-mood" data-mood-value="${esc(e+' '+l)}"><span>${e}</span><b>${esc(l)}</b></button>`).join('')}</div><label class="mood-extra">Message complémentaire<textarea id="moodExtra" maxlength="500" placeholder="Ajoutez un message…"></textarea></label><button class="primary big" data-action="apply-mood">Ajouter à ma publication</button></div>`)}
+function openMoreComposer(){openModal(`<div class="modal-box composer-modal-premium more-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • PLUS</span><h3>Enrichir votre publication</h3><p class="muted">Ajoutez des éléments à votre publication.</p><div class="more-composer-grid"><button data-action="more-question"><span>❓</span><div><b>Question</b><small>Posez une question à votre communauté.</small></div></button><button data-action="more-location"><span>📍</span><div><b>Lieu</b><small>Ajoutez un lieu réel à votre texte.</small></div></button><button data-action="more-file"><span>📎</span><div><b>Média</b><small>Ajouter une photo ou une vidéo.</small></div></button><button data-action="more-style"><span>✨</span><div><b>Style premium</b><small>Préparez votre texte pour un affichage premium.</small></div></button></div></div>`)}
+async function renderFeed() {
+    const token = state.renderToken;
+    const stories=await loadActiveStories();
+    const sponsoredR=await sb.rpc('tafa_get_sponsored_ads',{p_limit:2});
+    const sponsoredAds=sponsoredR.error?[]:(sponsoredR.data||[]);
+    const liveR=await sb.from("live_sessions").select("id,user_id,title,started_at,profiles(first_name,last_name,username,avatar_url)").eq("status","live").order("started_at",{ascending:false}).limit(12);
+    const activeLives=liveR.error ? [] : (liveR.data||[]);
+    if (token !== state.renderToken || state.route !== "home") return;
+    const storyGroups=[];
+    const seen=new Set();
+    for(const s of stories){ if(seen.has(s.user_id)) continue; seen.add(s.user_id); storyGroups.push(s); }
+
+    let html=`<section class="news-feed">
+      <div class="news-topbar"><div><h2>Actualités</h2><small>Publications et stories des membres Tafaß</small></div></div>
+      <section class="stories-card">
+        <div class="stories-head"><div><b>Stories</b><small>Contenus disponibles pendant 24 h</small></div><button class="small-action" data-action="story-create">＋ Créer</button></div>
+        <div class="stories">
+          <button class="story story-create-tile" data-action="story-create"><span class="story-add">${menuIcon("profile")}</span><small>Votre story</small></button>
+          ${storyGroups.map(s=>`<button class="story" data-action="open-story" data-id="${esc(s.id)}"><span class="story-ring">${s.media_type==="video"?`<video src="${esc(s.media_url)}" muted playsinline></video>`:s.media_type==="text"?`<span class="story-text-preview">${esc(s.text_overlay||"Texte")}</span>`:`<img src="${esc(s.media_url)}" alt="Story">`}</span><small>${esc(s.user_id===state.user.id?"Vous":nameOf(s.author))}</small></button>`).join("")}
+        </div>
+      </section>
+      ${activeLives.length ? `<section class="live-strip">
+        <div class="live-strip-head"><div><b>En direct maintenant</b><small>Regardez les directs des membres Tafaß</small></div><span class="live-pulse">● LIVE</span></div>
+        <div class="live-strip-list">${activeLives.map(l=>{const mine=String(l.user_id)===String(state.user.id);return `<button class="live-card ${mine?"live-card-own":""}" data-action="${mine?"end-live-session":"watch-live"}" data-id="${esc(l.id)}"><span class="live-card-avatar">${avatarHTML(l.profiles||{})}</span><span><b>${esc(l.profiles ? nameOf(l.profiles) : "Membre Tafaß")}</b><small>${esc(l.title||"Direct Tafaß")}</small></span><strong>${mine?"Terminer":"Regarder"}</strong></button>`;}).join("")}</div>
+      </section>` : ""}
+
+      <section class="composer composer-news composer-launcher">
+        <div class="composer-launcher-row">
+          <button class="composer-launcher-button" type="button" data-action="open-publisher" aria-label="Créer une publication">
+            <span class="composer-launcher-avatar">${avatarHTML(state.profile)}</span>
+            <span class="composer-launcher-input">À quoi pensez-vous ?</span>
+          </button>
+          <button class="composer-launcher-photo" type="button" data-action="quick-publisher-photo" aria-label="Publier une photo ou une vidéo">
+            <span class="composer-photo-icon" aria-hidden="true">▣</span>
+            <small>Photo</small>
+          </button>
+        </div>
+        <input id="quickPostFile" class="quick-post-file" type="file" accept="image/*,video/*" hidden>
+      </section>`;
+      if(sponsoredAds.length) html+=`<section class="sponsored-feed-section">${sponsoredAds.map(sponsoredAdHTML).join('')}</section>`;
+      html += v80EntityFeedHTML(state.v80EntityFeed||[]);
+
+    if(!state.posts.length) html+=`<div class="card empty">Aucune publication pour le moment.<br><span>Publiez la première sur Tafaß.</span></div>`;
+    for(const p of state.posts){ if(token!==state.renderToken||state.route!=="home")return; html+=await postHTML(p); }
+    if(token!==state.renderToken||state.route!=="home")return;
+    $("content").innerHTML=html;
+  }
+
+function publisherBackgrounds(){
+    return [
+      ["plain","", "Classique"],
+      ["snow","linear-gradient(135deg,#ffffff,#eef3ff)","Blanc"],
+      ["violet","linear-gradient(135deg,#7c3aed,#ec4899)","Violet"],
+      ["blue","linear-gradient(135deg,#2563eb,#06b6d4)","Bleu"],
+      ["sunset","linear-gradient(135deg,#f97316,#ef4444,#ec4899)","Sunset"],
+      ["mint","linear-gradient(135deg,#10b981,#14b8a6)","Menthe"],
+      ["night","linear-gradient(135deg,#111827,#374151)","Nuit"],
+      ["pink","linear-gradient(135deg,#db2777,#9333ea)","Rose"]
+    ];
+  }
+  function savePublisherDraft(){
+    if(!$("postText")) return;
+    state.composerDraftText=$("postText").value||"";
+    state.composerBackground=state.composerBackground||"plain";
+    state.composerLocation=state.composerLocation||"";
+    state.composerFile=$("postFile")?.files?.[0]||state.composerFile||null;
+    state.composerVisibility=state.composerVisibility||"public";
+    state.composerMeta=state.composerMeta||{};
+  }
+  function openPublisher(){
+    const restoring=!!state.composerOpen;
+    if(!restoring){
+      state.composerBackground="plain";
+      state.composerLocation="";
+      state.composerDraftText="";
+      state.composerFile=null;
+      state.composerVisibility="public";
+      state.composerMeta={};
+    }
+    state.composerOpen=true;
+    openModal(`<div class="publisher-modal publisher-modal-v2">
+      <header class="publisher-header">
+        <button class="publisher-back" data-action="close-publisher" aria-label="Retour">←</button>
+        <div class="publisher-brand">
+          <img src="assets/tafass-logo-premium.svg" alt="Tafaß" class="publisher-logo">
+          <div><span class="eyebrow">TAFAß</span><h2>Créer une publication</h2></div>
+        </div>
+        <button class="publisher-top-publish" data-action="publish-post-news">PUBLIER</button>
+      </header>
+
+      <div class="publisher-scroll">
+        <div class="publisher-author">
+          ${avatarHTML(state.profile,"avatar publisher-avatar")}
+          <div class="publisher-author-copy"><b>${esc(nameOf(state.profile))}</b>
+            <button class="publisher-audience" type="button" data-action="publisher-audience"><span aria-hidden="true">◉</span> ${esc(state.composerVisibility==="friends"?"Amis":state.composerVisibility==="private"?"Moi uniquement":"Public")} <span>⌄</span></button>
+          </div>
+        </div>
+
+        <div class="publisher-editor-wrap">
+          <textarea id="postText" class="publisher-editor" maxlength="5000" placeholder="Quoi de neuf pour vous ?" aria-label="Texte de la publication">${esc(state.composerDraftText||"")}</textarea>
+          <div class="publisher-style-head"><span>Style du texte</span><small>Choisissez un fond</small></div>
+          <div class="publisher-backgrounds" role="listbox" aria-label="Fonds de publication">
+            ${publisherBackgrounds().map(([id,bg,label])=>`<button class="publisher-bg ${id==="plain"?"selected":""}" data-action="select-publisher-bg" data-bg="${id}" title="${esc(label)}" aria-label="${esc(label)}" style="${bg?`background:${bg};`:""}">${id==="plain"?"Aa":""}</button>`).join("")}
+          </div>
+        </div>
+
+        <div class="publisher-media-preview" id="publisherMediaPreview"></div>
+
+        <div class="publisher-tools">
+          <button data-action="publisher-photo"><span class="publisher-tool-icon photos">▣</span><span><b>Photos/Vidéos</b><small>Ajouter depuis votre appareil</small></span></button>
+          <button data-action="publisher-music"><span class="publisher-tool-icon music">♫</span><span><b>Musique</b><small>Ajouter une musique</small></span></button>
+          <button data-action="publisher-tag"><span class="publisher-tool-icon tag">♙</span><span><b>Identifier des personnes</b><small>Ajouter des personnes</small></span></button>
+          <button data-action="publisher-location"><span class="publisher-tool-icon location">⌖</span><span><b>Ajouter un lieu</b><small>Indiquer où vous êtes</small></span></button>
+          <button data-action="publisher-mood"><span class="publisher-tool-icon mood">☺</span><span><b>Humeur/Activité</b><small>Partager votre humeur</small></span></button>
+          <button data-action="publisher-message"><span class="publisher-tool-icon message">✦</span><span><b>Recevoir des messages</b><small>Autoriser les réponses</small></span></button>
+          <button data-action="publisher-event"><span class="publisher-tool-icon event">▦</span><span><b>Créer un évènement</b><small>Ajouter un évènement</small></span></button>
+          <button data-action="publisher-live"><span class="publisher-tool-icon live">●</span><span><b>Lancer un direct</b><small>Démarrer un direct</small></span></button>
+        </div>
+      </div>
+
+      <input id="postFile" type="file" accept="image/*,video/*" hidden>
+      <div class="publisher-bottom">
+        <span id="composerFileName">Aucun média sélectionné</span>
+        <button class="primary big" data-action="publish-post-news">PUBLIER</button>
+      </div>
+    </div>`);
+    const pf=$("postFile");
+    if(pf && state.composerFile){
+      try{
+        const dt=new DataTransfer();
+        dt.items.add(state.composerFile);
+        pf.files=dt.files;
+      }catch(_){}
+    }
+    const preview=()=>{
+      const f=pf?.files?.[0], box=$("publisherMediaPreview");
+      if(!box)return;
+      if(!f){box.innerHTML=""; $("composerFileName") && ($("composerFileName").textContent="Aucun média sélectionné"); return;}
+      $("composerFileName") && ($("composerFileName").textContent=f.name);
+      const url=URL.createObjectURL(f);
+      box.innerHTML=f.type.startsWith("video/")
+        ? `<div class="publisher-preview-frame"><video src="${url}" controls playsinline></video><button class="publisher-preview-remove" data-action="publisher-clear-media" aria-label="Retirer le média">×</button></div>`
+        : `<div class="publisher-preview-frame"><img src="${url}" alt="Aperçu de la publication"><button class="publisher-preview-remove" data-action="publisher-clear-media" aria-label="Retirer le média">×</button></div>`;
+    };
+    pf?.addEventListener("change",()=>{state.composerFile=pf.files?.[0]||null;preview();});
+    $("postText")?.addEventListener("input",()=>{state.composerDraftText=$("postText").value;});
+    preview();
+    setTimeout(()=>$("postText")?.focus(),80);
+  }
+
+  function openPublisherAudience() {
+    savePublisherDraft();
+    const current=state.composerVisibility||"public";
+    openModal(`<div class="modal-box composer-audience-modal">
+      <button class="modal-close" data-action="close-publisher-field">×</button>
+      <div class="composer-field-brand"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"></div>
+      <span class="eyebrow">TAFAß • AUDIENCE</span>
+      <h3>Qui peut voir votre publication ?</h3>
+      <p class="muted">Choisissez l’audience avant de publier.</p>
+      <div class="audience-options">
+        ${[
+          ["public","Public","Tout le monde peut voir cette publication.","◉"],
+          ["friends","Amis","Vos amis sur Tafaß.","👥"],
+          ["private","Moi uniquement","Visible uniquement par vous.","🔒"]
+        ].map(([v,t,s,ic])=>`<button class="audience-option ${current===v?"selected":""}" data-action="set-publisher-audience" data-audience="${v}"><span class="audience-option-icon">${ic}</span><span><b>${t}</b><small>${s}</small></span><i>${current===v?"✓":""}</i></button>`).join("")}
+      </div>
+    </div>`);
+  }
+
+  function publisherMusicCatalog(){
+    const styles=["Lo-fi Night","Afro Pulse","Tropical Flow","Piano Glow","Urban Wave","Sunset Drive","Acoustic Air","Future Pop","Ocean Dream","Cinematic Rise","Chill Focus","Island Beat"];
+    const moods=["Calme","Énergique","Romantique","Positif","Solaire","Nocturne","Élégant","Épique","Doux","Focus"];
+    const out=[];
+    for(let i=1;i<=120;i++) out.push({id:`ai-${i}`,title:`Tafaß Music ${String(i).padStart(3,'0')}`,style:styles[(i-1)%styles.length],mood:moods[(i*7-1)%moods.length],bpm:72+((i*11)%72),seed:i});
+    return out;
+  }
+  let musicAudioContext=null, musicNodes=[], currentMusicId=null, musicTimer=null;
+  function stopPublisherMusic(){
+    if(musicTimer)clearTimeout(musicTimer); musicTimer=null;
+    musicNodes.forEach(n=>{try{n.stop?.();n.disconnect?.();}catch(_){}}); musicNodes=[]; currentMusicId=null;
+  }
+  function playGeneratedMusic(track){
+    if(!track)return;
+    stopPublisherMusic();
+    try{
+      musicAudioContext ||= new (window.AudioContext||window.webkitAudioContext)();
+      const ctx=musicAudioContext; if(ctx.state==='suspended')ctx.resume().catch(()=>{});
+      const master=ctx.createGain(); master.gain.value=.055; master.connect(ctx.destination);
+      const scale=[220,247,277,330,370,440,494,554];
+      let step=0; currentMusicId=track.id;
+      const tick=()=>{
+        if(currentMusicId!==track.id)return;
+        const osc=ctx.createOscillator(), gain=ctx.createGain();
+        const freq=scale[(step*3+track.seed)%scale.length]*(step%8===7?.5:1);
+        osc.type=track.style.includes('Piano')?'sine':track.style.includes('Afro')?'triangle':'sine'; osc.frequency.value=freq;
+        gain.gain.setValueAtTime(.0001,ctx.currentTime); gain.gain.exponentialRampToValueAtTime(.7,ctx.currentTime+.025); gain.gain.exponentialRampToValueAtTime(.0001,ctx.currentTime+.24);
+        osc.connect(gain);gain.connect(master);osc.start();osc.stop(ctx.currentTime+.26);musicNodes.push(osc);step=(step+1)%16;
+        musicTimer=setTimeout(tick,Math.max(180,60000/track.bpm/2));
+      }; tick();
+    }catch(e){toast('Lecture audio indisponible sur cet appareil.');}
+  }
+  function openPublisherMusic(){
+    savePublisherDraft();
+    const tracks=publisherMusicCatalog();
+    openModal(`<div class="modal-box composer-field-modal publisher-music-modal">
+      <button class="modal-close" data-action="close-publisher-field" aria-label="Fermer">×</button>
+      <div class="composer-field-brand"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"></div>
+      <span class="eyebrow">TAFAß • MUSIC LAB</span><h3>Choisir une musique</h3>
+      <p class="muted">120 pistes générées automatiquement. Une seule musique peut être attachée à la publication.</p>
+      <div class="music-search-row"><input id="publisherMusicSearch" class="premium-input" placeholder="Rechercher une piste, un style ou une ambiance…"><span class="music-count">120</span></div>
+      <div id="publisherMusicList" class="publisher-music-list">${tracks.map(t=>`<button type="button" class="publisher-music-item" data-action="select-publisher-music" data-music-id="${t.id}"><span class="music-cover">♫</span><span><b>${esc(t.title)}</b><small>${esc(t.style)} · ${esc(t.mood)} · ${t.bpm} BPM</small></span><span class="music-play">▶</span></button>`).join('')}</div>
+    </div>`);
+    const list=$('publisherMusicList'), search=$('publisherMusicSearch');
+    search?.addEventListener('input',()=>{const q=search.value.trim().toLowerCase();[...list.children].forEach(el=>el.classList.toggle('hidden',q&&!el.textContent.toLowerCase().includes(q)));});
+  }
+  async function openPublisherTag(){
+    savePublisherDraft();
+    const {data:rows}=await sb.from('friendships').select('user_id,friend_id').or(`user_id.eq.${state.user.id},friend_id.eq.${state.user.id}`).limit(200);
+    const ids=[...new Set((rows||[]).map(r=>r.user_id===state.user.id?r.friend_id:r.user_id).filter(Boolean))];
+    const {data:friends}=ids.length?await sb.from('profiles').select('id,first_name,last_name,username,avatar_url').in('id',ids).order('first_name'):{data:[]};
+    openModal(`<div class="modal-box composer-field-modal publisher-tag-modal"><button class="modal-close" data-action="close-publisher-field">×</button><div class="composer-field-brand"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"></div><span class="eyebrow">TAFAß • AMIS</span><h3>Identifier des personnes</h3><p class="muted">Choisissez uniquement parmi vos amis Tafaß.</p><input id="publisherTagSearch" class="premium-input" placeholder="Rechercher un ami…"><div id="publisherTagList" class="publisher-tag-list">${(friends||[]).map(f=>`<button class="publisher-tag-person" type="button" data-action="select-publisher-tag" data-id="${esc(f.id)}" data-name="${esc(nameOf(f))}">${avatarHTML(f,'avatar tiny-avatar')}<span><b>${esc(nameOf(f))}</b><small>@${esc(f.username||'membre')}</small></span><i>＋</i></button>`).join('')||'<div class="empty">Vous n’avez pas encore d’amis à identifier.</div>'}</div><button class="primary big" data-action="close-publisher-field">Terminer</button></div>`);
+    $('publisherTagSearch')?.addEventListener('input',e=>{const q=e.target.value.toLowerCase();document.querySelectorAll('.publisher-tag-person').forEach(x=>x.classList.toggle('hidden',q&&!x.textContent.toLowerCase().includes(q)));});
+  }
+  function openPublisherLocation(){
+    savePublisherDraft();
+    openModal(`<div class="modal-box composer-field-modal publisher-location-modal"><button class="modal-close" data-action="close-publisher-field">×</button><div class="composer-field-brand"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"></div><span class="eyebrow">TAFAß • LOCALISATION</span><h3>Ajouter un lieu</h3><p class="muted">Recherchez un lieu réel. Sélectionnez un résultat vérifié par la recherche géographique.</p><div class="place-search-wrap-v4"><input id="publisherPlaceInput" class="premium-input" placeholder="Rechercher un lieu, une rue, une ville…" autocomplete="off"><div id="publisherPlaceResults" class="place-results-v4"></div></div><button class="primary big" data-action="publisher-location-apply">Ajouter le lieu</button></div>`);
+    installPlaceSearch('publisherPlaceInput','publisherPlaceResults');
+  }
+  function openPublisherField(field){
+    const config={
+      music:{eyebrow:"MUSIQUE",title:"Ajouter une musique",label:"Nom de la musique",placeholder:"Ex. Ma chanson préférée",action:"publisher-field-apply",button:"Ajouter"},
+      tag:{eyebrow:"PERSONNES",title:"Identifier des personnes",label:"Nom de la personne",placeholder:"Rechercher ou saisir un nom",action:"publisher-field-apply",button:"Identifier"},
+      location:{eyebrow:"LIEU",title:"Ajouter un lieu",label:"Lieu de la publication",placeholder:"Ex. Antananarivo, Madagascar",action:"publisher-field-apply",button:"Ajouter le lieu"},
+      event:{eyebrow:"ÉVÈNEMENT",title:"Créer un évènement",label:"Nom de l’évènement",placeholder:"Ex. Rencontre Tafaß",action:"publisher-field-apply",button:"Ajouter l’évènement"},
+      question:{eyebrow:"QUESTION",title:"Poser une question",label:"Votre question",placeholder:"Écrivez votre question…",action:"publisher-field-apply",button:"Ajouter la question"}
+    }[field] || null;
+    if(!config)return;
+    savePublisherDraft();
+    openModal(`<div class="modal-box composer-field-modal">
+      <button class="modal-close" data-action="close-publisher-field" aria-label="Fermer">×</button>
+      <div class="composer-field-brand"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"></div>
+      <span class="eyebrow">TAFAß • ${config.eyebrow}</span>
+      <h3>${config.title}</h3>
+      <p class="muted">Ajoutez cet élément à votre publication sans quitter l’éditeur.</p>
+      <label class="composer-field-label">${config.label}<input id="publisherFieldInput" maxlength="500" autocomplete="off" placeholder="${config.placeholder}"></label>
+      <div class="composer-field-actions"><button class="secondary-action" data-action="close-publisher-field">Annuler</button><button class="primary" data-action="${config.action}" data-field="${field}">${config.button}</button></div>
+    </div>`);
+    setTimeout(()=>$("publisherFieldInput")?.focus(),60);
+  }
+
+  function openLiveSetup(){
+    savePublisherDraft();
+    openModal(`<div class="modal-box live-setup-modal">
+      <button class="modal-close" data-action="close-publisher-field">×</button>
+      <div class="composer-field-brand"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"></div>
+      <span class="eyebrow">TAFAß • DIRECT</span>
+      <h3>Lancer un direct</h3>
+      <p class="muted">Votre caméra et votre microphone seront utilisés pendant le direct.</p>
+      <label class="composer-field-label">Titre du direct<input id="liveTitleInput" maxlength="120" placeholder="Ex. Direct Tafaß"></label>
+      <div class="live-permission-note">● Caméra · ● Microphone · Temps réel</div>
+      <button class="primary big" data-action="confirm-live-start">Lancer le direct</button>
+    </div>`);
+    setTimeout(()=>$("liveTitleInput")?.focus(),50);
+  }
+
+  const livePeers = new Map();
+  let liveStream = null;
+  let liveChannel = null;
+  let liveSessionId = null;
+  let liveRole = null;
+  let liveViewerPc = null;
+  let liveViewerId = null;
+  let liveCommentsChannel = null;
+  let liveCommentRows = [];
+  let liveViewerCount = 0;
+  let liveFacingMode = "user";
+  let liveMicEnabled = true;
+
+  // WebRTC: STUN is the safe default. A production TURN server can be supplied
+  // through window.TAFASS_TURN_SERVERS without hard-coding credentials in the app.
+  function liveIceServers(){
+    const configured = Array.isArray(window.TAFASS_TURN_SERVERS) ? window.TAFASS_TURN_SERVERS : [];
+    return [{urls:"stun:stun.l.google.com:19302"}, ...configured].filter(x => x && x.urls);
+  }
+  function createLivePeer(){
+    return new RTCPeerConnection({iceServers:liveIceServers(), bundlePolicy:"max-bundle", rtcpMuxPolicy:"require"});
+  }
+  function liveChannelName(id){ return `tafass-live:${id}`; }
+  async function loadLiveComments(sessionId){
+    const r=await sb.from('live_comments').select('id,user_id,content,created_at,profiles(first_name,last_name,username,avatar_url)').eq('live_session_id',sessionId).order('created_at',{ascending:true}).limit(150);
+    liveCommentRows=r.error?[]:(r.data||[]); renderLiveComments();
+  }
+  function renderLiveComments(){
+    const box=$('liveCommentsList'); if(!box)return;
+    box.innerHTML=liveCommentRows.slice(-80).map(c=>`<div class="live-comment-row">${avatarHTML(c.profiles||{},'avatar live-comment-avatar')}<div><b>${esc(nameOf(c.profiles||{}))}</b><span>${esc(c.content||'')}</span></div></div>`).join('') || `<div class="live-comments-empty">Les commentaires du direct apparaîtront ici.</div>`;
+    box.scrollTop=box.scrollHeight;
+  }
+  async function setupLiveComments(sessionId){
+    if(liveCommentsChannel){try{await sb.removeChannel(liveCommentsChannel);}catch(_){} liveCommentsChannel=null;}
+    await loadLiveComments(sessionId);
+    liveCommentsChannel=sb.channel(`tafass-live-comments:${sessionId}`)
+      .on('postgres_changes',{event:'INSERT',schema:'public',table:'live_comments',filter:`live_session_id=eq.${sessionId}`},async payload=>{
+        const c=payload.new;
+        const p=(await sb.from('profiles').select('first_name,last_name,username,avatar_url').eq('id',c.user_id).maybeSingle()).data||{};
+        if(!liveCommentRows.some(x=>x.id===c.id)){liveCommentRows.push({...c,profiles:p});renderLiveComments();}
+      })
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'live_sessions',filter:`id=eq.${sessionId}`},async payload=>{
+        if(payload.new?.status==='ended' && liveRole==='viewer'){
+          try{liveViewerPc?.close();}catch(_){}
+          if(liveChannel){try{await sb.removeChannel(liveChannel);}catch(_){}}
+          liveViewerPc=null;liveChannel=null;liveSessionId=null;liveRole=null;liveViewerId=null;
+          if(liveCommentsChannel){try{await sb.removeChannel(liveCommentsChannel);}catch(_){} liveCommentsChannel=null;}
+          closeModal(); toast('Le direct est terminé.'); if(state.route==='home') renderFeed();
+        }
+      }).subscribe();
+  }
+  async function sendLiveComment(){
+    const input=$('liveCommentInput'), text=input?.value.trim()||'';
+    if(!text||!liveSessionId)return;
+    const r=await sb.from('live_comments').insert({live_session_id:liveSessionId,user_id:state.user.id,content:text.slice(0,500)});
+    if(r.error)return toast('Commentaire du direct impossible : '+r.error.message);
+    if(input)input.value='';
+  }
+  function liveCommentsMarkup(){
+    return `<section class="live-comments-panel"><div class="live-comments-head"><div><b>Commentaires en direct</b><small>Les messages sont visibles par le diffuseur et les spectateurs.</small></div><span>● LIVE</span></div><div id="liveCommentsList" class="live-comments-list"></div><form id="liveCommentForm" class="live-comment-form"><input id="liveCommentInput" maxlength="500" placeholder="Écrire un commentaire…" autocomplete="off"><button type="submit" aria-label="Envoyer">➤</button></form></section>`;
+  }
+
+  async function startLiveFromPublisher(){
+    savePublisherDraft();
+    let stream;
+    try {
+      if(!navigator.mediaDevices?.getUserMedia) throw new Error("unsupported");
+      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:1280},height:{ideal:720}},audio:true});
+    } catch(e) {
+      return toast("Autorisez la caméra et le microphone pour lancer un direct.");
+    }
+    const title = (state.composerMeta?.live_title || "Direct Tafaß").trim().slice(0,120);
+    const {data:session,error} = await sb.from("live_sessions").insert({user_id:state.user.id,title,status:"live",started_at:new Date().toISOString()}).select().single();
+    if(error){ stream.getTracks().forEach(t=>t.stop()); return toast("Impossible de lancer le direct : "+error.message); }
+    liveStream=stream; liveSessionId=session.id; liveRole="broadcaster"; liveFacingMode="user"; liveMicEnabled=true; liveViewerCount=0; state.activeLive=session;
+    closeModal(); await openBroadcasterLive(session,stream);
+    if(state.route==="home") renderFeed();
+  }
+
+  async function openBroadcasterLive(session,stream){
+    liveChannel=sb.channel(liveChannelName(session.id),{config:{broadcast:{self:false}}});
+    liveChannel.on("broadcast",{event:"viewer-join"},async ({payload})=>{
+      if(liveRole!=="broadcaster" || !payload?.viewerId) return;
+      liveViewerCount=Math.max(0,liveViewerCount+1);
+      renderLiveViewerCount();
+      await liveChannel.send({type:"broadcast",event:"viewer-count",payload:{count:liveViewerCount}});
+    });
+    liveChannel.on("broadcast",{event:"viewer-leave"},async ({payload})=>{
+      if(liveRole!=="broadcaster" || !payload?.viewerId) return;
+      const old=livePeers.get(payload.viewerId); if(old) old.close();
+      livePeers.delete(payload.viewerId); liveViewerCount=Math.max(0,liveViewerCount-1); renderLiveViewerCount();
+      await liveChannel.send({type:"broadcast",event:"viewer-count",payload:{count:liveViewerCount}});
+    });
+    liveChannel.on("broadcast",{event:"viewer-offer"},async ({payload})=>{
+      if(liveRole!=="broadcaster" || !payload?.viewerId || !payload?.offer) return;
+      const viewerId=payload.viewerId;
+      const old=livePeers.get(viewerId); if(old) old.close();
+      const pc=createLivePeer();
+      livePeers.set(viewerId,pc);
+      stream.getTracks().forEach(track=>pc.addTrack(track,stream));
+      pc.onicecandidate=e=>{if(e.candidate) liveChannel?.send({type:"broadcast",event:"broadcaster-ice",payload:{viewerId,candidate:e.candidate}});};
+      pc.onconnectionstatechange=()=>{if(["failed","closed"].includes(pc.connectionState)){pc.close();livePeers.delete(viewerId);}};
+      try{
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.offer));
+        const answer=await pc.createAnswer(); await pc.setLocalDescription(answer);
+        await liveChannel.send({type:"broadcast",event:"broadcaster-answer",payload:{viewerId,answer:pc.localDescription}});
+      }catch(err){console.error("Tafaß live answer:",err);}
+    });
+    liveChannel.on("broadcast",{event:"viewer-ice"},async ({payload})=>{
+      const pc=livePeers.get(payload?.viewerId);
+      if(pc && payload?.candidate) try{await pc.addIceCandidate(payload.candidate);}catch(_){}
+    });
+    await liveChannel.subscribe();
+    openModal(`<div class="modal-box live-modal live-broadcast-modal" data-live-broadcaster="true">
+      <div class="live-lock-badge">🔒 DIRECT ACTIF · Terminez le direct pour quitter</div>
+      <div class="live-modal-head"><div><span class="eyebrow">TAFAß • DIRECT</span><h3>Vous êtes en direct</h3></div><span class="live-pulse">● LIVE</span></div>
+      <video id="liveLocalVideo" class="live-video" autoplay muted playsinline></video>
+      <div class="live-status"><span>●</span><b>Diffusion en temps réel</b><small>Audio + vidéo en direct. Les spectateurs peuvent commenter et vous répondez en direct.</small><strong id="liveViewerCount">0 spectateur</strong></div>
+      <div class="live-controls"><button class="secondary-action" data-action="live-flip-camera">↻ Caméra</button><button class="secondary-action" data-action="live-toggle-mic">🎙 Micro</button></div>
+      ${liveCommentsMarkup()}
+      <button class="danger-action live-end-button" data-action="end-live">Terminer le direct</button>
+    </div>`);
+    const v=$("liveLocalVideo"); if(v){v.srcObject=stream;await v.play().catch(()=>{});}
+    await setupLiveComments(session.id);
+    $("liveCommentForm")?.addEventListener("submit",e=>{e.preventDefault();sendLiveComment();});
+  }
+
+  async function watchLive(id){
+    // Open the viewer immediately so a slow/failed WebRTC negotiation can never
+    // leave the user stuck on the feed without a way to cancel.
+    const {data:session,error}=await sb.from("live_sessions").select("id,user_id,title,status,started_at,profiles(first_name,last_name,username,avatar_url)").eq("id",id).maybeSingle();
+    if(error || !session || session.status!=="live") return toast("Ce direct est terminé.");
+    if(session.user_id===state.user.id) return toast("Vous êtes déjà le diffuseur de ce direct.");
+
+    liveRole="viewer"; liveSessionId=id; liveViewerId=crypto.randomUUID();
+    liveChannel=sb.channel(liveChannelName(id),{config:{broadcast:{self:false}}});
+    liveViewerPc=createLivePeer();
+
+    // A viewer has no local media tracks, so explicitly request receive-only
+    // audio/video transceivers. Without them, some browsers create an empty SDP.
+    try{
+      liveViewerPc.addTransceiver("video",{direction:"recvonly"});
+      liveViewerPc.addTransceiver("audio",{direction:"recvonly"});
+    }catch(err){ console.warn("Tafaß live recv transceiver:",err); }
+
+    liveViewerPc.ontrack=e=>{
+      const v=$("liveRemoteVideo");
+      if(v && e.streams?.[0]){
+        v.srcObject=e.streams[0];
+        v.play?.().catch(()=>{});
+      }
+    };
+    liveViewerPc.onicecandidate=e=>{
+      if(e.candidate && liveRole==="viewer" && liveSessionId===id)
+        liveChannel?.send({type:"broadcast",event:"viewer-ice",payload:{viewerId:liveViewerId,candidate:e.candidate}});
+    };
+    liveChannel.on("broadcast",{event:"viewer-count"},({payload})=>{
+      if(payload?.count!=null){ liveViewerCount=Number(payload.count)||0; renderLiveViewerCount(); }
+    });
+    liveChannel.on("broadcast",{event:"broadcaster-answer"},async ({payload})=>{
+      if(payload?.viewerId!==liveViewerId || !payload.answer || !liveViewerPc)return;
+      try{await liveViewerPc.setRemoteDescription(new RTCSessionDescription(payload.answer));}catch(err){console.warn("Tafaß live answer:",err);}
+    });
+    liveChannel.on("broadcast",{event:"broadcaster-ice"},async ({payload})=>{
+      if(payload?.viewerId!==liveViewerId || !payload.candidate || !liveViewerPc)return;
+      try{await liveViewerPc.addIceCandidate(payload.candidate);}catch(_){}
+    });
+
+    openModal(`<div class="modal-box live-modal live-viewer-modal">
+      <button class="modal-close" data-action="close-live-viewer" aria-label="Fermer le direct">×</button>
+      <div class="live-modal-head"><div><span class="eyebrow">TAFAß • EN DIRECT</span><h3>${esc(session.title||"Direct Tafaß")}</h3><small class="admin-section-note">${esc(nameOf(session.profiles||{}))}</small></div><span class="live-pulse">● LIVE</span></div>
+      <video id="liveRemoteVideo" class="live-video" autoplay playsinline controls></video>
+      <div class="live-status"><span>●</span><b id="liveConnectionStatus">Connexion au direct…</b><small>Vous entendez l'audio du diffuseur. Vos commentaires sont transmis en temps réel.</small><strong id="liveViewerCount">1 spectateur</strong></div>
+      <div class="live-controls"><button class="secondary-action" data-action="live-toggle-mic">🔊 Audio</button><button class="secondary-action" data-action="live-gift" data-gift="heart" data-coins="10">❤️ 10</button><button class="secondary-action" data-action="live-gift" data-gift="rose" data-coins="50">🌹 50</button><button class="secondary-action" data-action="live-gift" data-gift="star" data-coins="100">⭐ 100</button></div>
+      ${liveCommentsMarkup()}
+    </div>`);
+
+    try{
+      const sub=await liveChannel.subscribe();
+      if(liveRole!=="viewer" || liveSessionId!==id)return;
+      if(sub && sub!=="SUBSCRIBED") console.warn("Tafaß live channel status:",sub);
+
+      await liveChannel.send({type:"broadcast",event:"viewer-join",payload:{viewerId:liveViewerId}});
+      if(liveRole!=="viewer" || liveSessionId!==id)return;
+
+      const offer=await liveViewerPc.createOffer();
+      await liveViewerPc.setLocalDescription(offer);
+      await liveChannel.send({type:"broadcast",event:"viewer-offer",payload:{viewerId:liveViewerId,offer:liveViewerPc.localDescription}});
+      const status=$("liveConnectionStatus");
+      if(status)status.textContent="Direct en temps réel";
+    }catch(err){
+      console.error("Tafaß watch live:",err);
+      const status=$("liveConnectionStatus");
+      if(status)status.textContent="Connexion impossible";
+      toast("Impossible de regarder ce direct pour le moment.");
+    }
+
+    if(liveRole==="viewer" && liveSessionId===id){
+      await setupLiveComments(id);
+      $("liveCommentForm")?.addEventListener("submit",e=>{e.preventDefault();sendLiveComment();});
+    }
+  }
+
+  function renderLiveViewerCount(){
+    const el=$("liveViewerCount"); if(!el)return;
+    const n=Math.max(0,Number(liveViewerCount)||0); el.textContent=`${n} ${n===1?"spectateur":"spectateurs"}`;
+  }
+  async function flipLiveCamera(){
+    if(!liveStream)return;
+    liveFacingMode=liveFacingMode==="user"?"environment":"user";
+    try{
+      const next=await navigator.mediaDevices.getUserMedia({video:{facingMode:liveFacingMode,width:{ideal:1280},height:{ideal:720}},audio:false});
+      const track=next.getVideoTracks()[0];
+      const old=liveStream.getVideoTracks()[0];
+      liveStream.removeTrack(old); old.stop(); liveStream.addTrack(track);
+      livePeers.forEach(pc=>{const sender=pc.getSenders().find(x=>x.track?.kind==="video"); if(sender)sender.replaceTrack(track).catch(()=>{});});
+      const v=$("liveLocalVideo"); if(v){v.srcObject=liveStream; await v.play().catch(()=>{});}
+    }catch(_){toast("Impossible de changer de caméra.");}
+  }
+  function toggleLiveMic(){
+    if(liveRole==="broadcaster" && liveStream){
+      liveMicEnabled=!liveMicEnabled; liveStream.getAudioTracks().forEach(t=>t.enabled=liveMicEnabled);
+      toast(liveMicEnabled?"Micro activé":"Micro coupé");
+    }else if(liveRole==="viewer" && liveViewerPc){
+      const v=$("liveRemoteVideo"); if(v){v.muted=!v.muted; toast(v.muted?"Audio coupé":"Audio activé");}
+    }
+  }
+  async function endLive(sessionIdOverride=null){
+    const id=sessionIdOverride || liveSessionId;
+    if(!id)return;
+    const isCurrent=String(liveSessionId)===String(id);
+    try{
+      const {error}=await sb.from("live_sessions").update({status:"ended",ended_at:new Date().toISOString()}).eq("id",id).eq("user_id",state.user.id);
+      if(error) return toast("Impossible de terminer ce direct : "+error.message);
+    }catch(err){
+      return toast("Impossible de terminer ce direct.");
+    }
+    if(isCurrent){
+      livePeers.forEach(pc=>pc.close()); livePeers.clear();
+      if(liveStream) liveStream.getTracks().forEach(t=>t.stop());
+      liveViewerPc?.close();
+      if(liveChannel){try{await sb.removeChannel(liveChannel);}catch(_){}}
+      if(liveCommentsChannel){try{await sb.removeChannel(liveCommentsChannel);}catch(_){} liveCommentsChannel=null;}
+      stopPublisherMusic();
+      liveStream=null;liveViewerPc=null;liveChannel=null;liveSessionId=null;liveRole=null;liveViewerId=null;liveCommentRows=[];liveViewerCount=0;state.activeLive=null;
+      closeModal();
+    }
+    if(state.route==="home") await renderFeed();
+    toast("Direct terminé.");
+  }
+
+  async function publishPostNews(){
+    const text=$("postText")?.value.trim()||"";
+    const pf=$("postFile"), vf=$("postVideoFile"), file=pf?.files?.[0]||vf?.files?.[0];
+    if(!text&&!file)return toast("Écrivez quelque chose ou choisissez un média.");
+    const buttons=[...document.querySelectorAll('[data-action="publish-post-news"]')], btn=buttons[buttons.length-1];
+    setLoading(btn,true,"Publier");
+    try{
+      let media_url=null,media_type=null;
+      if(file){
+        const moderation=await moderationCheckMedia(file,file.type.startsWith("video/")?"post_video":"post_image");
+        if(!moderation.ok) throw new Error("Publication refusée : média protégé de l’administration Tafaß.");
+        const identity=await identityProtectionCheck({first_name:state.profile?.first_name,last_name:state.profile?.last_name,username:state.profile?.username,mediaHash:moderation.hash||"",context:"post_media"});
+        if(!identity.allowed) throw new Error(identity.message||"Publication refusée : violation de l’identité protégée.");
+        const ext=(file.name.split(".").pop()||"bin").toLowerCase();
+        const path=`${state.user.id}/${crypto.randomUUID()}.${ext}`;
+        const up=await uploadPostMedia(path,file,{upsert:false,contentType:file.type||undefined});
+        if(up.error)throw new Error("Upload : "+up.error.message);
+        media_url=sb.storage.from("posts").getPublicUrl(path).data.publicUrl;
+        media_type=file.type.startsWith("video/")?"video":"image";
+        await registerAdminMediaHash(moderation.hash,media_type.startsWith("video")?"post_video":"post_image",media_url);
+      }
+      const guard=await sb.rpc("tafa_account_guard",{p_user_id:state.user.id});
+      if(guard.error) throw new Error(guard.error.message);
+      if(guard.data?.allowed===false) throw new Error(guard.data.message||"Votre compte est restreint.");
+      const payload={user_id:state.user.id,content:text,media_url,media_type,visibility:state.composerVisibility||"public",location:state.composerLocation||null,background_style:state.composerBackground||"plain",publication_meta:state.composerMeta||{}};
+      let r=await sb.from("posts").insert(payload).select().single();
+      if(r.error && String(r.error.code)==="42703"){
+        delete payload.background_style;
+        delete payload.publication_meta;
+        r=await sb.from("posts").insert(payload).select().single();
+      }
+      if(r.error)throw new Error(r.error.message);
+      await logActivity("post_created","Publication créée","post",r.data?.id||null);
+      state.composerOpen=false; state.composerDraftText=""; state.composerFile=null; state.composerBackground="plain"; state.composerLocation=""; state.composerVisibility="public"; state.composerMeta={};
+      closeModal(); toast("Publication publiée"); await loadPosts(); await render();
+    }catch(e){toast(e?.message||"Publication impossible.");}
+    finally{setLoading(btn,false,"Publier");}
+  }
+  function appendPublisherText(prefix){
+    const t=$("postText"); if(!t)return;
+    t.value=(prefix+(t.value.trim()?`\n${t.value.trim()}`:"")).slice(0,5000);
+    t.focus();
+  }
+
+
+  async function reactionCountsVisibleFor(ownerId) {
+    if (!ownerId || ownerId === state.user.id) return true;
+    if (state.reactionSettingsCache.has(ownerId)) return state.reactionSettingsCache.get(ownerId);
+    const r = await sb.from("reaction_settings").select("show_reaction_counts").eq("user_id",ownerId).maybeSingle();
+    const visible = r.error ? true : r.data?.show_reaction_counts !== false;
+    state.reactionSettingsCache.set(ownerId, visible);
+    return visible;
+  }
+
+  function socialTextHTML(text) {
+    const value = String(text || "");
+    const parts = value.split(/(#[\p{L}\p{N}_-]+|@[\p{L}\p{N}_.-]+)/gu);
+    return parts.map(part => {
+      if (/^#[\p{L}\p{N}_-]+$/u.test(part)) return `<button type="button" class="social-tag-link" data-action="social-hashtag" data-tag="${esc(part.slice(1))}">${esc(part)}</button>`;
+      if (/^@[\p{L}\p{N}_.-]+$/u.test(part)) return `<button type="button" class="social-mention-link" data-action="social-mention" data-username="${esc(part.slice(1))}">${esc(part)}</button>`;
+      return esc(part);
+    }).join('');
+  }
+  function captionHTML(text, limit = 280) {
+    const value = String(text || "");
+    if (value.length <= limit) return `<div class="post-caption">${socialTextHTML(value)}</div>`;
+    const short = value.slice(0, limit).replace(/\s+\S*$/, "").trimEnd();
+    return `<div class="post-caption post-caption-collapsed" data-caption-state="collapsed">
+      <span class="caption-short">${socialTextHTML(short)}…</span>
+      <span class="caption-full" hidden>${socialTextHTML(value)}</span>
+      <button type="button" class="caption-toggle" data-action="toggle-caption">Voir plus</button>
+    </div>`;
+  }
+  async function openSocialHashtag(tag) {
+    const q=String(tag||'').trim().replace(/^#/,'');
+    if(!q) return;
+    state.searchQuery = `#${q}`;
+    return searchPage(`#${q}`);
+  }
+  async function openSocialMention(username) {
+    const u=String(username||'').trim().replace(/^@/,'');
+    if(!u) return;
+    const r=await sb.from('profiles').select('*').ilike('username',u).limit(1).maybeSingle();
+    if(r.error || !r.data) return toast(`Compte @${u} introuvable.`);
+    return openUserProfile(r.data.id);
+  }
+  async function copyPostLink(id) {
+    const url = `${location.origin}${location.pathname}#post-${encodeURIComponent(id)}`;
+    try { await navigator.clipboard.writeText(url); toast('✓ Lien de la publication copié'); }
+    catch { openModal(`<div class="modal-box social-share-link-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">PARTAGE</span><h3>Lien de la publication</h3><input class="premium-input" readonly value="${esc(url)}"><button class="primary big" data-action="close-modal">Fermer</button></div>`); }
+  }
+  function toggleCaption(btn) {
+    const box = btn?.closest(".post-caption");
+    if (!box) return;
+    const full = box.querySelector(".caption-full"), short = box.querySelector(".caption-short");
+    const collapsed = box.dataset.captionState !== "expanded";
+    if (full) full.hidden = !collapsed;
+    if (short) short.hidden = collapsed;
+    box.dataset.captionState = collapsed ? "expanded" : "collapsed";
+    btn.textContent = collapsed ? "Voir moins" : "Voir plus";
+  }
+
+  async function postViewCount(postId) {
+    const r = await sb.rpc("tafa_post_view_count", { p_post_id: postId });
+    return r.error ? Number(0) : Number(r.data || 0);
+  }
+  async function recordPostView(postId) {
+    if (!state.user || !postId) return;
+    const r = await sb.rpc("tafa_record_post_view", { p_post_id: postId });
+    if (!r.error) {
+      const el = document.querySelector(`[data-post-views="${CSS.escape(String(postId))}"]`);
+      if (el && r.data != null) el.textContent = `${Number(r.data) || 0} vue${Number(r.data)===1?'':'s'}`;
+    }
+  }
+
+  async function postHTML(p) {
+    const [rs, cs, sh, showReactionCounts, views] = await Promise.all([reactionsFor(p.id), commentsFor(p.id), sharersFor(p.id), reactionCountsVisibleFor(p.user_id), postViewCount(p.id)]);
+    const counts = {}; rs.forEach(r => counts[r.reaction_type] = (counts[r.reaction_type] || 0) + 1);
+    const reactorIds=[...new Set(rs.map(r=>r.user_id).filter(Boolean))].slice(0,20);
+    const reactorProfiles=reactorIds.length ? (await sb.from("profiles").select("id,first_name,last_name,username,avatar_url").in("id",reactorIds)).data||[] : [];
+    const reactorMap=new Map(reactorProfiles.map(x=>[String(x.id),x]));
+    const reactionNames=rs.map(r=>reactorMap.get(String(r.user_id))).filter(Boolean).slice(0,8).map(x=>esc(nameOf(x))).join(", ");
+    const mine = rs.find(r => r.user_id === state.user.id)?.reaction_type;
+    const totalReactions = Object.values(counts).reduce((a,b) => a+b, 0);
+    const reactionVisual = showReactionCounts ? Object.entries(counts).map(([k,v]) => `<span class="reaction-chip" data-reaction-chip="${esc(k)}"><i>${reactionMeta[k]?.[1] || "👍"}</i><b>${v}</b></span>`).join("") : `<span class="reaction-hidden-badge">🔒 Réactions masquées</span>`;
+    const media = p.media_url
+      ? (p.media_type === "video" || p.media_type === "reel"
+        ? `<video class="post-media protected-media" data-post-viewable="1" data-post-id="${esc(p.id)}" src="${esc(p.media_url)}" controls preload="metadata"></video>`
+        : `<img class="post-media protected-media" src="${esc(p.media_url)}" alt="Publication">`)
+      : "";
+    const byParent = new Map();
+    cs.forEach(c => { const k = c.parent_id || "root"; if (!byParent.has(k)) byParent.set(k, []); byParent.get(k).push(c); });
+    const commentHTML = (parentId = null, depth = 0) => (byParent.get(parentId || "root") || []).map(c => {
+      const own = c.user_id === state.user.id;
+      const postOwner = p.user_id === state.user.id;
+      const actions = `<div class="comment-actions"><button data-action="reply-comment" data-id="${esc(c.id)}">Répondre</button>${own || postOwner ? `<button data-action="delete-comment" data-id="${esc(c.id)}">Supprimer</button>` : ""}</div>`;
+      const commentAuthor = c.author || (own ? state.profile : null);
+      return `<div class="comment comment-depth-${Math.min(depth,3)}" data-comment-id="${esc(c.id)}">${profileLink(commentAuthor, avatarHTML(commentAuthor), "profile-link profile-avatar-link") }<div class="bubble"><div class="comment-author-line">${profileLink(commentAuthor, `${displayNameHTML(commentAuthor)}`, "profile-link profile-comment-name")}<small>${timeAgo(c.created_at)}</small></div><div class="comment-text">${esc(c.content || c.text || "")}</div>${actions}<div class="reply-box" id="reply-${esc(c.id)}"></div>${commentHTML(c.id, depth+1)}</div></div>`;
+    }).join("");
+    const shareNames = sh.slice(0,3).map(x => esc(nameOf(x.user))).join(", ");
+    const shareSummary = sh.length ? `<span class="share-summary">↗ ${shareNames}${sh.length > 3 ? ` +${sh.length-3}` : ""}</span>` : "";
+    const sharedMeta = p.publication_meta && typeof p.publication_meta === "object" && p.publication_meta.shared_from_post_id ? p.publication_meta : null;
+    const sharedBanner = sharedMeta ? `<div class="shared-post-banner"><span>↗</span><div><b>${esc(nameOf(p.author||state.profile))} a partagé cette publication</b><small>Publication originale de ${esc(sharedMeta.shared_from_user_name||"un membre Tafaß")}${sharedMeta.shared_from_group_name?` · ${esc(sharedMeta.shared_from_group_name)}`:""}</small></div></div>` : "";
+    return `<article class="post post-premium" id="post-${esc(p.id)}" data-post-id="${esc(p.id)}" data-post-bg="${esc(p.background_style || "plain")}" data-media-type="${esc(p.media_type || "")}">
+      <div class="post-head">${profileLink(p.author, avatarHTML(p.author), "profile-link profile-avatar-link")}<div class="meta">${profileLink(p.author, `<span class="post-author-name">${displayNameHTML(p.author)}</span>`, "profile-link profile-meta-link")}<span class="post-time"><small>${timeAgo(p.created_at)} · ${esc(p.visibility || "public")}</small></span></div><button class="post-menu" data-action="post-menu" data-id="${esc(p.id)}">⋯</button></div>${sharedBanner}
+      ${p.content ? `<div class="post-body ${p.background_style && p.background_style !== "plain" ? "post-body-has-bg" : ""}">${captionHTML(p.content)}</div>` : ""}${media}
+      ${p.publication_meta && typeof p.publication_meta === "object" ? (()=>{const m=p.publication_meta||{};const chips=[];if(m.music)chips.push(`<button type="button" class="post-music-chip" data-action="play-post-music" data-music-id="${esc(m.music_id||'ai-1')}" data-music-seed="${esc(m.music_seed||1)}">♫ ${esc(m.music)} · Écouter</button>`);if(m.tag)chips.push(`<span>👥 ${esc(m.tag)}</span>`);if(m.location)chips.push(`<span>📍 ${esc(m.location)}</span>`);if(m.event)chips.push(`<span>📅 ${esc(m.event)}</span>`);if(m.mood)chips.push(`<span>☺ ${esc(m.mood)}</span>`);return chips.length?`<div class="post-meta-chips">${chips.join('')}</div>`:''})() : ""}
+      ${p.publication_meta?.receive_messages && p.user_id !== state.user.id ? `<div class="post-message-cta"><div><b>Messages ouverts</b><small>Envoyez un message privé directement à ${esc(nameOf(p.author||{}))}.</small></div><button type="button" data-action="post-receive-message" data-owner-id="${esc(p.user_id)}">💬 Message</button></div>` : ""}
+      <div class="post-stats" data-post-stats="${esc(p.id)}"><span class="reaction-summary" data-reaction-total="${totalReactions}">${reactionVisual || "<span class='muted-inline'>Aucune réaction</span>"}${showReactionCounts && totalReactions ? `<span class="reaction-people"><b data-reaction-total-number="${esc(p.id)}">${totalReactions}</b> réaction${totalReactions>1?'s':''}${reactionNames ? ` · ${reactionNames}${totalReactions>8?'…':''}` : ''}</span>` : ""}</span><span class="post-counts-inline"><span data-comment-count="${esc(p.id)}">${cs.length}</span> commentaire${cs.length!==1?'s':''} · <span data-share-count="${esc(p.id)}">${Number(p.shares || sh.length || 0)}</span> partage${Number(p.shares || sh.length || 0)!==1?'s':''}${(p.media_type === 'video' || p.media_type === 'reel') ? ` · <span class="post-view-count" data-post-views="${esc(p.id)}">${views} vue${views!==1?'s':''}</span>` : ''}</span></div>
+      ${shareSummary}
+      <div class="post-actions"><button class="react-btn" data-action="react" data-id="${esc(p.id)}" data-current-reaction="${esc(mine||"")}">${reactionMeta[mine]?.[1] || "👍"} ${esc(reactionMeta[mine]?.[0] || "J’aime")}</button><button data-action="comment" data-id="${esc(p.id)}">💬 Commenter</button><button data-action="share" data-id="${esc(p.id)}">↗ Reposter</button><button data-action="copy-post-link" data-id="${esc(p.id)}" title="Copier le lien">🔗</button></div>
+      <div id="reaction-${esc(p.id)}"></div>
+      <div class="comments">${commentHTML()}<div class="comment-form"><input id="comment-${esc(p.id)}" placeholder="Écrire un commentaire..."><button data-action="send-comment" data-id="${esc(p.id)}">Envoyer</button></div></div>
+    </article>`;
+  }
+
+  async function showReactions(id) {
+    const box = $("reaction-" + id); if (!box) return;
+    box.innerHTML = `<div class="reaction-picker-premium">${Object.entries(reactionMeta).map(([key,[label,icon]]) => `<button data-reaction="${key}" title="${esc(label)}"><span>${icon}</span><small>${esc(label)}</small></button>`).join("")}</div>`;
+    box.querySelectorAll("[data-reaction]").forEach(b => b.addEventListener("click", () => setReaction(id, b.dataset.reaction), { once: true }));
+  }
+  function optimisticReactionUI(postId, oldReaction, newReaction) {
+    const summary=document.querySelector(`[data-post-stats="${CSS.escape(String(postId))}"] .reaction-summary`);
+    const totalEl=document.querySelector(`[data-reaction-total-number="${CSS.escape(String(postId))}"]`);
+    const btn=document.querySelector(`[data-action="react"][data-id="${CSS.escape(String(postId))}"]`);
+    if(!summary) return;
+    const chip=(key)=>summary.querySelector(`[data-reaction-chip="${CSS.escape(String(key))}"] b`);
+    if(oldReaction && oldReaction!==newReaction){
+      const el=chip(oldReaction); if(el) el.textContent=String(Math.max(0,Number(el.textContent||0)-1));
+    }
+    if(!oldReaction){
+      const total=Number(summary.dataset.reactionTotal||0)+1; summary.dataset.reactionTotal=String(total); if(totalEl) totalEl.textContent=String(total);
+    }
+    const next=chip(newReaction);
+    if(next) next.textContent=String(Number(next.textContent||0)+1);
+    if(btn){ btn.dataset.currentReaction=newReaction; btn.classList.add("is-reacted"); const meta=reactionMeta[newReaction]||reactionMeta.like; btn.innerHTML=`${meta[1]} ${esc(meta[0])}`; }
+  }
+
+  async function setReaction(postId, reaction) {
+    const target=state.posts.find(x=>String(x.id)===String(postId));
+    if(target?.user_id && await denyIfBlocked(target.user_id,"Réaction impossible : ce compte est bloqué."))return;
+    // Instant UI: reflect the selected reaction immediately, then sync Supabase.
+    const picker = $("reaction-" + postId);
+    const button = document.querySelector(`[data-action="react"][data-id="${CSS.escape(String(postId))}"]`);
+    const oldReaction = button?.dataset.currentReaction || "";
+    const meta = reactionMeta[reaction] || ["J’aime", "👍"];
+    if (oldReaction === reaction) return;
+    optimisticReactionUI(postId, oldReaction, reaction);
+    if (picker) picker.innerHTML = "";
+    const { error } = await sb.rpc("tafa_set_post_reaction", { p_post_id: postId, p_reaction_type: reaction });
+    if (error) {
+      if (button) { button.classList.remove("is-reacted"); button.textContent = "👍 J’aime"; }
+      return toast(error.message);
+    }
+    toast("Réaction enregistrée");
+    loadPosts().then(()=>{ if (state.route === "profile") profilePage(state.profileTab); });
+  }
+  async function addComment(postId, parentId = null) {
+    const target=state.posts.find(x=>String(x.id)===String(postId));
+    if(target?.user_id && await denyIfBlocked(target.user_id,"Commentaire impossible : ce compte est bloqué."))return;
+    const input = $(parentId ? "reply-input-" + parentId : "comment-" + postId);
+    const text = input?.value.trim(); if (!text) return;
+    const payload = { post_id: postId, user_id: state.user.id, content: text, parent_id: parentId || null };
+    const { error } = await sb.from("comments").insert(payload);
+    if (error) return toast(error.message);
+    input.value = "";
+    const commentsBox=document.querySelector(`#post-${CSS.escape(String(postId))} .comments`);
+    const form=commentsBox?.querySelector('.comment-form');
+    const row=`<div class="comment comment-depth-${parentId?1:0} optimistic-comment">${avatarHTML(state.profile,'avatar')}<div class="bubble"><div class="comment-author-line"><b>${esc(nameOf(state.profile))}</b><small>à l’instant</small></div><div class="comment-text">${esc(text)}</div></div></div>`;
+    if(form) form.insertAdjacentHTML('beforebegin',row);
+    const count=document.querySelector(`[data-comment-count="${CSS.escape(String(postId))}"]`);
+    if(count) count.textContent=String(Number(count.textContent||0)+1);
+    toast(parentId ? "✓ Réponse publiée" : "✓ Commentaire publié");
+    loadPosts().then(()=>{ if(state.route === "profile") profilePage(state.profileTab); }).catch(()=>{});
+  }
+  async function sharePost(id) {
+    const target=state.posts.find(x=>String(x.id)===String(id));
+    if(target?.user_id && await denyIfBlocked(target.user_id,"Partage impossible : ce compte est bloqué."))return;
+    const { error } = await sb.rpc("tafa_share_post", { p_post_id: id, p_share_message: "" });
+    if (error) return toast(error.message);
+    // Une partage devient une vraie publication dans le profil du partageur.
+    // Le contenu original reste attribué à son auteur afin d’éviter toute ambiguïté.
+    const original = target || (await sb.from("posts").select("*").eq("id",id).maybeSingle()).data;
+    if(original){
+      const originalAuthor=original.author || (await sb.from("profiles").select("first_name,last_name,username").eq("id",original.user_id).maybeSingle()).data || {};
+      const meta={...(original.publication_meta&&typeof original.publication_meta==="object"?original.publication_meta:{}),shared_from_post_id:original.id,shared_from_user_id:original.user_id,shared_from_user_name:nameOf(originalAuthor),shared_at:new Date().toISOString()};
+      const clone={user_id:state.user.id,content:original.content||"",media_url:original.media_url||null,media_type:original.media_type||null,visibility:"public",background_style:original.background_style||"plain",publication_meta:meta};
+      let cr=await sb.from("posts").insert(clone);
+      if(cr.error && String(cr.error.code)==="42703"){ delete clone.background_style; delete clone.publication_meta; delete clone.media_sha256; cr=await sb.from("posts").insert(clone); }
+      if(cr.error) console.warn("Tafaß reshare:",cr.error.message);
+    }
+    const count=document.querySelector(`[data-share-count="${CSS.escape(String(id))}"]`);
+    if(count) count.textContent=String(Number(count.textContent||0)+1);
+    toast("✓ Publication partagée sur votre profil");
+    loadPosts().then(()=>{ if (state.route === "profile") profilePage(state.profileTab); }).catch(()=>{});
+  }
+
+  async function deleteComment(id) {
+    const row = document.querySelector(`[data-comment-id="${CSS.escape(String(id))}"]`);
+    const snapshot = row?.outerHTML || "";
+    row?.remove();
+    const postId=row?.closest?.(".post")?.dataset?.postId;
+    if(postId){ const count=document.querySelector(`[data-comment-count="${CSS.escape(String(postId))}"]`); if(count) count.textContent=String(Math.max(0,Number(count.textContent||0)-1)); }
+    toast("Commentaire supprimé");
+    const { error } = await sb.rpc("tafa_delete_comment", { p_comment_id: id });
+    if (error) { toast(error.message); await loadPosts(); return; }
+    loadPosts().then(()=>{ if (state.route === "profile") profilePage(state.profileTab); });
+  }
+  async function editPost(id) {
+    const p = state.posts.find(x => x.id === id) || (await sb.from("posts").select("*").eq("id",id).maybeSingle()).data;
+    if (!p || p.user_id !== state.user.id) return toast("Vous ne pouvez modifier que vos publications.");
+    openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">PUBLICATION</span><h3>Modifier la publication</h3><textarea id="editPostText" class="premium-textarea">${esc(p.content || "")}</textarea><button class="primary big" data-action="save-post-edit" data-id="${esc(id)}">Enregistrer</button></div>`);
+  }
+  async function savePostEdit(id) {
+    const content = $("editPostText")?.value.trim() || "";
+    const { error } = await sb.rpc("tafa_update_post", { p_post_id: id, p_content: content });
+    if (error) return toast(error.message);
+    closeModal(); toast("Publication modifiée"); await loadPosts();
+    if (state.route === "profile") await profilePage(state.profileTab);
+  }
+  async function deletePost(id) {
+    const row = document.querySelector(`[data-post-id="${CSS.escape(String(id))}"]`) || document.querySelector(`article.post:has([data-action="post-menu"][data-id="${CSS.escape(String(id))}"])`);
+    row?.remove();
+    state.posts = state.posts.filter(p => String(p.id) !== String(id));
+    closeModal(); toast("Publication supprimée");
+    const { error } = await sb.rpc("tafa_delete_post", { p_post_id: id });
+    if (error) { toast(error.message); await loadPosts(); return; }
+    loadPosts().then(()=>{ if (state.route === "profile") profilePage(state.profileTab); });
+  }
+  async function reportPost(id) {
+    const { error } = await sb.rpc("tafa_report_post", { p_post_id: id, p_reason: "Contenu à vérifier" });
+    if (error) return toast(error.message);
+    closeModal(); toast("Signalement envoyé");
+  }
+  async function publishPost() {
+    if (!state.user) return;
+    const text = $("postText")?.value.trim() || "", file = $("postFile")?.files?.[0];
+    if (!text && !file) return toast("Écrivez quelque chose ou choisissez un média.");
+    const button = $("publishBtn"); setLoading(button, true);
+    try {
+      let media_url = null, media_type = null;
+      if (file) {
+        const moderation=await moderationCheckMedia(file,file.type.startsWith("video/")?"post_video":"post_image");
+        if(!moderation.ok) throw new Error(moderation.message||"Publication refusée : média protégé de l’administration Tafaß.");
+        const ext = file.name.split(".").pop().toLowerCase(), path = `${state.user.id}/${crypto.randomUUID()}.${ext}`;
+        const up = await uploadPostMedia(path, file, { upsert: false });
+        if (up.error) throw new Error("Upload : " + up.error.message);
+        media_url = sb.storage.from("posts").getPublicUrl(path).data.publicUrl;
+        media_type = file.type.startsWith("video/") ? "reel" : "image";
+        await registerAdminMediaHash(moderation.hash,media_type==="reel"?"post_video":"post_image",media_url);
+      }
+      const { error } = await sb.from("posts").insert({ user_id: state.user.id, content: text, media_url, media_type, visibility: "public" });
+      if (error) throw new Error(error.message);
+      $("postText").value = ""; $("postFile").value = ""; toast("Publication publiée"); await loadPosts();
+    } catch (e) { toast(e.message); }
+    finally { setLoading(button, false, "Publier"); }
+  }
+
+  async function friendsPage(tab = state.friendsTab) {
+    state.friendsTab = tab || "suggestions";
+    const token = state.renderToken;
+    await getBlockedIds();
+    const { data: peopleRaw, error } = await sb.from("profiles").select("*").neq("id", state.user.id).order("created_at", { ascending:false }).limit(100);
+    const people=filterBlocked(peopleRaw||[],"id");
+    if (token !== state.renderToken) return;
+    if (error) return simplePage("Amis", `<div class="empty">${esc(error.message)}</div>`);
+
+    const [incomingR, sentR, mineR] = await Promise.all([
+      sb.from("friend_requests").select("sender_id,status").eq("receiver_id", state.user.id).eq("status", "pending"),
+      sb.from("friend_requests").select("receiver_id,status").eq("sender_id", state.user.id).eq("status", "pending"),
+      sb.from("friendships").select("friend_id").eq("user_id", state.user.id)
+    ]);
+    if (token !== state.renderToken) return;
+    const incoming = new Set((incomingR.data || []).map(x => x.sender_id));
+    const sent = new Set((sentR.data || []).map(x => x.receiver_id));
+    const friendIds = new Set((mineR.data || []).map(x => x.friend_id));
+    const map = new Map((people || []).map(p => [p.id, p]));
+    const friends = [...friendIds].map(id => map.get(id)).filter(Boolean);
+    const requests = [...incoming].map(id => map.get(id)).filter(Boolean);
+    const suggestions = (people || []).filter(p => !friendIds.has(p.id) && !incoming.has(p.id) && !sent.has(p.id));
+
+    // Calcul réel et sécurisé des amis en commun via une fonction SQL dédiée.
+    const commonMap = new Map();
+    if (people?.length) {
+      const commonR = await sb.rpc("tafa_common_friend_counts", { p_user_ids: people.map(p => p.id) });
+      (commonR.data || []).forEach(r => commonMap.set(r.user_id, Number(r.common_count || 0)));
+    }
+    const tabButton = (key, label, count) => `<button class="${state.friendsTab === key ? "active" : ""}" data-action="friends-tab" data-tab="${key}">${label}${count ? ` <span class="tab-count">${count}</span>` : ""}</button>`;
+    const body = state.friendsTab === "friends"
+      ? (friends.length ? friends.map(p => friendRow(p,"friend",commonMap.get(p.id)||0)).join("") : `<div class="empty">Vous n'avez pas encore d'amis.</div>`)
+      : state.friendsTab === "requests"
+        ? (requests.length ? requests.map(p => friendRow(p,"incoming",commonMap.get(p.id)||0)).join("") : `<div class="empty">Aucune demande en attente.</div>`)
+        : (suggestions.length ? suggestions.map(p => friendRow(p,sent.has(p.id)?"sent":"add",commonMap.get(p.id)||0)).join("") : `<div class="empty">Aucune suggestion pour le moment.</div>`);
+    const title = state.friendsTab === "friends" ? "Vos amis" : state.friendsTab === "requests" ? "Demandes reçues" : "Suggestions pour vous";
+    $("content").innerHTML = `<section class="clean-page friends-page"><div class="page-header clean-page-header"><div><h2>Amis</h2><p class="page-kicker">Votre réseau, vos demandes et vos suggestions réelles</p></div><span class="count-label">${friends.length} amis</span></div><div class="friends-filter clean-filter">${tabButton("suggestions","Suggestions",suggestions.length)}${tabButton("friends","Amis",friends.length)}${tabButton("requests","Demandes",requests.length)}</div><div class="clean-section friends-section"><h3 class="menu-section-title">${title}</h3><div class="friends-list">${body}</div></div></section>`;
+  }
+  function friendRow(p,type,commonCount=0) {
+    const common = commonCount > 0 ? `<small class="mutual-friends">${commonCount} ami${commonCount > 1 ? "s" : ""} en commun</small>` : "";
+    const action = type === "friend" ? `<button class="ghost-action" data-action="view-profile" data-id="${esc(p.id)}">Profil</button>` : type === "sent" ? `<button class="ghost-action" disabled>Demande envoyée</button>` : type === "incoming" ? `<div class="friend-actions"><button class="small-action" data-action="accept-friend" data-id="${esc(p.id)}">Confirmer</button><button class="ghost-action" data-action="decline-friend" data-id="${esc(p.id)}">Refuser</button></div>` : `<button class="small-action" data-action="add-friend" data-id="${esc(p.id)}">Ajouter</button>`;
+    return `<div class="list-row friend-row">${avatarHTML(p)}<div class="grow">${displayNameHTML(p)}${common}</div>${action}</div>`;
+  }
+  async function addFriend(id) {
+    if (!id || id === state.user.id) return;
+    if(await denyIfBlocked(id,"Demande impossible : ce compte est bloqué."))return;
+    const settings = (await sb.from("user_settings").select("allow_friend_requests").eq("user_id", id).maybeSingle()).data;
+    if (settings?.allow_friend_requests === false) return toast("Ce compte n’accepte pas les demandes d’ami.");
+    const existing = await sb.from("friend_requests").select("id,status,sender_id,receiver_id").or(`and(sender_id.eq.${state.user.id},receiver_id.eq.${id}),and(sender_id.eq.${id},receiver_id.eq.${state.user.id})`).maybeSingle();
+    if (existing.data?.status === "pending") return toast(existing.data.sender_id === state.user.id ? "Demande déjà envoyée." : "Cette personne vous a déjà envoyé une demande.");
+    const { error } = await sb.from("friend_requests").upsert({ sender_id: state.user.id, receiver_id: id, status: "pending", updated_at: new Date().toISOString() }, { onConflict: "sender_id,receiver_id" });
+    if (error) return toast(error.message);
+    await logActivity("friend_request_sent", "Demande d’ami envoyée", "profile", id);
+    toast("Invitation envoyée");
+    if (state.route === "friends") await friendsPage();
+    if (state.viewingProfileId === id) await openUserProfile(id);
+  }
+  async function handleFriend(id, status) {
+    if(await denyIfBlocked(id,"Cette relation est bloquée."))return;
+    const { error } = await sb.from("friend_requests").update({ status }).eq("sender_id", id).eq("receiver_id", state.user.id).eq("status", "pending");
+    if (error) return toast(error.message);
+    if (status === "accepted") {
+      await sb.from("friendships").upsert([{ user_id: state.user.id, friend_id: id }, { user_id: id, friend_id: state.user.id }], { onConflict: "user_id,friend_id" });
+    }
+    toast(status === "accepted" ? "Ami ajouté" : "Demande supprimée");
+    if (state.route === "friends") await friendsPage();
+  }
+
+  let searchTimer = null;
+  let searchCategory = "accounts";
+  async function searchPage(q = "", category = searchCategory) {
+    searchCategory = category || searchCategory;
+    const token = state.renderToken;
+    const term = q.trim();
+    let people = [], posts = [], groups = [];
+
+    // A search screen must stay clean until the user actually searches.
+    // Search history is intentionally kept in the dedicated History table.
+    if (term) {
+      const safe = term.replace(/[%_]/g, "").trim();
+      if (!safe) return searchPage("", searchCategory);
+      const [pr, por, pgr, gr] = await Promise.all([
+        sb.from("profiles").select("*").or(`first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,username.ilike.%${safe}%`).limit(30),
+        sb.from("posts").select("*").or(`content.ilike.%${safe}%`).order("created_at", {ascending:false}).limit(30),
+        sb.from("groups").select(GROUP_FIELDS).or(`name.ilike.%${safe}%,description.ilike.%${safe}%`).limit(20)
+      ]);
+      await getBlockedIds(); people=filterBlocked(pr.data||[],"id"); posts=filterBlocked(por.data||[],"user_id"); groups=gr.data||[];
+      if (state.user && safe.length >= 2) {
+        const recent=await sb.from("search_history").select("id").eq("user_id",state.user.id).eq("search_text",term).limit(1);
+        if(!(recent.data||[]).length) await sb.from("search_history").insert({ user_id:state.user.id, search_text:term, result_type:"all" });
+      }
+      const ids=[...new Set(posts.map(x=>x.user_id).filter(Boolean))];
+      const pp=ids.length ? await sb.from("profiles").select("*").in("id",ids) : {data:[]};
+      const map=new Map((pp.data||[]).map(x=>[x.id,x]));
+      posts=posts.map(x=>({...x,author:map.get(x.user_id)}));
+    }
+    if (token !== state.renderToken || state.route !== "search") return;
+
+    const peopleHtml=people.length ? people.map(p=>`<div class="list-row search-result-row">${avatarHTML(p)}<div class="grow">${displayNameHTML(p)}</div><button class="small-action" data-action="view-profile" data-id="${esc(p.id)}">Voir le profil</button></div>`).join("") : `<div class="empty">Aucun compte trouvé.</div>`;
+    const postHtml=posts.length ? posts.map(p=>`<div class="list-row search-result-row"><div class="grow"><b>${esc(nameOf(p.author||{}))}</b><small>${esc((p.content||"Publication sans texte").slice(0,140))}</small></div><button class="small-action" data-action="search-post" data-id="${esc(p.id)}">Voir</button></div>`).join("") : `<div class="empty">Aucune publication trouvée.</div>`;
+    const groupHtml=groups.length ? groups.map(x=>`<div class="list-row search-result-row"><div class="entity-search-icon">◎</div><div class="grow"><b>${esc(x.name)}</b><small>${esc(x.privacy||"public")} · ${esc(x.description||"")}</small></div><button class="small-action" data-action="group-open" data-id="${esc(x.id)}">Ouvrir</button></div>`).join("") : `<div class="empty">Aucun groupe trouvé.</div>`;
+
+    const categories = [
+      ["accounts","Comptes","people",people.length],
+      ["posts","Publications","post",posts.length],
+      ["groups","Groupes","group",groups.length]
+    ];
+    const categoryTabs = term ? `<div class="search-category-bar" role="tablist" aria-label="Types de résultats">${categories.map(([key,label,icon,count])=>`<button type="button" class="search-category-tab ${searchCategory===key?"active":""}" data-action="search-category" data-category="${key}" role="tab" aria-selected="${searchCategory===key}"><span class="search-tab-icon">${icon === "people" ? "♙" : icon === "post" ? "▤" : icon === "page" ? "▣" : "◎"}</span><span>${label}</span><b>${count}</b></button>`).join("")}</div>` : "";
+    let activeResults = "";
+    if (term) {
+      const map = {accounts: ["Comptes", peopleHtml], posts: ["Publications", postHtml], groups: ["Groupes", groupHtml]};
+      const [label, html] = map[searchCategory] || map.accounts;
+      activeResults = `<div class="search-active-result"><div class="search-result-heading"><div><span class="eyebrow">TAFAß • RECHERCHE</span><h3>${label}</h3><p>${html.includes("Aucun") ? "Aucun résultat pour cette catégorie." : "Résultats correspondant à votre recherche."}</p></div><span class="search-result-count">${categories.find(x=>x[0]===searchCategory)?.[3] || 0}</span></div><div class="clean-list search-results-list">${html}</div></div>`;
+    } else {
+      activeResults = `<div class="search-ready-hint"><span>⌕</span><div><b>Commencez votre recherche</b><small>Entrez votre recherche puis validez avec le bouton ou la touche Entrée.</small></div></div>`;
+    }
+
+    $("content").innerHTML = `<section class="clean-page search-page-premium"><div class="page-header clean-page-header"><div><span class="eyebrow">TAFAß • EXPLORER</span><h2>Rechercher</h2><p class="page-kicker">Les résultats apparaissent uniquement après validation de votre recherche.</p></div></div><form id="tafaSearchForm" class="clean-search searchbox premium-searchbox"><span class="icon">⌕</span><input id="searchInput" value="${esc(term)}" placeholder="Rechercher un compte, une publication, une Page ou un groupe…" autocomplete="off"><button type="submit" aria-label="Lancer la recherche">→</button></form>${categoryTabs}${activeResults}</section>`;
+    $("tafaSearchForm")?.addEventListener("submit", e=>{e.preventDefault();const v=$("searchInput")?.value?.trim()||""; if(v) searchPage(v, searchCategory);});
+  }
+
+  async function pageMessagesHub(){
+    const pg=state.activePage, token=state.renderToken;
+    const {data:msgs,error}=await sb.from("page_messages").select("id,sender_id,message,is_read,created_at,profiles(first_name,last_name,username,avatar_url)").eq("page_id",pg.id).order("created_at",{ascending:false}).limit(100);
+    if(token!==state.renderToken || state.route!=="messages") return;
+    if(error) return simplePage("Messages",pageContextBanner()+`<div class="empty-block"><b>Impossible de charger les messages de la Page.</b><small>${esc(error.message)}</small></div>`);
+    const rows=(msgs||[]).map(m=>`<div class="list-row page-message-hub-row">${avatarHTML(m.profiles||{})}<div class="grow"><b>${esc(m.profiles?nameOf(m.profiles):"Visiteur")}</b><small>${esc(m.message||"")} · ${timeAgo(m.created_at)}</small></div></div>`).join("")||`<div class="empty">Aucun message reçu par ${esc(pg.name)}.</div>`;
+    $("content").innerHTML=`<section class="clean-page messages-page page-mode-section">${pageContextBanner()}<div class="page-header clean-page-header"><div><span class="eyebrow">MESSAGERIE DE LA PAGE</span><h2>${esc(pg.name)}</h2><p class="page-kicker">Messages envoyés à votre Page.</p></div></div><div class="clean-list">${rows}</div></section>`;
+  }
+
+  async function messagesPage() {
+    document.body.classList.remove("tafa-conversation-active");
+    if(state.conversationChannel){ try{ await sb.removeChannel(state.conversationChannel); }catch(_){} state.conversationChannel=null; }
+    state.selectedConversation=null;
+    if(pageModeActive()) return pageMessagesHub();
+
+    const token = state.renderToken;
+
+    // V100: paint the Messages shell immediately. Network hydration happens
+    // afterwards so navigation is not blocked by Supabase.
+    const paintList = (html = '<div class="messages-loading-state"><span class="tafa-spinner" aria-hidden="true"></span><span>Chargement des conversations…</span></div>') => {
+      if(token !== state.renderToken || state.route !== "messages") return false;
+      const content = $("content");
+      if(!content) return false;
+      content.innerHTML = `<section class="clean-page messages-page" data-page-route="messages">
+        <div class="page-header clean-page-header"><div><h2>Messages</h2><p class="page-kicker">Vos conversations, simplement et en temps réel</p></div><button class="round-button clean-new-button" data-action="new-message" aria-label="Nouvelle conversation">＋</button></div>
+        <div class="clean-search searchbox"><span class="icon">⌕</span><input id="messageSearch" placeholder="Rechercher une conversation"></div>
+        <div id="conversationList" class="clean-list">${html}</div>
+      </section>`;
+      $("messageSearch")?.addEventListener("input", e => {
+        const q = e.target.value.trim().toLowerCase();
+        document.querySelectorAll(".message-conversation").forEach(row => row.classList.toggle("hidden", !!q && !row.textContent.toLowerCase().includes(q)));
+      });
+      return true;
+    };
+
+    paintList();
+
+    try {
+      // V100: replace the previous N+1 request chain with batched reads.
+      const [membershipsR, blockedR] = await Promise.all([
+        sb.from("conversation_members").select("conversation_id").eq("user_id", state.user.id),
+        getBlockedIds()
+      ]);
+      if(token !== state.renderToken || state.route !== "messages") return;
+      if(membershipsR.error) throw membershipsR.error;
+
+      const ids = [...new Set((membershipsR.data || []).map(x => x.conversation_id).filter(Boolean))];
+      if(!ids.length){
+        paintList(`<div class="empty">Aucune conversation.<br><button class="text-button" data-action="new-message">Commencer une discussion</button></div>`);
+        return;
+      }
+
+      const [convsR, membersR, hiddenR, messagesR, aliasesR] = await Promise.all([
+        sb.from("conversations").select("id,name,created_at,type").in("id", ids).order("created_at", {ascending:false}),
+        sb.from("conversation_members").select("conversation_id,user_id").in("conversation_id", ids),
+        sb.from("tafab_deleted_conversations").select("conversation_id").eq("user_id", state.user.id).in("conversation_id", ids),
+        sb.from("messages").select("conversation_id,content,created_at").in("conversation_id", ids).order("created_at", {ascending:false}).limit(Math.max(200, ids.length * 5)),
+        sb.from("tafab_conversation_aliases").select("conversation_id,target_user_id,nickname").in("conversation_id", ids).eq("target_user_id", state.user.id)
+      ]);
+      if(token !== state.renderToken || state.route !== "messages") return;
+      if(convsR.error) throw convsR.error;
+
+      const conversations = convsR.data || [];
+      const memberRows = membersR.data || [];
+      const hidden = new Set((hiddenR.data || []).map(x => String(x.conversation_id)));
+      const otherByConv = new Map();
+      for(const row of memberRows){
+        if(String(row.user_id) === String(state.user.id)) continue;
+        if(!otherByConv.has(row.conversation_id)) otherByConv.set(row.conversation_id, row.user_id);
+      }
+      const otherIds = [...new Set([...otherByConv.values()].filter(Boolean))];
+      const profilesR = otherIds.length
+        ? await sb.from("profiles").select("*").in("id", otherIds)
+        : {data:[],error:null};
+      if(token !== state.renderToken || state.route !== "messages") return;
+      if(profilesR.error) throw profilesR.error;
+      const profiles = new Map((profilesR.data || []).map(p => [String(p.id), p]));
+      const lastByConv = new Map();
+      for(const m of (messagesR.data || [])) if(!lastByConv.has(String(m.conversation_id))) lastByConv.set(String(m.conversation_id), m);
+      const aliasByConv = new Map((aliasesR.data || []).map(a => [String(a.conversation_id), a.nickname || ""]));
+
+      const cards = [];
+      for(const c of conversations){
+        if(hidden.has(String(c.id))) continue;
+        const person = profiles.get(String(otherByConv.get(c.id))) || null;
+        if(person && blockedCache.ids.has(person.id)) continue;
+        const last = lastByConv.get(String(c.id));
+        const alias = aliasByConv.get(String(c.id)) || "";
+        const title = c.name || (person ? (alias || nameOf(person)) : "Conversation");
+        cards.push(`<button class="list-row message-conversation clean-conversation-row" style="width:100%;text-align:left" data-action="open-conversation" data-id="${esc(c.id)}" data-other-id="${esc(person?.id||"")}">
+          ${avatarHTML(person || state.profile)}
+          <div class="grow"><b>${esc(title)}</b><small>${esc(last?.content || "Ouvrir la conversation")} · ${last ? timeAgo(last.created_at) : ""}</small></div><small class="conversation-chevron">›</small>
+        </button>`);
+      }
+      if(token !== state.renderToken || state.route !== "messages") return;
+      paintList(cards.join("") || `<div class="empty">Aucune conversation.<br><button class="text-button" data-action="new-message">Commencer une discussion</button></div>`);
+      bindConversationLongPress();
+    }catch(e){
+      if(token !== state.renderToken || state.route !== "messages") return;
+      paintList(`<div class="empty"><b>Impossible de charger les messages.</b><br><small>${esc(e?.message || "Erreur réseau")}</small><br><button class="text-button" data-action="menu-route" data-route-target="messages">Réessayer</button></div>`);
+    }
+  }
+
+  async function newMessage() {
+    await getBlockedIds();
+    const { data: rawPeople } = await sb.from("profiles").select("*").neq("id", state.user.id).limit(50);
+    const people=filterBlocked(rawPeople||[],"id");
+    openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><h3>Nouvelle conversation</h3><div>${(people||[]).map(p=>`<button class="list-row" style="width:100%;text-align:left" data-action="start-conversation" data-id="${esc(p.id)}">${avatarHTML(p)}<div class="grow"><b>${esc(nameOf(p))}</b></div><span>›</span></button>`).join("")}</div></div>`);
+  }
+  async function startConversation(otherId) {
+    if(!otherId || otherId===state.user.id)return;
+    if(await denyIfBlocked(otherId,"Conversation impossible : ce compte est bloqué."))return;
+    const cfg=(await sb.from("user_settings").select("allow_messages").eq("user_id",otherId).maybeSingle()).data;
+    if(cfg?.allow_messages===false)return toast("Ce compte n’accepte pas les messages.");
+    const { data: mine } = await sb.from("conversation_members").select("conversation_id").eq("user_id", state.user.id);
+    const hiddenRows = await sb.from("tafab_deleted_conversations").select("conversation_id").eq("user_id", state.user.id);
+    const hiddenConversationIds = new Set((hiddenRows.data || []).map(x => String(x.conversation_id)));
+    for (const m of mine || []) {
+      if(hiddenConversationIds.has(String(m.conversation_id))) continue;
+      const r = await sb.from("conversation_members").select("user_id").eq("conversation_id", m.conversation_id);
+      if ((r.data || []).some(x => x.user_id === otherId)) { closeModal(); return openConversation(m.conversation_id); }
+    }
+    const { data: conv, error } = await sb.from("conversations").insert({ type: "private", created_by: state.user.id }).select().single();
+    if (error) return toast(error.message);
+    const add = await sb.from("conversation_members").insert([{ conversation_id: conv.id, user_id: state.user.id }, { conversation_id: conv.id, user_id: otherId }]);
+    if (add.error) return toast(add.error.message);
+    closeModal(); await openConversation(conv.id);
+  }
+  const TAFASS_MESSAGE_THEMES = Object.freeze([
+    {key:"emerald", label:"Émeraude", icon:"✦", desc:"Vert premium + or"},
+    {key:"sunset", label:"Sunset", icon:"◒", desc:"Orange profond + or"},
+    {key:"gold", label:"Gold", icon:"◆", desc:"Noir + doré premium"},
+    {key:"forest", label:"Forêt", icon:"◈", desc:"Vert sombre élégant"},
+    {key:"rose", label:"Amour", icon:"♥", desc:"Rose chaud premium"},
+    {key:"midnight", label:"Minuit", icon:"●", desc:"Noir graphite"}
+  ]);
+  async function getConversationTheme(conversationId){
+    if(!conversationId || !state.user) return "emerald";
+    try{
+      const r=await sb.from("tafa_message_themes").select("theme_key").eq("conversation_id",conversationId).eq("user_id",state.user.id).maybeSingle();
+      return r.data?.theme_key || "emerald";
+    }catch(_){ return "emerald"; }
+  }
+  async function openMessageTheme(conversationId){
+    if(!conversationId) return toast("Conversation introuvable.");
+    const current=await getConversationTheme(conversationId);
+    openModal(`<div class="modal-box tfa-message-theme-modal-v70"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß · CONVERSATION</span><h3>Thème de la conversation</h3><p class="muted">Le thème choisi est synchronisé pour les deux membres de cette conversation.</p><div class="tfa-message-theme-grid-v70">${TAFASS_MESSAGE_THEMES.map(t=>`<button type="button" class="tfa-message-theme-option-v70 ${t.key===current?'active':''}" data-theme-key="${t.key}" data-conversation-id="${esc(conversationId)}"><span class="tfa-message-theme-preview-v70 theme-${t.key}">${t.icon}</span><span><b>${esc(t.label)}</b><small>${esc(t.desc)}</small></span><i>${t.key===current?'✓':'›'}</i></button>`).join('')}</div><div class="tfa-message-theme-footer-v70"><button class="ghost-action" data-action="close-modal">Annuler</button><button class="primary big" data-action="save-message-theme" data-id="${esc(conversationId)}">Appliquer</button></div></div>`);
+    document.querySelectorAll("[data-theme-key]").forEach(btn=>btn.addEventListener("click",()=>{
+      document.querySelectorAll("[data-theme-key]").forEach(x=>x.classList.toggle("active",x===btn));
+      document.querySelectorAll("[data-theme-key] i").forEach(x=>x.textContent="›");
+      const check=btn.querySelector("i"); if(check) check.textContent="✓";
+    }));
+  }
+  async function saveMessageTheme(conversationId){
+    const selected=document.querySelector("[data-theme-key].active")?.dataset.themeKey || "emerald";
+    const r=await sb.rpc("tafa_set_conversation_theme",{p_conversation_id:conversationId,p_theme_key:selected});
+    if(r.error) return toast(r.error.message || "Impossible d'appliquer le thème.");
+    closeModal();
+    toast("Thème appliqué aux deux comptes.");
+    return openConversation(conversationId);
+  }
+
+  async function openConversation(id) {
+    document.body.classList.add("tafa-conversation-active");
+    const token = state.renderToken;
+    state.selectedConversation = id;
+    if (state.route !== "messages") {
+      if (state.navStack[state.navStack.length - 1] !== "messages") state.navStack.push("messages");
+      state.route = "messages"; history.replaceState(null, "", "#messages"); document.querySelectorAll("[data-route]").forEach(el => el.classList.toggle("active", el.dataset.route === "messages"));
+    }
+    const [memberR, otherR] = await Promise.all([
+      sb.from("conversation_members").select("user_id").eq("conversation_id", id).eq("user_id", state.user.id).maybeSingle(),
+      sb.from("conversation_members").select("user_id").eq("conversation_id",id).neq("user_id",state.user.id).maybeSingle()
+    ]);
+    if (!memberR.data) return toast("Conversation inaccessible.");
+    const otherIdCheck=otherR.data?.user_id;
+    if(otherIdCheck && await denyIfBlocked(otherIdCheck,"Conversation indisponible : ce compte est bloqué."))return;
+    const [msgsR, hiddenR] = await Promise.all([
+      sb.from("messages").select("*").eq("conversation_id", id).order("created_at", { ascending: true }).limit(200),
+      sb.from("tafab_message_hidden").select("message_id").eq("user_id",state.user.id)
+    ]);
+    const rawMsgs=msgsR.data;
+    const hiddenIds=new Set((hiddenR.data||[]).map(x=>x.message_id));
+    const msgs=(rawMsgs||[]).filter(m=>!hiddenIds.has(m.id));
+    const messageIds=(msgs||[]).map(m=>m.id).filter(Boolean);
+    const [reactionsR] = await Promise.all([
+      messageIds.length ? sb.from("tafab_message_reactions").select("message_id,user_id,reaction").in("message_id",messageIds) : Promise.resolve({data:[]}),
+      sb.rpc("tafa_mark_conversation_read", { p_conversation_id:id })
+    ]);
+    const reactionMap=new Map();
+    (reactionsR.data||[]).forEach(r=>{ if(!reactionMap.has(r.message_id)) reactionMap.set(r.message_id,[]); reactionMap.get(r.message_id).push(r); });
+    // Resolve reply targets in one extra query so replies remain visible after reload/reconnect.
+    const replyIds=[...new Set((msgs||[]).map(m=>m.reply_to_id).filter(Boolean))];
+    if(replyIds.length){
+      const rr=await sb.from("messages").select("id,content,sender_id").in("id",replyIds);
+      const rmap=new Map((rr.data||[]).map(x=>[x.id,x]));
+      (msgs||[]).forEach(m=>{ const r=rmap.get(m.reply_to_id); if(r){ m.reply_to_content=r.content||""; m.reply_to_author_id=r.sender_id; } });
+    }
+    const ids = [...new Set((msgs || []).flatMap(m => [m.sender_id,m.reply_to_author_id]).filter(Boolean))];
+    const { data: profiles } = ids.length ? await sb.from("profiles").select("*").in("id", ids) : { data: [] };
+    if (token !== state.renderToken) return;
+    const map = new Map((profiles || []).map(p => [p.id, p]));
+    const otherId = otherIdCheck || null;
+    const [otherProfileR, aliasR, themeR] = await Promise.all([
+      otherId ? sb.from("profiles").select("*").eq("id", otherId).maybeSingle() : Promise.resolve({data:null}),
+      sb.from("tafab_conversation_aliases").select("target_user_id,nickname").eq("conversation_id",id),
+      getConversationTheme(id)
+    ]);
+    const otherProfile=otherProfileR.data||null;
+    const aliasRows=aliasR.data||[];
+    const aliasMap=new Map(aliasRows.map(x=>[String(x.target_user_id),x.nickname]));
+    const displayOtherName=otherProfile ? (aliasMap.get(String(otherProfile.id))||nameOf(otherProfile)) : "Discussion";
+    const conversationTheme=themeR||"emerald";
+    $("content").innerHTML = `<section class="clean-page messages-page conversation-page conversation-page-clean tfa-message-theme-${esc(conversationTheme)}" data-message-theme="${esc(conversationTheme)}"><header class="conversation-clean-topbar"><button class="conversation-back" data-action="page-back" type="button" aria-label="Retour">‹</button><button class="conversation-person" data-action="view-profile" data-id="${esc(otherId||"")}" type="button">${avatarHTML(otherProfile || state.profile,"avatar conversation-avatar")}<span><b>${esc(displayOtherName)}</b><small id="conversationPresence" class="conversation-presence">Actif</small></span></button><div class="conversation-head-actions"><button type="button" aria-label="Rechercher dans la conversation" title="Rechercher" data-action="conversation-search"><span>⌕</span></button><button type="button" aria-label="Options" title="Options" data-action="conversation-menu" data-id="${esc(id)}">⚙</button></div></header><div id="conversationSearchBar" class="conversation-search-bar" hidden><span>⌕</span><input id="conversationSearchInput" type="search" placeholder="Rechercher dans les messages…" autocomplete="off"><b id="conversationSearchCount">0</b><button type="button" data-action="conversation-search-close" aria-label="Fermer">×</button></div><div id="typingIndicator" class="typing-indicator" hidden>écrit…</div><div class="message-list clean-message-list">${(msgs||[]).map(m=>conversationMessageHTML(m,map,reactionMap)).join("")||renderFirstContactGreetings(otherProfile||{})}</div><form id="messageForm" class="comment-form clean-message-form"><div class="message-voice-row"><button type="button" class="message-tool message-voice-tool" data-action="message-voice" title="Message vocal" aria-label="Message vocal"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14.5a3.25 3.25 0 0 0 3.25-3.25V6.75a3.25 3.25 0 0 0-6.5 0v4.5A3.25 3.25 0 0 0 12 14.5Z"/><path d="M18.25 11.25a6.25 6.25 0 0 1-12.5 0M12 17.5V21M8.5 21h7"/></svg></button></div><div class="message-compose-row"><button type="button" class="message-tool message-attachment-tool" data-action="message-attachment" title="Photo ou fichier" aria-label="Photo ou fichier"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.75h8.25l3.75 3.75v12.75H6.5a2.75 2.75 0 0 1-2.75-2.75V6.5A2.75 2.75 0 0 1 6.5 3.75Z"/><path d="M14.5 3.75V8h4M7.5 15.5l2.3-2.3 2.15 2.15 1.8-1.8 2.75 2.75M8 8.75h.01"/></svg></button><input id="messageAttachment" type="file" hidden accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.txt,.zip,.apk"><div class="message-input-shell"><input id="messageText" autocomplete="off" placeholder="Message"><button type="button" class="message-emoji-button" data-action="message-emoji" title="Emoji" aria-label="Emoji"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M8.7 14.2c.9 1.15 2 1.7 3.3 1.7s2.4-.55 3.3-1.7M8.5 9.5h.01M15.5 9.5h.01"/></svg></button><div id="messageMentionSuggestions" class="message-mention-suggestions" hidden></div></div><button type="submit" class="message-send-button" aria-label="Envoyer" title="Envoyer"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3.8 4.8 16.4 7.2-16.4 7.2 3.2-6.1 7.2-1.1-7.2-1.1-3.2-6.1Z"/></svg></button></div></form></section>`;
+
+    // Conversation-level Realtime: typing + online presence without storing ephemeral state in SQL.
+    if(state.conversationChannel){ try{ await sb.removeChannel(state.conversationChannel); }catch(_){} state.conversationChannel=null; }
+    const convChannel=sb.channel(`tafass-conversation:${id}`, { config:{ broadcast:{ self:false }, presence:{ key:state.user.id } } });
+    state.conversationChannel=convChannel;
+    let typingTimer=null;
+    const setTyping=(on)=>{ try{ convChannel.send({type:"broadcast",event:"typing",payload:{user_id:state.user.id,typing:!!on}}); }catch(_){} };
+    convChannel.on("broadcast",{event:"typing"},({payload})=>{
+      if(payload?.user_id===state.user.id) return;
+      const el=$("typingIndicator"); if(!el)return;
+      el.hidden=!payload?.typing; if(payload?.typing) el.textContent=`${esc(otherProfile ? nameOf(otherProfile) : "Votre contact")} écrit…`;
+    });
+    convChannel.on("presence",{event:"sync"},()=>{
+      const present=convChannel.presenceState();
+      const localOnline=Object.keys(present||{}).some(k=>k!==state.user.id);
+      const globalOnline=otherId ? isUserOnline(otherId) : false;
+      const el=$("conversationPresence"); if(el) el.textContent=(globalOnline||localOnline) ? "En ligne" : "Hors ligne";
+    });
+    let messageRefreshTimer=null;
+    convChannel.on("postgres_changes",{event:"INSERT",schema:"public",table:"messages",filter:`conversation_id=eq.${id}`},async payload=>{
+      if(state.selectedConversation!==id || state.route!=="messages") return;
+      const m=payload?.new;
+      if(m?.id && m.sender_id===state.user.id) { updateBadges(); return; }
+      // Never rebuild the whole conversation on every realtime event.
+      // Fetch only the newest message and append it to the existing DOM.
+      if(m?.id){
+        clearTimeout(messageRefreshTimer);
+        messageRefreshTimer=setTimeout(async()=>{
+          try{
+            const r=await sb.from("messages").select("*").eq("id",m.id).maybeSingle();
+            if(!r.data || state.selectedConversation!==id || state.route!=="messages") return;
+            const msg=r.data;
+            const exists=document.querySelector(`[data-message-id="${CSS.escape(String(msg.id))}"]`);
+            if(exists) return;
+            const ids=[msg.sender_id,msg.reply_to_id].filter(Boolean);
+            const pr=ids.length?await sb.from("profiles").select("*").in("id",ids):{data:[]};
+            const rm=msg.reply_to_id?await sb.from("messages").select("id,content,sender_id").eq("id",msg.reply_to_id).maybeSingle():{data:null};
+            if(rm.data){msg.reply_to_content=rm.data.content||"";msg.reply_to_author_id=rm.data.sender_id;}
+            const reactions=await sb.from("tafab_message_reactions").select("message_id,user_id,reaction").eq("message_id",msg.id);
+            const map=new Map((pr.data||[]).map(x=>[x.id,x]));
+            const reactionMap=new Map([[msg.id,reactions.data||[]]]);
+            const list=document.querySelector(".clean-message-list");
+            if(list){ const empty=list.querySelector(".message-first-contact"); if(empty) empty.remove(); list.insertAdjacentHTML("beforeend",conversationMessageHTML(msg,map,reactionMap)); list.scrollTop=list.scrollHeight; bindMessageLongPress(); }
+            updateBadges();
+          }catch(_){}
+        },120);
+      } else updateBadges();
+    });
+    convChannel.subscribe(async status=>{
+      if(status==="SUBSCRIBED"){
+        try{ await convChannel.track({user_id:state.user.id,online_at:new Date().toISOString()}); }catch(_){}
+      }
+    });
+
+    const input=$("messageText");
+    input?.addEventListener("input",()=>{
+      setTyping(true); clearTimeout(typingTimer); typingTimer=setTimeout(()=>setTyping(false),1200);
+      updateMessageMentionSuggestions();
+    });
+    input?.addEventListener("keydown",e=>{
+      if(e.key==="Escape"){ const box=$("messageMentionSuggestions"); if(box){box.hidden=true;box.innerHTML="";} }
+    });
+    $("conversationSearchInput")?.addEventListener("input",e=>filterConversationMessages(e.target.value));
+    $("messageAttachment")?.addEventListener("change", sendMessageAttachment);
+    $("messageForm").addEventListener("submit", async e => {
+      e.preventDefault(); const text=$("messageText").value.trim(); if(!text)return;
+      setTyping(false); clearTimeout(typingTimer);
+      const otherId=(await sb.from("conversation_members").select("user_id").eq("conversation_id",id).neq("user_id",state.user.id).maybeSingle()).data?.user_id;
+      if(otherId && await denyIfBlocked(otherId,"Message impossible : ce compte est bloqué."))return;
+      const replyTo=$("messageText")?.dataset.replyTo || null;
+      const r=await sb.from("messages").insert({conversation_id:id,sender_id:state.user.id,content:text,is_read:false,reply_to_id:replyTo});
+      if(r.error)toast(r.error.message); else {$("messageText"); delete $("messageText").dataset.replyTo; cancelMessageReply(); $("messageText").value=""; await openConversation(id);}
+    });
+    bindMessageLongPress();
+  }
+
+
+  function toggleMessageReactionPicker(id){
+    const current=document.querySelector(`[data-picker-for="${CSS.escape(String(id))}"]`);
+    if(!current) return;
+    document.querySelectorAll(".message-reaction-picker:not([hidden])").forEach(p=>{ if(p!==current) p.hidden=true; });
+    current.hidden=!current.hidden;
+  }
+
+  function bindMessageLongPress(){
+    document.querySelectorAll('.conversation-page-clean .message[data-message-id]').forEach(el=>{
+      if(el.dataset.longPressBound==='1') return;
+      el.dataset.longPressBound='1';
+      let timer=null, sx=0, sy=0;
+      const clear=()=>{ if(timer){clearTimeout(timer);timer=null;} };
+      el.addEventListener('pointerdown',e=>{
+        if(e.button!==undefined && e.button!==0) return;
+        if(e.target.closest('button,a,input,textarea,video,audio')) return;
+        sx=e.clientX||0; sy=e.clientY||0;
+        el.classList.add('press-feedback');
+        timer=setTimeout(()=>{
+          timer=null; el.classList.remove('press-feedback');
+          const id=el.dataset.messageId;
+          if(id) messageActionMenu(id);
+        },620);
+      },{passive:true});
+      el.addEventListener('pointermove',e=>{
+        if(!timer) return;
+        if(Math.abs((e.clientX||0)-sx)>12 || Math.abs((e.clientY||0)-sy)>12){
+          clear(); el.classList.remove('press-feedback');
+        }
+      },{passive:true});
+      el.addEventListener('pointerup',()=>{clear();setTimeout(()=>el.classList.remove('press-feedback'),40);});
+      el.addEventListener('pointercancel',()=>{clear();el.classList.remove('press-feedback');});
+      el.addEventListener('pointerleave',()=>{if(timer){clear();el.classList.remove('press-feedback');}});
+      el.addEventListener('contextmenu',e=>{
+        e.preventDefault(); e.stopPropagation(); clear(); el.classList.remove('press-feedback');
+        const id=el.dataset.messageId; if(id) messageActionMenu(id);
+      });
+    });
+  }
+
+
+  function messageContentHTML(text){
+    const value=String(text||"");
+    return esc(value).replace(/(^|[\\s(])@([a-zA-Z0-9_.-]{2,40})/g,
+      (_,prefix,username)=>`${prefix}<button type="button" class="message-mention" data-action="message-mention" data-username="${esc(username)}">@${esc(username)}</button>`);
+  }
+
+  let messageMentionTimer=null;
+  async function updateMessageMentionSuggestions(){
+    const input=$("messageText"), box=$("messageMentionSuggestions");
+    if(!input || !box)return;
+    const value=input.value||"", caret=input.selectionStart ?? value.length;
+    const before=value.slice(0,caret);
+    const match=before.match(/(?:^|\\s)@([a-zA-Z0-9_.-]{0,40})$/);
+    if(!match){ box.hidden=true; box.innerHTML=""; return; }
+    const query=match[1]||"";
+    clearTimeout(messageMentionTimer);
+    messageMentionTimer=setTimeout(async()=>{
+      const r=await sb.from("profiles").select("id,first_name,last_name,username,avatar_url")
+        .neq("id",state.user.id).ilike("username",`${query}%`).limit(6);
+      if(r.error || !r.data?.length){ box.hidden=true; box.innerHTML=""; return; }
+      box.innerHTML=r.data.map(p=>`<button type="button" class="message-mention-option" data-action="message-mention-select" data-username="${esc(p.username||"")}">
+        ${avatarHTML(p,"avatar mention-avatar")}<span><b>${esc(nameOf(p))}</b><small>@${esc(p.username||"")}</small></span>
+      </button>`).join("");
+      box.hidden=false;
+    },120);
+  }
+
+  function selectMessageMention(username){
+    const input=$("messageText"), box=$("messageMentionSuggestions");
+    if(!input || !username)return;
+    const value=input.value||"", caret=input.selectionStart ?? value.length;
+    const before=value.slice(0,caret), after=value.slice(caret);
+    const replaced=before.replace(/(?:^|\\s)@[a-zA-Z0-9_.-]{0,40}$/,m=>{
+      const leading=m.match(/^\\s*/)?.[0]||"";
+      return `${leading}@${username} `;
+    });
+    input.value=replaced+after;
+    const pos=replaced.length;
+    input.focus(); input.setSelectionRange(pos,pos);
+    if(box){box.hidden=true;box.innerHTML="";}
+  }
+
+  function conversationMessageHTML(m, map, reactionMap=new Map()){
+    const mine=m.sender_id===state.user.id;
+    const author=map.get(m.sender_id);
+    const mt=String(m.media_type||"");
+    let body='';
+    if(m.media_url){
+      if(mt.startsWith('audio/')) body=`<div class="message-audio-wrap"><audio controls preload="metadata" src="${esc(m.media_url)}"></audio><button class="message-download" data-action="download-message-file" data-url="${esc(m.media_url)}" data-name="${esc(m.content||'message-vocal.webm')}">⬇</button></div>`;
+      else if(mt.startsWith('video/')) body=`<div class="message-media-wrap"><video class="message-media" controls playsinline preload="metadata" src="${esc(m.media_url)}"></video><button class="message-download" data-action="download-message-file" data-url="${esc(m.media_url)}" data-name="${esc(m.content||'video')}">⬇ Télécharger</button></div>`;
+      else if(mt.startsWith('image/')) body=`<div class="message-media-wrap"><img class="message-media" src="${esc(m.media_url)}" alt="${esc(m.content||'Image')}" loading="lazy"><button class="message-download" data-action="download-message-file" data-url="${esc(m.media_url)}" data-name="${esc(m.content||'image')}">⬇ Télécharger</button></div>`;
+      else body=`<div class="message-file-wrap"><a class="message-file" href="${esc(m.media_url)}" target="_blank" rel="noopener">📎 ${esc(m.content||'Fichier')}</a><button class="message-download" data-action="download-message-file" data-url="${esc(m.media_url)}" data-name="${esc(m.content||'Fichier')}">⬇ Télécharger</button></div>`;
+    } else body=messageContentHTML(m.content||'');
+    const replyPreview = m.reply_to_content ? `<div class="message-reply-preview"><span class="message-reply-line"></span><div><b>Message</b><span>${esc(String(m.reply_to_content).slice(0,180))}</span></div></div>` : '';
+    const edited = m.updated_at && m.updated_at !== m.created_at ? ` · <button type="button" class="message-edited-link" data-action="message-history" data-id="${esc(m.id)}">modifié</button>` : '';
+    const deleted = !!m.deleted_for_everyone;
+    if(deleted){ body=`<div class="message-deleted-marker">🚫 <span>Ce message a été supprimé pour tout le monde</span></div>`; }
+    const reactionRows=reactionMap.get(m.id)||[];
+    const reactionCounts={}; reactionRows.forEach(r=>reactionCounts[r.reaction]=(reactionCounts[r.reaction]||0)+1);
+    const reactionBadge=Object.entries(reactionCounts).map(([emoji,count])=>`<span class="message-reaction-chip">${esc(emoji)}${count>1?`<b>${count}</b>`:''}</span>`).join('');
+    return `<div class="message ${mine?'mine':''}" data-message-id="${esc(m.id)}" data-author="${esc(author?nameOf(author):'Membre')}"><div class="message-card">${replyPreview}<div class="message-body">${body}</div>${reactionBadge?`<div class="message-reaction-badge visible">${reactionBadge}</div>`:''}<div class="message-inline-reactions" aria-label="Réagir au message"><button type="button" class="message-react-trigger" data-action="toggle-message-reactions" data-id="${esc(m.id)}" aria-label="Réagir">☺</button><div class="message-reaction-picker" data-picker-for="${esc(m.id)}" hidden><button type="button" data-action="react-message" data-id="${esc(m.id)}" data-reaction="👍" aria-label="J’aime">👍</button><button type="button" data-action="react-message" data-id="${esc(m.id)}" data-reaction="❤️" aria-label="J’adore">❤️</button><button type="button" data-action="react-message" data-id="${esc(m.id)}" data-reaction="😂" aria-label="Haha">😂</button><button type="button" data-action="react-message" data-id="${esc(m.id)}" data-reaction="😮" aria-label="Waouh">😮</button><button type="button" data-action="react-message" data-id="${esc(m.id)}" data-reaction="😢" aria-label="Triste">😢</button><button type="button" data-action="react-message" data-id="${esc(m.id)}" data-reaction="😡" aria-label="En colère">😡</button><button type="button" data-action="react-message" data-id="${esc(m.id)}" data-reaction="🥰" aria-label="J’adore">🥰</button></div></div><div class="message-meta"><small>${timeAgo(m.created_at)}${edited}${mine ? (m.is_read ? ' · Lu' : ' · Envoyé') : ''}</small><button type="button" class="message-more" data-action="message-menu" data-id="${esc(m.id)}" aria-label="Options du message">⋯</button></div></div></div>`;
+  }
+
+  async function refreshConversation(id){
+    if(!id || state.selectedConversation!==id || state.route!=="messages") return;
+    return openConversation(id);
+  }
+
+  async function editConversationMessage(id){
+    if(!id) return;
+    const r=await sb.from("messages").select("id,content,sender_id").eq("id",id).eq("sender_id",state.user.id).maybeSingle();
+    if(r.error||!r.data) return toast("Ce message ne peut pas être modifié.");
+    const current=String(r.data.content||"");
+    openModal(`<div class="modal-box message-action-modal edit-message-modal"><button class="modal-close" data-action="close-modal">×</button><div class="message-action-icon edit">✎</div><span class="eyebrow">MESSAGE</span><h3>Modifier le message</h3><p class="muted">Corrigez votre message puis enregistrez les modifications.</p><textarea id="editMessageText" class="premium-textarea message-edit-textarea" maxlength="5000">${esc(current)}</textarea><div class="message-action-footer"><button class="ghost-action" data-action="close-modal">Annuler</button><button class="primary big" data-action="save-message-edit" data-id="${esc(id)}">Enregistrer</button></div></div>`);
+    setTimeout(()=>{const el=$("editMessageText"); el?.focus(); el?.setSelectionRange(el.value.length,el.value.length);},40);
+  }
+
+  async function saveConversationMessageEdit(id){
+    const text=$("editMessageText")?.value.trim()||"";
+    if(!text) return toast("Le message ne peut pas être vide.");
+    const u=await sb.rpc("tafab_edit_message",{p_message_id:id,p_new_content:text});
+    if(u.error) return toast(u.error.message);
+    closeModal(); toast("Message modifié");
+    return refreshConversation(state.selectedConversation);
+  }
+
+  async function deleteConversationMessage(id){
+    if(!id)return;
+    const r=await sb.from("messages").select("id,content,sender_id,media_url,deleted_for_everyone").eq("id",id).maybeSingle();
+    if(r.error||!r.data)return toast("Ce message n’existe plus.");
+    if(r.data.deleted_for_everyone)return toast("Ce message a déjà été supprimé pour tout le monde.");
+    const mine=r.data.sender_id===state.user.id;
+    openModal(`<div class="modal-box message-action-modal message-menu-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">MESSAGE</span><h3>Supprimer le message</h3><p class="muted">Choisissez où supprimer ce message.</p><div class="message-menu-list"><button data-action="delete-message-me" data-id="${esc(id)}"><span class="menu-action-icon">⌫</span><span><b>Supprimer pour moi</b><small>Il disparaîtra uniquement de votre conversation.</small></span><i>›</i></button>${mine?`<button class="danger-row" data-action="confirm-delete-message" data-id="${esc(id)}"><span class="menu-action-icon">×</span><span><b>Supprimer pour tout le monde</b><small>Une confirmation sera demandée avant suppression.</small></span><i>›</i></button>`:''}</div></div>`);
+  }
+  async function hideMessageForMe(id){
+    const r=await sb.from('tafab_message_hidden').upsert({user_id:state.user.id,message_id:id},{onConflict:'user_id,message_id'});
+    if(r.error)return toast(r.error.message); closeModal(); return refreshConversation(state.selectedConversation);
+  }
+  async function deleteMessageForEveryone(id){
+    const r=await sb.rpc('tafab_delete_message_for_everyone',{p_message_id:id});
+    if(r.error)return toast(r.error.message||'Suppression impossible.');
+    closeModal(); toast('Message supprimé pour tout le monde'); return refreshConversation(state.selectedConversation);
+  }
+  async function confirmDeleteMessageForEveryone(id){
+    openModal(`<div class="modal-box message-action-modal confirm-danger-modal"><button class="modal-close" data-action="close-modal">×</button><div class="message-action-icon danger">×</div><span class="eyebrow">CONFIRMATION</span><h3>Supprimer pour tout le monde ?</h3><p class="muted">Le message restera visible comme message supprimé, mais son contenu ne sera plus accessible. Cette action est définitive.</p><div class="message-action-footer"><button class="ghost-action" data-action="close-modal">Annuler</button><button class="primary danger-confirm" data-action="delete-message-everyone" data-id="${esc(id)}">Oui, supprimer</button></div></div>`);
+  }
+  async function messageHistory(id){
+    const r=await sb.from("tafab_message_edits").select("old_content,edited_at,editor_id").eq("message_id",id).order("edited_at",{ascending:false});
+    if(r.error)return toast(r.error.message);
+    const rows=(r.data||[]).map(x=>`<div class="message-history-row"><small>${new Date(x.edited_at).toLocaleString("fr-FR")}</small><p>${esc(x.old_content||"")}</p></div>`).join("")||'<div class="empty">Aucune ancienne version disponible.</div>';
+    openModal(`<div class="modal-box message-action-modal history-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">MESSAGE</span><h3>Historique des modifications</h3><p class="muted">Anciennes versions enregistrées de ce message.</p><div class="message-history-list">${rows}</div></div>`);
+  }
+  function renderFirstContactGreetings(person){
+    const n=nameOf(person||{})||'votre ami(e)';
+    const safe=esc(n);
+    const options=[
+      `Bonjour ${safe} 👋, heureux de faire ta connaissance !`,
+      `Salut ${safe} 😊, j’espère que tu vas bien.`,
+      `Coucou ${safe} ❤️, ravi de pouvoir discuter avec toi !`
+    ];
+    return `<div class="first-contact-greetings"><div class="first-contact-head"><span>👋</span><div><b>Premier message</b><small>Choisissez une formule ou écrivez directement votre propre message.</small></div></div><div class="first-contact-options">${options.map((text,i)=>`<button type="button" class="first-contact-option" data-action="send-greeting" data-index="${i}">${text}</button>`).join('')}</div><div class="first-contact-custom"><small>Vous pouvez aussi envoyer votre propre message ci-dessous.</small></div></div>`;
+  }
+  async function sendGreeting(index){
+    const id=state.selectedConversation; if(!id)return;
+    const otherId=(await sb.from("conversation_members").select("user_id").eq("conversation_id",id).neq("user_id",state.user.id).maybeSingle()).data?.user_id;
+    const other=otherId ? (await sb.from("profiles").select("*").eq("id",otherId).maybeSingle()).data : null;
+    const n=nameOf(other||{})||'votre ami(e)';
+    const messages=[`Bonjour ${n} 👋, heureux de faire ta connaissance !`,`Salut ${n} 😊, j’espère que tu vas bien.`,`Coucou ${n} ❤️, ravi de pouvoir discuter avec toi !`];
+    const text=messages[Number(index)]; if(!text)return;
+    const r=await sb.from("messages").insert({conversation_id:id,sender_id:state.user.id,content:text,is_read:false});
+    if(r.error)return toast(r.error.message); return refreshConversation(id);
+  }
+
+  async function messageAliases(id){
+    const members=(await sb.from("conversation_members").select("user_id").eq("conversation_id",id)).data||[];
+    const ids=members.map(x=>x.user_id);
+    const profiles=ids.length?(await sb.from("profiles").select("*").in("id",ids)).data||[]:[];
+    const aliases=(await sb.from("tafab_conversation_aliases").select("target_user_id,nickname,updated_by,updated_at").eq("conversation_id",id)).data||[];
+    const amap=new Map(aliases.map(x=>[String(x.target_user_id),x]));
+    openModal(`<div class="modal-box message-action-modal alias-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">MESSAGES</span><h3>Pseudos des comptes</h3><p class="muted">Modifiez le pseudo affiché dans cette conversation. Le changement est visible par les deux comptes.</p><div class="alias-list">${profiles.map(p=>{const a=amap.get(String(p.id));return `<form class="alias-row" data-alias-form="${esc(p.id)}"><div class="alias-person">${avatarHTML(p,'avatar sm')}<div><b>${esc(nameOf(p))}</b><small>${String(p.id)===String(state.user.id)?'Compte 1 · vous':'Compte 2 · interlocuteur'}</small></div></div><input name="nickname" maxlength="40" value="${esc(a?.nickname||nameOf(p)||'')}" aria-label="Pseudo de ${esc(nameOf(p))}"><button class="primary" type="submit">Enregistrer</button></form>`;}).join('')}</div></div>`);
+    document.querySelectorAll('[data-alias-form]').forEach(form=>form.onsubmit=async e=>{
+      e.preventDefault();
+      const target=form.dataset.aliasForm;
+      const nickname=String(form.nickname?.value||'').trim();
+      const btn=form.querySelector('button[type="submit"]');
+      if(btn){btn.disabled=true;btn.textContent='Enregistrement…';}
+      const r=await sb.from('tafab_conversation_aliases').upsert({conversation_id:id,target_user_id:target,nickname,updated_by:state.user.id},{onConflict:'conversation_id,target_user_id'});
+      if(r.error){if(btn){btn.disabled=false;btn.textContent='Enregistrer';}return toast(r.error.message);}
+      const notifyTarget=String(target)===String(state.user.id)?ids.find(x=>String(x)!==String(state.user.id)):target;
+      if(notifyTarget) await sb.from('notifications').insert({user_id:notifyTarget,actor_id:state.user.id,type:'message_alias',title:'Pseudo modifié',message:`${nameOf(state.profile||{})} a changé votre pseudo dans cette conversation en « ${nickname} ».`,entity_type:'conversation',entity_id:id,is_read:false}).catch(()=>{});
+      closeModal();
+      toast('Pseudo enregistré ✓');
+      return openConversation(id);
+    });
+  }
+
+  async function confirmDeleteConversation(id){
+    openModal(`<div class="modal-box message-action-modal confirm-danger-modal"><button class="modal-close" data-action="close-modal">×</button><div class="message-action-icon danger">⌫</div><span class="eyebrow">CONVERSATION</span><h3>Supprimer cette conversation ?</h3><p class="muted">Elle sera retirée de votre liste. Les messages de l'autre personne ne seront pas supprimés.</p><div class="message-action-footer"><button class="ghost-action" data-action="close-modal">Annuler</button><button class="primary danger-confirm" data-action="delete-conversation-me" data-id="${esc(id)}">Oui, supprimer</button></div></div>`);
+  }
+
+  async function copyMessage(id){
+    const r=await sb.from('messages').select('content').eq('id',id).maybeSingle();
+    if(r.error||!r.data?.content)return toast('Rien à copier.');
+    try{await navigator.clipboard.writeText(r.data.content);toast('Message copié');}catch(_){toast('Copie impossible sur cet appareil.');}
+  }
+  async function reactToMessage(id,reaction){
+    const r=await sb.from('tafab_message_reactions').upsert({message_id:id,user_id:state.user.id,reaction},{onConflict:'message_id,user_id'});
+    if(r.error)return toast(r.error.message); closeModal(); toast('Réaction ajoutée'); return refreshConversation(state.selectedConversation);
+  }
+  function openConversationSearch(){
+    const bar=$("conversationSearchBar"), input=$("conversationSearchInput");
+    if(!bar || !input) return;
+    bar.hidden=false; input.value=""; input.focus(); filterConversationMessages("");
+  }
+  function closeConversationSearch(){
+    const bar=$("conversationSearchBar"), input=$("conversationSearchInput");
+    if(bar) bar.hidden=true;
+    if(input) input.value="";
+    filterConversationMessages("");
+  }
+  function filterConversationMessages(term){
+    const q=String(term||"").trim().toLocaleLowerCase();
+    const list=document.querySelector(".clean-message-list");
+    if(!list)return;
+    let count=0;
+    list.querySelectorAll("[data-message-id]").forEach(node=>{
+      const text=(node.querySelector(".message-body")?.textContent||node.textContent||"").toLocaleLowerCase();
+      const hit=!q || text.includes(q);
+      node.classList.toggle("message-search-hidden",!hit);
+      node.classList.toggle("message-search-hit",!!q && hit);
+      if(hit && q) count++;
+    });
+    const counter=$("conversationSearchCount"); if(counter) counter.textContent=q?String(count):"0";
+    if(q && count===1){ const hit=list.querySelector(".message-search-hit"); hit?.scrollIntoView({behavior:"smooth",block:"center"}); }
+  }
+
+  function messageActionMenu(id){
+    const node=document.querySelector(`[data-message-id="${CSS.escape(String(id))}"]`); if(!node)return;
+    const mine=node.classList.contains('mine');
+    openModal(`<div class="modal-box message-action-modal message-menu-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">MESSAGE</span><h3>Options</h3><div class="message-menu-list"><button data-action="reply-message" data-id="${esc(id)}"><span class="menu-action-icon">↩</span><span><b>Répondre</b><small>Répondre à ce message</small></span><i>›</i></button><button data-action="copy-message" data-id="${esc(id)}"><span class="menu-action-icon">⧉</span><span><b>Copier</b><small>Copier le texte</small></span><i>›</i></button>${mine?`<button data-action="edit-message" data-id="${esc(id)}"><span class="menu-action-icon">✎</span><span><b>Modifier</b><small>Changer le contenu</small></span><i>›</i></button>`:''}<button class="danger-row" data-action="delete-message" data-id="${esc(id)}"><span class="menu-action-icon">⌫</span><span><b>Supprimer</b><small>Pour moi ou pour tout le monde</small></span><i>›</i></button></div></div>`);
+  }
+
+  function replyConversationMessage(id){
+    const node=document.querySelector(`[data-message-id="${CSS.escape(String(id))}"]`);
+    if(!node) return;
+    const text=node.querySelector(".message-body")?.textContent?.trim()||"";
+    const author=node.dataset.author||"Membre";
+    const input=$("messageText");
+    if(!input) return;
+    const composer=$("messageForm")?.parentElement || input.parentElement;
+    let bar=$("replyComposerBar");
+    if(!bar && composer){ bar=document.createElement("div"); bar.id="replyComposerBar"; bar.className="reply-composer-bar"; composer.prepend(bar); }
+    if(bar) bar.innerHTML=`<span class="reply-composer-icon">↩</span><div><b>Répondre à ${esc(author)}</b><small>${esc(text.slice(0,120))}${text.length>120?'…':''}</small></div><button type="button" data-action="cancel-message-reply" aria-label="Annuler la réponse">×</button>`;
+    input.value=""; input.dataset.replyTo=id; input.focus();
+  }
+
+  function cancelMessageReply(){
+    const bar=$("replyComposerBar"); if(bar) bar.remove();
+    const input=$("messageText"); if(input){ delete input.dataset.replyTo; input.focus(); }
+  }
+
+  async function notificationsPage() {
+    const token = state.renderToken;
+    const { data, error } = await sb.from("notifications").select("*").eq("user_id", state.user.id).order("created_at", { ascending:false }).limit(100);
+    if (token !== state.renderToken || state.route !== "notifications") return;
+    if (error) return simplePage("Alertes", `<div class="empty">${esc(error.message)}</div>`);
+    const actorIds = [...new Set((data || []).map(n => n.actor_id).filter(Boolean))];
+    const { data: actors } = actorIds.length ? await sb.from("profiles").select("*").in("id", actorIds) : { data: [] };
+    const amap = new Map((actors || []).map(p => [p.id,p]));
+    if (token !== state.renderToken) return;
+    $("content").innerHTML = `<section class="clean-page alerts-page"><div class="page-header clean-page-header"><div><h2>Alertes</h2><p class="page-kicker">Les activités réelles de votre compte, en temps réel</p></div><button class="text-button clean-read-button" data-action="mark-read">Tout lire</button></div>
+      <div class="clean-list">${(data || []).map(n => {
+        const actor = amap.get(n.actor_id);
+        const target = notificationTarget(n, actor);
+        const actionAttrs = target ? `data-action="${esc(target.action)}" data-id="${esc(target.id || "")}"` : `data-action="notification-read" data-id="${esc(n.id)}"`; const roleButtons = (n.type==='page_role_request'||n.type==='group_role_request') ? `<span class="notification-role-actions"><button data-action="accept-role-request" data-id="${esc(n.entity_id||'')}">Accepter</button><button data-action="reject-role-request" data-id="${esc(n.entity_id||'')}">Refuser</button></span>` : "";
+        const actorName = actor ? nameOf(actor) : "Un membre";
+        return `<button class="list-row notification-row ${n.is_read ? "" : "unread"}" ${actionAttrs} data-notification="${esc(n.id)}">${avatarHTML(actor || null)}<div class="grow"><b>${esc(actorName)}</b><small>${esc(notificationAction(n))} · ${timeAgo(n.created_at)}</small></div>${n.is_read ? "" : '<span class="blue-dot"></span>'}${roleButtons}<span class="notification-arrow">›</span></button>`;
+      }).join("") || `<div class="empty">Aucune alerte pour le moment.</div>`}</div></section>`;
+  }
+
+  async function openNotificationPost(notificationId) {
+    const n = (await sb.from("notifications").select("*").eq("id", notificationId).maybeSingle()).data;
+    if (!n) return toast("Alerte introuvable");
+    await sb.from("notifications").update({is_read:true}).eq("id",notificationId).eq("user_id",state.user.id);
+    const postId=n.post_id || n.entity_id;
+    if (!postId) return notificationsPage();
+    const p=(await sb.from("posts").select("*").eq("id",postId).maybeSingle()).data;
+    if(!p) return toast("Publication introuvable");
+    const author=(await sb.from("profiles").select("*").eq("id",p.user_id).maybeSingle()).data || state.profile;
+    return openModal(`<div class="modal-box post-preview-modal"><button class="modal-close" data-action="close-modal">×</button>${await postHTML({...p,author})}</div>`);
+  }
+  async function notificationRead(id) {
+    await sb.from("notifications").update({is_read:true}).eq("id",id).eq("user_id",state.user.id);
+    await notificationsPage(); updateBadges();
+  }
+
+  async function markRead() {
+    const { error } = await sb.from("notifications").update({ is_read: true })
+      .eq("user_id", state.user.id).eq("is_read", false);
+    if (error) return toast(error.message);
+    toast("Alertes lues");
+    await notificationsPage();
+    updateBadges();
+  }
+
+  function isUserOnline(userId){
+    if(!userId) return false;
+    if(window.tafaOnlineIds?.has?.(String(userId))) return true;
+    if(!state.presenceChannel) return false;
+    const present=state.presenceChannel.presenceState();
+    return Object.prototype.hasOwnProperty.call(present||{}, String(userId));
+  }
+  async function refreshPresenceLabels(){
+    const id=state.selectedConversation; if(!id || state.route!=="messages") return;
+    const other=(await sb.from("conversation_members").select("user_id").eq("conversation_id",id).neq("user_id",state.user.id).maybeSingle()).data?.user_id;
+    const el=$("conversationPresence"); if(el) el.textContent=other && isUserOnline(other) ? "En ligne" : "Hors ligne";
+  }
+  window.addEventListener("tafass:presence-sync", refreshPresenceLabels);
+  window.addEventListener("tafass:presence-change", refreshPresenceLabels);
+  window.addEventListener("tafass:presence-change", ()=>{
+    if(state.route==="profile" && state.viewingProfileId) { clearTimeout(window.__tafaPresenceRenderTimer); window.__tafaPresenceRenderTimer=setTimeout(()=>openUserProfile(state.viewingProfileId),120); }
+  });
+
+  async function getProfilePrivacy(userId) {
+    if (!userId) return { locked:false, visibility:"public" };
+    const { data, error } = await sb.from("user_settings")
+      .select("profile_visibility,allow_messages,allow_friend_requests")
+      .eq("user_id", userId).maybeSingle();
+    if (error) console.warn("Tafaß profile privacy:", error.message);
+    return { locked:data?.profile_visibility === "private", visibility:data?.profile_visibility || "public", settings:data || {} };
+  }
+
+  function lockedProfileScreen(p, isOwner=false) {
+    const display = nameOf(p) || "Profil Tafaß";
+    return `<section class="profile-locked-screen" data-page-route="profile">
+      <div class="profile-lock-orbit"><div class="profile-lock-icon" aria-hidden="true">🔒</div></div>
+      <div class="profile-lock-identity">${avatarHTML(p,"avatar profile-lock-avatar")}</div>
+      <span class="eyebrow">TAFAß • CONFIDENTIALITÉ</span>
+      <h2>Profil verrouillé</h2>
+      <h3>${esc(display)}</h3>
+      ${p.username ? `<div class="profile-lock-handle">@${esc(p.username)}</div>` : ""}
+      <p class="profile-lock-message">Ny profil ankehitriny dia voasakan'ny tompony ny hiditra</p>
+      <p class="profile-lock-message-fr">Le propriétaire de ce profil a verrouillé l’accès. Les informations, publications, photos, vidéos et relations privées ne sont pas accessibles.</p>
+      <div class="profile-lock-status"><span>🔐</span><div><b>Accès protégé</b><small>Seul le propriétaire peut consulter le contenu complet de ce profil.</small></div></div>
+      <div class="unavailable-actions"><button class="primary" data-route="home">Retour à l’accueil</button><button class="ghost-action" data-route="search">Rechercher</button></div>
+    </section>`;
+  }
+
+  async function loadProfileWallSettings(ownerId){
+    const {data,error}=await sb.from("tafa_profile_wall_settings").select("allow_friend_posts,require_approval").eq("profile_owner_id",ownerId).maybeSingle();
+    if(error) console.warn("Tafaß profile wall settings:",error.message);
+    return {allow_friend_posts:data?.allow_friend_posts!==false,require_approval:data?.require_approval!==false};
+  }
+  function profileWallPostHTML(row, ownerProfile){
+    const author=row.author||{}; const owner=ownerProfile||{};
+    const media=row.media_url ? (String(row.media_type||"").startsWith("video") ? `<video class="profile-wall-media" src="${esc(row.media_url)}" controls playsinline preload="metadata"></video>` : `<img class="profile-wall-media" src="${esc(row.media_url)}" alt="Publication" loading="lazy">`) : "";
+    const mine=String(row.author_id)===String(state.user?.id); const ownerMe=String(row.profile_owner_id)===String(state.user?.id);
+    return `<article class="profile-wall-post-v72" data-wall-post-id="${esc(row.id)}"><header><div class="profile-wall-author">${avatarHTML(author,"avatar sm")}<div><b>${displayNameHTML(author)}</b><small>${timeAgo(row.created_at)} · ${row.status==="pending"?"En attente d’approbation":"Publié"}</small></div></div>${mine||ownerMe?`<button type="button" class="profile-wall-more" data-action="profile-wall-menu" data-id="${esc(row.id)}">•••</button>`:""}</header><div class="profile-wall-target"><span>↳</span><span>sur le profil de <b>${esc(nameOf(owner))}</b></span></div>${row.content?`<p>${esc(row.content)}</p>`:""}${media}${row.status==="pending"?`<div class="profile-wall-pending">⏳ Cette publication attend l’approbation du propriétaire du profil.</div>`:""}</article>`;
+  }
+  async function openProfileWallComposer(ownerId, ownerName){
+    if(!ownerId||!state.user?.id) return;
+    const settings=await loadProfileWallSettings(ownerId);
+    if(ownerId!==state.user.id && !settings.allow_friend_posts) return toast("Le propriétaire n’autorise pas les publications de ses amis.");
+    state.profileWallOwnerId=ownerId; state.profileWallRequireApproval=settings.require_approval;
+    openModal(`<div class="modal-box profile-wall-composer-v72"><button class="modal-close" data-action="close-profile-wall-composer">×</button><span class="eyebrow">TAFAß · PROFIL</span><h3>Écrire sur le profil de ${esc(ownerName||"ce membre")}</h3><p class="muted">Votre publication sera affichée sur son profil${settings.require_approval&&ownerId!==state.user.id?" après approbation":" immédiatement"}.</p><textarea id="profileWallText" class="premium-textarea" maxlength="5000" placeholder="Écrivez quelque chose…"></textarea><div id="profileWallMediaPreview" class="profile-wall-media-preview"></div><input id="profileWallFile" type="file" accept="image/*,video/*" hidden><div class="profile-wall-compose-tools"><button type="button" data-action="profile-wall-photo">▣ <span>Photo/Vidéo</span></button><button type="button" data-action="profile-wall-publish" class="primary">PUBLIER</button></div></div>`);
+    const file=$("profileWallFile"); file?.addEventListener("change",()=>{const f=file.files?.[0]; const box=$("profileWallMediaPreview"); if(!box)return; if(!f){box.innerHTML="";return;} const u=URL.createObjectURL(f); box.innerHTML=f.type.startsWith("video/")?`<video src="${u}" controls playsinline></video>`:`<img src="${u}" alt="Aperçu">`;});
+  }
+  async function publishProfileWallPost(){
+    const ownerId=state.profileWallOwnerId; if(!ownerId||!state.user?.id)return;
+    const text=$("profileWallText")?.value?.trim()||""; const file=$("profileWallFile")?.files?.[0]||null;
+    if(!text&&!file)return toast("Écrivez quelque chose ou ajoutez un média.");
+    if(file){const check=validateMediaFile(file); if(!check.ok)return toast(check.message);}
+    let media_url=null,media_type=null;
+    if(file){const ext=(file.name.split(".").pop()||"bin").toLowerCase(); const path=`${state.user.id}/profile-wall/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`; const up=await uploadPostMedia(path,file); if(up.error)return toast(up.error.message); media_url=sb.storage.from("posts").getPublicUrl(path).data.publicUrl; media_type=file.type||"application/octet-stream";}
+    const {data,error}=await sb.rpc("tafa_create_profile_wall_post",{p_profile_owner_id:ownerId,p_content:text,p_media_url:media_url,p_media_type:media_type});
+    if(error)return toast(error.message);
+    closeModal(); toast(data?.status==="pending"?"✓ Publication envoyée : en attente d’approbation.":"✓ Publication publiée sur le profil.");
+    const id=state.viewingProfileId; if(id) await openUserProfile(id);
+  }
+  async function profileWallMenu(id){
+    const {data,error}=await sb.from("tafa_profile_wall_posts").select("id,author_id,profile_owner_id,status").eq("id",id).maybeSingle(); if(error||!data)return;
+    const owner=String(data.profile_owner_id)===String(state.user.id), author=String(data.author_id)===String(state.user.id);
+    const buttons=[];
+    if(owner&&data.status==="pending") buttons.push(`<button class="menu-card" data-action="profile-wall-approve" data-id="${esc(id)}"><span class="menu-icon">✓</span><span><b>Approuver et publier</b><small>Cette publication apparaîtra immédiatement sur votre profil.</small></span></button>`);
+    if(owner&&data.status==="pending") buttons.push(`<button class="menu-card danger-card" data-action="profile-wall-reject" data-id="${esc(id)}"><span class="menu-icon">×</span><span><b>Refuser</b><small>Supprimer cette demande de publication.</small></span></button>`);
+    if(owner||author) buttons.push(`<button class="menu-card danger-card" data-action="profile-wall-delete" data-id="${esc(id)}"><span class="menu-icon">⌫</span><span><b>Supprimer</b><small>Retirer cette publication du profil.</small></span></button>`);
+    if(owner) buttons.push(`<button class="menu-card" data-action="profile-wall-settings"><span class="menu-icon">⚙</span><span><b>Paramètres des publications</b><small>Choisir si les publications des amis doivent être approuvées.</small></span></button>`);
+    if(!buttons.length)return; openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">PUBLICATIONS DU PROFIL</span><h3>Options</h3><div class="menu-grid">${buttons.join("")}</div></div>`);
+  }
+  async function setProfileWallSettings(){
+    const cfg=await loadProfileWallSettings(state.user.id);
+    openModal(`<div class="modal-box profile-wall-settings-v72"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß · PROFIL</span><h3>Publications sur votre profil</h3><label class="profile-wall-setting"><input id="profileWallAllow" type="checkbox" ${cfg.allow_friend_posts?"checked":""}><span><b>Autoriser les amis à publier</b><small>Les amis peuvent écrire une publication sur votre profil.</small></span></label><label class="profile-wall-setting"><input id="profileWallApprove" type="checkbox" ${cfg.require_approval?"checked":""}><span><b>Approuver avant publication</b><small>Les publications des amis restent en attente jusqu’à votre validation.</small></span></label><button class="primary big" data-action="profile-wall-save-settings">Enregistrer</button></div>`);
+  }
+  async function saveProfileWallSettings(){
+    const allow=!!$("profileWallAllow")?.checked, approve=!!$("profileWallApprove")?.checked;
+    const {error}=await sb.rpc("tafa_set_profile_wall_settings",{p_allow_friend_posts:allow,p_require_approval:approve}); if(error)return toast(error.message); closeModal(); toast("✓ Paramètres des publications enregistrés"); if(state.viewingProfileId) await openUserProfile(state.viewingProfileId);
+  }
+  async function moderateProfileWall(id,status){
+    const {error}=await sb.rpc("tafa_moderate_profile_wall_post",{p_post_id:id,p_status:status});
+    if(error)return toast(error.message);
+    if(status==="deleted") document.querySelector(`[data-wall-post-id="${CSS.escape(String(id))}"]`)?.remove();
+    closeModal();
+    toast(status==="approved"?"✓ Publication approuvée.":status==="deleted"?"✓ Publication supprimée du profil.":"Publication refusée.");
+    if(state.viewingProfileId) await openUserProfile(state.viewingProfileId);
+  }
+  async function openUserProfile(userId) {
+    if (!userId || !state.user) return;
+    state.viewingProfileId = userId;
+    state.route = "profile";
+    history.replaceState(null, "", "#profile");
+    document.querySelectorAll("[data-route]").forEach(el => el.classList.toggle("active", el.dataset.route === "profile"));
+    state.profileTab = "posts";
+    state.renderToken++;
+    const token = state.renderToken;
+
+    // V71: public profile is built from one parallel read batch so opening a
+    // profile never waits through a chain of independent Supabase requests.
+    const [profileR, privacyR, blockedR, liveR, friendR, sentR, receivedR, postsR, friendsR, friendCountR, followersR, ownFriendsR, targetFriendsR, wallSettingsR, wallPostsR] = await Promise.all([
+      sb.from("profiles").select("*").eq("id", userId).maybeSingle(),
+      sb.from("user_settings").select("profile_visibility,allow_messages,allow_friend_requests").eq("user_id", userId).maybeSingle(),
+      userId !== state.user.id ? getBlockedIds() : Promise.resolve(new Set()),
+      sb.from("live_sessions").select("id,title,status,started_at").eq("user_id", userId).eq("status", "live").order("started_at", {ascending:false}).limit(1).maybeSingle(),
+      userId !== state.user.id ? sb.from("friendships").select("id").or(`and(user_id.eq.${state.user.id},friend_id.eq.${userId}),and(user_id.eq.${userId},friend_id.eq.${state.user.id})`).limit(1).maybeSingle() : Promise.resolve({data:null}),
+      userId !== state.user.id ? sb.from("friend_requests").select("id,status").eq("sender_id",state.user.id).eq("receiver_id",userId).eq("status","pending").limit(1).maybeSingle() : Promise.resolve({data:null}),
+      userId !== state.user.id ? sb.from("friend_requests").select("id,status").eq("sender_id",userId).eq("receiver_id",state.user.id).eq("status","pending").limit(1).maybeSingle() : Promise.resolve({data:null}),
+      sb.from("posts").select("*").eq("user_id", userId).order("created_at", {ascending:false}).limit(100),
+      sb.from("friendships").select("user_id,friend_id").or(`user_id.eq.${userId},friend_id.eq.${userId}`).limit(12),
+      sb.rpc("tafa_profile_friend_count", { p_user_id: userId }),
+      sb.from("follows").select("id", {count:"exact",head:true}).eq("following_id", userId),
+      sb.from("friendships").select("user_id,friend_id").or(`user_id.eq.${state.user.id},friend_id.eq.${state.user.id}`).limit(200),
+      sb.from("friendships").select("user_id,friend_id").or(`user_id.eq.${userId},friend_id.eq.${userId}`).limit(200),
+      loadProfileWallSettings(userId),
+      sb.from("tafa_profile_wall_posts").select("*").eq("profile_owner_id",userId).neq("status","deleted").order("created_at",{ascending:false}).limit(50)
+    ]);
+
+    const p = profileR.data;
+    if (profileR.error || !p || token !== state.renderToken) {
+      if (token !== state.renderToken) return;
+      $("content").innerHTML = `<section class="profile-unavailable premium-unavailable" data-page-route="profile"><div class="profile-unavailable-icon"><span>◌</span></div><span class="eyebrow">TAFAß • PROFIL</span><h2>Profil indisponible</h2><p>Ce profil n’est pas accessible actuellement. Il peut avoir été supprimé ou désactivé.</p><div class="unavailable-actions"><button class="primary" data-route="home">Retour</button><button class="ghost-action" data-route="search">Rechercher</button></div></section>`;
+      return;
+    }
+
+    const isMe = userId === state.user.id;
+    const isBlocked = !isMe && blockedR instanceof Set && blockedR.has(String(userId));
+    const privacy = {locked: privacyR.data?.profile_visibility === "private", visibility: privacyR.data?.profile_visibility || "public", settings: privacyR.data || {}};
+    const activeProfileLive = liveR.data || null;
+    const isFriend = !!friendR.data;
+
+    if (!isMe && isBlocked) {
+      $("content").innerHTML = `<section class="profile-locked-screen profile-blocked-screen" data-page-route="profile"><div class="profile-lock-orbit"><div class="profile-lock-icon">⊘</div></div><span class="eyebrow">TAFAß • BLOCAGE</span><h2>Compte inaccessible</h2><h3>Profil masqué</h3><p class="profile-lock-message-fr">Ce compte et votre compte sont bloqués l’un pour l’autre. Les profils, publications, relations et interactions ne sont pas accessibles.</p><div class="profile-lock-status"><span>🔒</span><div><b>Accès totalement bloqué</b><small>Vous ne pouvez ni voir ni contacter ce compte tant que le blocage est actif.</small></div></div><div class="unavailable-actions"><button class="ghost-action" data-route="home">Retour à l’accueil</button></div></section>`;
+      return;
+    }
+    if (!isMe && privacy.locked) {
+      $("content").innerHTML = lockedProfileScreen(p, false);
+      return;
+    }
+    if (!isMe && privacy.visibility === "friends" && !isFriend) {
+      $("content").innerHTML = `<section class="profile-locked-screen" data-page-route="profile"><div class="profile-lock-orbit"><div class="profile-lock-icon">🔐</div></div>${avatarHTML(p,"avatar profile-lock-avatar")}<span class="eyebrow">TAFAß • CONFIDENTIALITÉ</span><h2>Profil réservé aux amis</h2><h3>${esc(nameOf(p))}</h3><p class="profile-lock-message-fr">Ce profil est visible uniquement par les amis du propriétaire.</p><div class="profile-lock-status"><span>👥</span><div><b>Accès limité</b><small>Ajoutez cette personne comme ami pour demander l’accès.</small></div></div><div class="unavailable-actions"><button class="primary" data-action="add-friend" data-id="${esc(userId)}">Ajouter</button><button class="ghost-action" data-route="friends">Retour</button></div></section>`;
+      return;
+    }
+
+    const postRows = postsR.data || [];
+    const targetFriendIds = (targetFriendsR.data || []).map(x => x.user_id === userId ? x.friend_id : x.user_id).filter(Boolean);
+    const ownFriendIds = new Set((ownFriendsR.data || []).map(x => x.user_id === state.user.id ? x.friend_id : x.user_id).filter(Boolean).map(String));
+    const mutualIds = targetFriendIds.filter(id => ownFriendIds.has(String(id))).slice(0, 5);
+    const profileFriendCount = Number(friendCountR?.data ?? 0) || 0;
+    const previewIds = (friendsR.data || []).map(x => x.user_id === userId ? x.friend_id : x.user_id).filter(Boolean).slice(0, 8);
+    const profileFriendIds = [...new Set([...mutualIds, ...previewIds])].slice(0, 8);
+    const friendsPreviewR = profileFriendIds.length ? await sb.from("profiles").select("*").in("id", profileFriendIds) : {data:[]};
+    if (token !== state.renderToken) return;
+    const friendsPreview = (friendsPreviewR.data || []).slice(0, 6);
+    const mutualProfiles = friendsPreview.filter(x => mutualIds.map(String).includes(String(x.id))).slice(0,3);
+    const wallRowsRaw=(wallPostsR.data||[]).filter(x=>(isMe||isFriend) && (x.status==="approved"||String(x.profile_owner_id)===String(state.user.id)||String(x.author_id)===String(state.user.id)));
+    const wallAuthorIds=[...new Set(wallRowsRaw.map(x=>x.author_id).filter(Boolean))];
+    const wallProfilesR=wallAuthorIds.length?await sb.from("profiles").select("*").in("id",wallAuthorIds):{data:[]};
+    const wallMap=new Map((wallProfilesR.data||[]).map(x=>[String(x.id),x]));
+    const wallRows=wallRowsRaw.map(x=>({...x,author:wallMap.get(String(x.author_id))||{id:x.author_id}}));
+
+    // Facebook-like relationship actions from the supplied references:
+    // friend => Ami(e)s + blue Message; non-friend => blue Ajouter + neutral Message.
+    const relationAction = isMe
+      ? `<button type="button" class="tfa-public-action tfa-public-action-primary" data-action="edit-profile">✎ Modifier le profil</button>`
+      : isFriend
+        ? `<button type="button" class="tfa-public-action tfa-public-action-neutral" data-action="remove-friend" data-id="${esc(userId)}">♟ Ami(e)s</button>`
+        : receivedR.data
+          ? `<button type="button" class="tfa-public-action tfa-public-action-primary" data-action="accept-friend" data-id="${esc(userId)}">✓ Confirmer</button>`
+          : sentR.data
+            ? `<button type="button" class="tfa-public-action tfa-public-action-neutral" disabled>Demande envoyée</button>`
+            : `<button type="button" class="tfa-public-action tfa-public-action-primary" data-action="add-friend" data-id="${esc(userId)}">♟ Ajouter comme ami(e)</button>`;
+    const messageAction = !isMe ? `<button type="button" class="tfa-public-action ${isFriend ? "tfa-public-action-primary" : "tfa-public-action-neutral"}" data-action="message-user" data-id="${esc(userId)}">● Message</button>` : "";
+    const moreAction = !isMe && isFriend ? `<button type="button" class="tfa-public-more" data-action="profile-more" data-id="${esc(userId)}" aria-label="Plus d’options">•••</button>` : "";
+
+    const relationship = p.relationship_status || p.relationship || "";
+    const languages = Array.isArray(p.languages) ? p.languages.join(" · ") : String(p.languages || "");
+    const birth = p.birth_date || p.birth || "";
+    const location = [p.city_current || p.city, p.country].filter(Boolean).join(", ");
+    const personalRows = [
+      location ? `<div><span>⌖</span><b>${esc(location)}</b></div>` : "",
+      birth ? `<div><span>♨</span><b>${esc(new Date(birth).toLocaleDateString("fr-FR", {day:"numeric", month:"long", year:"numeric"}))}</b></div>` : "",
+      relationship ? `<div><span>♡</span><b>${esc(relationship)}</b></div>` : "",
+      p.gender ? `<div><span>◉</span><b>${esc(p.gender)}</b></div>` : "",
+      languages ? `<div><span>文</span><b>${esc(languages)}</b></div>` : ""
+    ].filter(Boolean).join("");
+
+    const cover = p.cover_url ? `style="background-image:url('${esc(p.cover_url)}')"` : "";
+    const mutualNames = mutualProfiles.map(x => nameOf(x).split(" ")[0]).filter(Boolean).slice(0,3).join(", ");
+    const extraMutual = mutualIds.length > 3 ? " et " + (mutualIds.length - 3) + " autre(s) personne(s)" : "";
+    const mutualText = mutualProfiles.length > 1 ? "Ami(e) avec " + mutualNames + extraMutual : (mutualNames ? mutualNames + " est votre ami(e)" : "");
+    const friendStrip = friendsPreview.map(x => `<button type="button" class="tfa-public-friend-card" data-action="view-profile" data-id="${esc(x.id)}">${avatarHTML(x,"avatar")}<b>${esc(nameOf(x).split(" ")[0])}</b><small>${ownFriendIds.has(String(x.id)) ? "ami(e) en commun" : "ami(e)"}</small></button>`).join("");
+    const publicPostsAllowed = isMe || isFriend;
+    let body = "";
+    if (publicPostsAllowed) {
+      const renderedPosts = await Promise.all(postRows.map(post => postHTML({...post, author:p})));
+      body = renderedPosts.join("");
+      if (!body) body = `<div class="tfa-public-empty">Aucune publication pour le moment.</div>`;
+    } else {
+      body = `<div class="tfa-public-private-posts"><div class="tfa-public-private-icon">🔒</div><h3>Ajoutez ${esc(nameOf(p).split(" ")[0])} à vos ami(e)s</h3><p>Ajoutez cette personne à vos ami(e)s pour voir ses publications.</p><button type="button" class="tfa-public-action tfa-public-action-primary" data-action="add-friend" data-id="${esc(userId)}">♟ Ajouter comme ami(e)</button></div>`;
+    }
+
+    $("content").innerHTML = `<section class="tfa-public-profile-v71" data-page-route="profile">
+      <div class="tfa-public-cover-v71"><div class="tfa-public-cover-image-v71" ${cover}></div><div class="tfa-public-cover-shade-v71"></div></div>
+      <main class="tfa-public-main-v71">
+        <div class="tfa-public-avatar-row-v71"><div class="tfa-public-avatar-ring-v71">${avatarHTML(p,"avatar profile-avatar")}</div>${isMe ? `<button type="button" class="tfa-public-avatar-camera-v71" data-action="edit-profile" aria-label="Modifier la photo de profil">▣</button>` : ""}</div>
+        <header class="tfa-public-head-v71">
+          <h1>${displayNameHTML(p)}</h1>${profilePresenceHTML(p) ? `<div class="tfa-profile-presence-v74">${profilePresenceHTML(p)}</div>` : ""}
+          <div class="tfa-public-counts-v71"><b>${profileFriendCount} ami(e)s</b>${mutualIds.length ? `<span>·</span><b>${mutualIds.length} en commun</b>` : ""}</div>
+          ${relationship ? `<p class="tfa-public-relationship-v71">${esc(relationship)}</p>` : ""}
+          ${p.bio ? `<p class="tfa-public-bio-v71">${esc(p.bio)}</p>` : ""}
+          ${location ? `<p class="tfa-public-location-v71">⌖ ${esc(location)}</p>` : ""}
+        </header>
+        ${mutualText ? `<div class="tfa-public-mutual-v71"><div>${mutualProfiles.map(x=>avatarHTML(x,"avatar")).join("")}</div><span>${esc(mutualText)}</span></div>` : ""}
+        <div class="tfa-public-actions-v71">${relationAction}${messageAction}${moreAction}</div>
+        <nav class="tfa-public-tabs-v71" role="tablist"><button class="active" type="button">Tous</button><button type="button" data-action="public-profile-tab" data-id="${esc(userId)}" data-tab="photos">Photos</button><button type="button" data-action="public-profile-tab" data-id="${esc(userId)}" data-tab="videos">Reels</button></nav>
+        ${personalRows ? `<section class="tfa-public-info-v71"><h2>Informations personnelles</h2>${personalRows}</section>` : ""}
+        ${friendStrip ? `<section class="tfa-public-friends-v71"><div class="tfa-public-section-head-v71"><h2>Amis</h2><button type="button" data-route="friends">Voir tout</button></div><div class="tfa-public-friend-strip-v71">${friendStrip}</div></section>` : ""}
+        <section class="tfa-public-posts-v71"><h2>Toutes les publications</h2>${isFriend || isMe ? `<button type="button" class="tfa-public-composer-v72" data-action="profile-wall-composer" data-id="${esc(userId)}">${avatarHTML(state.profile || p,"avatar")}<span>Écrivez quelque chose à ${isMe ? "vous-même" : esc(nameOf(p).split(" ")[0])}...</span><b>＋</b></button>` : ""}<div class="tfa-public-post-list-v71">${wallRows.map(x=>profileWallPostHTML(x,p)).join("")}${body}</div></section>
+      </main>
+    </section>`;
+  }
+
+  async function openUserProfileTab(userId, tab="posts") {
+    if (!userId) return;
+    if(userId!==state.user.id && await isBlockedBetween(userId)) return openUserProfile(userId);
+    const { data:p }=await sb.from("profiles").select("*").eq("id",userId).maybeSingle();
+    if(!p) return openUserProfile(userId);
+    const isMe = userId === state.user.id;
+    const privacy = await getProfilePrivacy(userId);
+    if(!isMe && privacy.locked) { $("content").innerHTML = lockedProfileScreen(p,false); return; }
+    const isLockedProfile = isMe && privacy.locked;
+    const { data:posts }=await sb.from("posts").select("*").eq("user_id",userId).order("created_at",{ascending:false}).limit(100);
+    const rows=(posts||[]).map(x=>({...x,author:p}));
+    let body="";
+    if(tab==="photos"){
+      body=`<div class="photo-grid">${rows.filter(x=>x.media_type==="image"&&x.media_url).map(x=>`<img class="protected-media" src="${esc(x.media_url)}" alt="Photo publiée" loading="lazy">`).join("")||`<div class="empty profile-empty">Aucune photo publiée.</div>`}</div>`;
+    } else if(tab==="videos"){
+      body=rows.filter(x=>["video","reel"].includes(x.media_type)).map(x=>`<article class="profile-publication"><p>${esc(x.content||"")}</p><video class="post-media protected-media" src="${esc(x.media_url)}" controls preload="metadata"></video></article>`).join("")||`<div class="empty profile-empty">Aucune vidéo publiée.</div>`;
+    } else if(tab==="friends"){
+      body=`<div class="profile-network-section"><p>Consultez les relations publiques de ce membre.</p><button class="primary big" data-route="friends">Ouvrir Amis</button></div>`;
+    } else {
+      for(const x of rows) body+=await postHTML(x);
+      if(!body) body=`<div class="empty profile-empty">Aucune publication pour le moment.</div>`;
+    }
+    const root=document.querySelector(".public-profile-page .profile-publications-section");
+    const nav=document.querySelector(".public-profile-page .profile-tabs");
+    if(root) root.innerHTML=body;
+    if(nav) nav.innerHTML=[["posts","Publications"],["photos","Photos"],["videos","Vidéos"],["friends","Amis"]].map(([k,v])=>`<button class="${tab===k?"active":""}" data-action="public-profile-tab" data-id="${esc(userId)}" data-tab="${k}">${v}</button>`).join("");
+  }
+
+  async function openPrivacySettings() {
+    const cfg=(await sb.from("user_settings").select("*").eq("user_id",state.user.id).maybeSingle()).data||{};
+    return openModal(`<div class="modal-box settings-modal privacy-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • CONFIDENTIALITÉ</span><h3>Confidentialité du profil</h3><p class="muted">Choisissez qui peut accéder à votre profil et comment les autres membres peuvent vous contacter.</p><label>Visibilité<select id="privacyVisibility"><option value="public" ${cfg.profile_visibility!=="friends"&&cfg.profile_visibility!=="private"?"selected":""}>Public</option><option value="friends" ${cfg.profile_visibility==="friends"?"selected":""}>Amis uniquement</option><option value="private" ${cfg.profile_visibility==="private"?"selected":""}>Privé</option></select></label><button class="primary big" data-action="save-privacy">Enregistrer</button></div>`);
+  }
+
+  async function removeFriend(id) {
+    const r1=await sb.from("friendships").delete().eq("user_id",state.user.id).eq("friend_id",id);
+    const r2=await sb.from("friendships").delete().eq("user_id",id).eq("friend_id",state.user.id);
+    if(r1.error&&r2.error)return toast(r1.error.message);
+    await logActivity("friend_removed","Ami retiré","profile",id); toast("Ami retiré");
+    if(state.route==="friends") await friendsPage();
+    if(state.viewingProfileId===id) await openUserProfile(id);
+  }
+  async function profileMore(id) {
+    if(!id || id===state.user.id)return;
+    const blocked=(await sb.from("blocked_profiles").select("id").eq("blocker_id",state.user.id).eq("blocked_id",id).maybeSingle()).data;
+    openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">COMPTE</span><h3>Options du profil</h3><div class="menu-grid"><button class="menu-card" data-action="report-profile" data-id="${esc(id)}"><span class="menu-icon">⚑</span><span><b>Signaler le compte</b><small>Signaler un comportement ou un contenu</small></span></button><button class="menu-card ${blocked?"":"danger-card"}" data-action="${blocked?"unblock-profile":"block-profile"}" data-id="${esc(id)}"><span class="menu-icon">${blocked?"✓":"⊘"}</span><span><b>${blocked?"Débloquer le compte":"Bloquer le compte"}</b><small>${blocked?"Autoriser à nouveau les interactions":"Empêcher les interactions avec ce compte"}</small></span></button></div></div>`);
+  }
+  async function reportProfile(id) {
+    if(!id || !state.user?.id || String(id)===String(state.user.id)) return toast("Signalement invalide");
+    const reason=await premiumPrompt("Signaler ce compte","Expliquez brièvement le motif du signalement. Votre message sera transmis à la modération.","Comportement ou contenu inapproprié","Envoyer le signalement");
+    if(reason===null)return;
+    const payload={
+      reporter_id:state.user.id,
+      reported_id:id,
+      reason:String(reason).trim()||"Contenu à vérifier",
+      status:"pending"
+    };
+    // Insert-only: an upsert can turn into UPDATE and therefore requires an
+    // UPDATE RLS policy. Profile reports are immutable submissions from the
+    // reporter, so only INSERT is needed and is compatible with the stable
+    // Supabase policy installed by V53.
+    const r=await sb.from("profile_reports").insert(payload);
+    if(r.error){
+      if(String(r.error.code||"")==="23505") return closeModal(),toast("Ce compte a déjà été signalé par vous.");
+      return toast(r.error.message);
+    }
+    closeModal();
+    toast("Signalement envoyé");
+    await logActivity("profile_reported","Compte signalé","profile",id);
+  }
+  async function blockProfile(id) {
+    if(!id || id===state.user.id)return;
+    // Insert-only flow: avoids PostgREST turning an upsert into UPDATE and
+    // hitting an UPDATE USING policy that may not exist on older schemas.
+    const existing=await sb.from("blocked_profiles").select("id").eq("blocker_id",state.user.id).eq("blocked_id",id).maybeSingle();
+    if(existing.error)return toast(existing.error.message);
+    if(!existing.data){
+      const r=await sb.from("blocked_profiles").insert({blocker_id:state.user.id,blocked_id:id});
+      if(r.error)return toast(r.error.message);
+    }
+    await Promise.allSettled([
+      sb.from("friend_requests").delete().or(`and(sender_id.eq.${state.user.id},receiver_id.eq.${id}),and(sender_id.eq.${id},receiver_id.eq.${state.user.id})`),
+      sb.from("friendships").delete().or(`and(user_id.eq.${state.user.id},friend_id.eq.${id}),and(user_id.eq.${id},friend_id.eq.${state.user.id})`),
+      sb.from("follows").delete().or(`and(follower_id.eq.${state.user.id},following_id.eq.${id}),and(follower_id.eq.${id},following_id.eq.${state.user.id})`)
+    ]);
+    blockedCache.loadedAt=0; await getBlockedIds(true); closeModal(); toast("Compte bloqué : accès et interactions désactivés"); await logActivity("profile_blocked","Compte bloqué","profile",id);
+  }
+  async function unblockProfile(id) {
+    const r=await sb.from("blocked_profiles").delete().eq("blocker_id",state.user.id).eq("blocked_id",id);
+    if(r.error)return toast(r.error.message); blockedCache.loadedAt=0; await getBlockedIds(true); closeModal(); toast("Compte débloqué");
+  }
+
+  async function profilePage(tab = state.profileTab) {
+    const token = state.renderToken;
+    const allowedTabs = ["posts","photos","videos","friends"];
+    state.profileTab = allowedTabs.includes(tab) ? tab : "posts";
+    tab = state.profileTab;
+    const p = state.profile || {};
+    const privacy = await getProfilePrivacy(state.user.id);
+    const isLockedProfile = privacy.locked === true;
+
+    const mine = await loadMyPosts();
+    const wallR = await sb.from("tafa_profile_wall_posts").select("*").eq("profile_owner_id",state.user.id).order("created_at",{ascending:false}).limit(50);
+    const wallRows = wallR.data||[];
+    const wallAuthorIds=[...new Set(wallRows.map(x=>x.author_id).filter(Boolean))];
+    const wallProfilesR=wallAuthorIds.length?await sb.from("profiles").select("*").in("id",wallAuthorIds):{data:[]};
+    const wallMap=new Map((wallProfilesR.data||[]).map(x=>[String(x.id),x]));
+    const wallRendered=wallRows.map(x=>profileWallPostHTML({...x,author:wallMap.get(String(x.author_id))||{id:x.author_id}},p)).join("");
+    const photos = mine.filter(x => x.media_url && String(x.media_type || "").toLowerCase().startsWith("image/"));
+    const videos = mine.filter(x => ["video","reel"].includes(String(x.media_type || "").toLowerCase()) || x.video_url || x.reel_url);
+
+    const [friendsCountR, followersCountR, friendsRowsR] = await Promise.all([
+      sb.from("friendships").select("id", { count:"exact", head:true }).eq("user_id", state.user.id),
+      sb.from("follows").select("id", { count:"exact", head:true }).eq("following_id", state.user.id),
+      sb.from("friendships").select("friend_id").eq("user_id", state.user.id).limit(8)
+    ]);
+    const friendsCount = friendsCountR.count || 0;
+    const followersCount = followersCountR.count || 0;
+    const friendIds = (friendsRowsR.data || []).map(x => x.friend_id).filter(Boolean).slice(0,8);
+    const friendsPreviewR = friendIds.length
+      ? await sb.from("profiles").select("*").in("id", friendIds)
+      : { data: [] };
+    const friendsPreview = (friendsPreviewR.data || []).slice(0,6);
+
+    if (token !== state.renderToken || state.route !== "profile") return;
+
+    let tabBody = "";
+    if (tab === "photos") {
+      tabBody = `<section class="tfa-profile-feed-v70"><div class="tfa-profile-photo-grid-v70">${photos.map(x =>
+        `<button type="button" class="tfa-profile-photo-v70" data-action="search-post" data-id="${esc(x.id)}"><img class="protected-media" src="${esc(x.media_url)}" alt="Photo publiée" loading="lazy"></button>`
+      ).join("") || `<div class="tfa-profile-empty-v70">Aucune photo publiée.</div>`}</div></section>`;
+    } else if (tab === "videos") {
+      tabBody = `<section class="tfa-profile-feed-v70"><div class="tfa-profile-reels-v70">${videos.map(x =>
+        `<article class="tfa-profile-reel-card-v70"><div class="tfa-profile-post-head-v70">${avatarHTML(p,"avatar sm")}<div><b>${esc(nameOf(p))}${verifiedBadgeHTML(p)}</b><small>${timeAgo(x.created_at)} · ${String(x.media_type||"").toLowerCase()==="reel" ? "Reel" : "Vidéo"}</small></div></div>${x.content ? `<p>${esc(x.content)}</p>` : ""}<video class="protected-media" src="${esc(x.media_url || x.video_url || x.reel_url)}" controls playsinline preload="metadata"></video></article>`
+      ).join("") || `<div class="tfa-profile-empty-v70">Aucun Reel ou vidéo publié.</div>`}</div></section>`;
+    } else if (tab === "friends") {
+      tabBody = `<section class="tfa-profile-feed-v70"><div class="tfa-profile-friends-full-v70">${friendsPreview.map(x =>
+        `<button type="button" class="tfa-profile-friend-card-v70" data-action="view-profile" data-id="${esc(x.id)}">${avatarHTML(x,"avatar")}<span><b>${esc(nameOf(x))}${verifiedBadgeHTML(x)}</b><small>${window.tafaOnlineIds?.has?.(String(x.id)) ? "En ligne" : "Ami(e)"}</small></span></button>`
+      ).join("") || `<div class="tfa-profile-empty-v70">Aucun ami à afficher.</div>`}</div><button class="tfa-profile-more-friends-v70" data-route="friends">Voir tous les amis</button></section>`;
+    } else {
+      const renderedMine = await Promise.all(mine.map(x => postHTML(x)));
+      const allFeed = wallRendered + renderedMine.join("");
+      tabBody = `<section class="tfa-profile-feed-v70">${allFeed || `<div class="tfa-profile-empty-v70">Aucune publication pour le moment.</div>`}</section>`;
+    }
+
+    const cover = p.cover_url ? `style="background-image:url('${esc(p.cover_url)}')"` : "";
+    const location = [p.city_current, p.country].filter(Boolean).join(", ");
+    const relationship = p.relationship_status || p.relationship || "";
+    const languages = Array.isArray(p.languages) ? p.languages.join(" · ") : String(p.languages || "");
+    const hobbies = Array.isArray(p.hobbies) ? p.hobbies.join(" · ") : String(p.hobbies || p.interests || "");
+    const mutual = Math.min(friendsPreview.length, 3);
+    const mutualNames = friendsPreview.slice(0,3).map(x => nameOf(x).split(" ")[0]).filter(Boolean).join(", ");
+    const personalRows = [
+      location ? `<div><span>⌖</span><b>${esc(location)}</b></div>` : "",
+      relationship ? `<div><span>♡</span><b>${esc(relationship)}</b></div>` : "",
+      p.gender ? `<div><span>◉</span><b>${esc(p.gender)}</b></div>` : "",
+      languages ? `<div><span>文</span><b>${esc(languages)}</b></div>` : ""
+    ].filter(Boolean).join("");
+
+    const friendsPreviewHtml = friendsPreview.map(x =>
+      `<button type="button" class="tfa-profile-friend-mini-v70" data-action="view-profile" data-id="${esc(x.id)}">${avatarHTML(x,"avatar")}<span>${esc(nameOf(x).split(" ")[0])}</span></button>`
+    ).join("");
+
+    $("content").innerHTML = `<section class="profile-page-premium tfa-profile-v70" data-page-route="profile">
+      <div class="tfa-profile-cover-v70">
+        <div class="profile-cover" ${cover}></div>
+        <div class="tfa-profile-cover-shade-v70"></div>
+        <button type="button" class="tfa-profile-cover-camera-v70" data-action="edit-profile" aria-label="Modifier la photo de couverture">▣</button>
+      </div>
+      <div class="tfa-profile-main-v70">
+        <div class="tfa-profile-avatar-row-v70">
+          <div class="tfa-profile-avatar-ring-v70">${avatarHTML(p,"avatar profile-avatar")}</div>
+          <button type="button" class="tfa-profile-avatar-camera-v70" data-action="edit-profile" aria-label="Modifier la photo de profil">▣</button>
+        </div>
+        <div class="tfa-profile-heading-v70">
+          <h1>${displayNameHTML(p)}</h1>
+          <p class="tfa-profile-handle-v70">${p.username ? `@${esc(p.username)} · ` : ""}${friendsCount} ami(e)s</p>
+          ${location ? `<p class="tfa-profile-location-v70">⌖ ${esc(location)}</p>` : ""}
+          ${p.bio ? `<p class="tfa-profile-bio-v70">${esc(p.bio)}</p>` : ""}
+        </div>
+        <div class="tfa-profile-actions-v70">
+          <button type="button" class="tfa-profile-story-btn-v70" data-action="story-create">＋ Ajouter à la story</button>
+          <button type="button" class="tfa-profile-edit-btn-v70" data-action="edit-profile">✎ Modifier le profil</button>
+        </div>
+        ${isLockedProfile ? `<div class="tfa-profile-lock-card-v70"><span>🔒</span><div><b>Vous avez verrouillé votre profil</b><small>Seul vous pouvez voir le contenu complet de votre profil.</small></div></div>` : ""}
+        ${mutual ? `<div class="tfa-profile-mutual-v70"><div class="tfa-profile-mutual-avatars-v70">${friendsPreview.slice(0,3).map(x => avatarHTML(x,"avatar")).join("")}</div><span>${mutual > 1 ? `${mutual} ami(e)s avec des points communs` : `${mutualNames} est votre ami(e)`}</span></div>` : ""}
+        <div class="tfa-profile-tabs-v70" role="tablist">
+          ${[["posts","Tous"],["photos","Photos"],["videos","Reels"],["friends","Amis"]].map(([k,v]) =>
+            `<button type="button" role="tab" class="${tab===k?"active":""}" data-action="profile-tab" data-tab="${k}">${v}</button>`
+          ).join("")}
+        </div>
+        <section class="tfa-profile-info-v70">
+          <div class="tfa-profile-section-head-v70"><h2>Informations personnelles</h2><button type="button" data-action="account-settings" aria-label="Modifier les informations">✎</button></div>
+          ${personalRows || `<div class="tfa-profile-empty-line-v70">Ajoutez votre lieu et votre présentation depuis Modifier le profil.</div>`}
+        </section>
+        
+        ${friendsPreview.length ? `<section class="tfa-profile-friends-v70"><div class="tfa-profile-section-head-v70"><h2>Amis</h2><button type="button" data-route="friends">Voir tout</button></div><div class="tfa-profile-friend-strip-v70">${friendsPreviewHtml}</div></section>` : ""}
+        <section class="tfa-profile-publications-head-v70"><div><h2>Toutes les publications</h2><small>${mine.length + wallRows.length} publication${mine.length + wallRows.length===1?"":"s"}</small></div><div class="tfa-profile-publication-actions-v72"><button type="button" data-action="profile-wall-settings">⚙</button><button type="button" data-action="profile-tab" data-tab="posts">Tout voir</button></div></section><button type="button" class="tfa-own-profile-composer-v72" data-action="profile-wall-composer" data-id="${esc(state.user.id)}">${avatarHTML(p,"avatar")}<span>Écrivez quelque chose...</span><b>＋</b></button>
+      </div>
+      ${tabBody}
+    </section>`;
+  }
+
+  function editProfile() {
+    const p=state.profile||{};
+    openModal(`<div class="modal-box profile-redesign-v5">
+      <header class="redesign-modal-header">
+        <button class="modal-back-v5" data-action="close-modal" aria-label="Retour"><span>‹</span><small>Retour</small></button>
+        <div class="redesign-heading"><span class="brand-kicker"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"> <span>TAFAß · PROFIL</span></span><h3>Modifier le profil</h3><p>Personnalisez votre présence publique avec une présentation claire et élégante.</p></div>
+      </header>
+      <div class="profile-redesign-body">
+        <section class="profile-visual-card-v5">
+          <label class="profile-cover-v5" id="editorCoverPreview" style="${p.cover_url?`background-image:url('${esc(p.cover_url)}')`:''}">
+            <span class="cover-fallback-v5"><b>Votre couverture</b><small>Ajoutez une image qui vous représente</small></span>
+            <span class="cover-edit-v5">📷 <b>Modifier</b></span>
+            <input id="pfCover" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+          </label>
+          <label class="profile-avatar-wrap-v5" id="editorAvatarPreview">
+            ${avatarHTML(p,"avatar editor-avatar-image-v3")}
+            <span class="avatar-edit-v5">📷</span>
+            <input id="pfAvatar" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+          </label>
+          <div class="profile-visual-meta-v5"><div><b>${esc(nameOf(p))}</b><small>Profil public Tafaß</small></div><span>PHOTO & COUVERTURE</span></div>
+        </section>
+
+        <section class="redesign-section-v5">
+          <div class="redesign-section-head-v5"><span class="section-icon-v5">Aa</span><div><b>Présentation</b><small>Ce que les autres voient sur votre profil</small></div></div>
+          <div class="redesign-field-v5 wide"><label><span>Bio</span><textarea id="pfBio" maxlength="500" placeholder="Présentez-vous en quelques mots…">${esc(p.bio||'')}</textarea><small class="field-counter-v5">Maximum 500 caractères</small></label></div>
+        </section>
+
+        <section class="redesign-section-v5">
+          <div class="redesign-section-head-v5"><span class="section-icon-v5">⌖</span><div><b>Lieu</b><small>Ajoutez des informations de localisation publiques</small></div></div>
+          <div class="redesign-field-v5"><label><span>Pays</span><input value="Madagascar" readonly disabled></label></div>
+          <div class="redesign-field-v5 wide place-field-v5"><label><span>Ville actuelle / Lieu</span><div class="place-search-wrap-v4"><input id="pfCityCurrent" value="${esc(p.city_current||'')}" placeholder="Rechercher un lieu réel…" autocomplete="off" data-place-valid="${p.city_current?'true':'false'}"><div id="pfCityCurrentResults" class="place-results-v4"></div></div><small>Sélectionnez un lieu réel à Madagascar.</small></label></div>
+          <div class="redesign-field-v5 wide place-field-v5"><label><span>Ville d'origine</span><div class="place-search-wrap-v4"><input id="pfCityOrigin" value="${esc(p.city_origin||'')}" placeholder="Rechercher une ville réelle…" autocomplete="off" data-place-valid="${p.city_origin?'true':'false'}"><div id="pfCityOriginResults" class="place-results-v4"></div></div><small>La ville d'origine peut rester vide.</small></label></div>
+        </section>
+      </div>
+      <footer class="redesign-modal-footer-v5"><button class="ghost-action" data-action="close-modal">Annuler</button><button class="primary big profile-save-button" data-action="save-profile"><span>✓</span> Enregistrer les modifications</button></footer>
+    </div>`);
+    installPlaceSearch("pfCityCurrent","pfCityCurrentResults");
+    installPlaceSearch("pfCityOrigin","pfCityOriginResults");
+    $("pfAvatar")?.addEventListener("change", e => { const file=e.target.files?.[0]; if(!file)return; if(!file.type.startsWith("image/"))return toast("Choisissez une image."); const img=document.createElement("img"); img.src=URL.createObjectURL(file); img.className="avatar editor-avatar-image-v3-img"; img.alt="Avatar"; const old=$("editorAvatarPreview")?.querySelector(".avatar"); if(old) old.replaceWith(img); });
+    $("pfCover")?.addEventListener("change", e => { const file=e.target.files?.[0]; if(!file)return; if(!file.type.startsWith("image/"))return toast("Choisissez une image."); $("editorCoverPreview").style.backgroundImage=`url("${URL.createObjectURL(file)}")`; });
+  }
+
+  function accountSettings() {
+    const p=state.profile||{}, authEmail=state.user?.email||p.email||'';
+    const changed=p.name_changed_at?new Date(p.name_changed_at):null, next=changed?new Date(changed.getTime()+15*86400000):null, locked=next&&next.getTime()>Date.now();
+    openModal(`<div class="modal-box account-redesign-v5">
+      <header class="redesign-modal-header account-header-v5">
+        <button class="modal-back-v5" data-action="close-modal" aria-label="Retour"><span>‹</span><small>Retour</small></button>
+        <div class="redesign-heading"><span class="brand-kicker"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"> <span>TAFAß · COMPTE</span></span><h3>Informations du compte</h3><p>Gérez vos informations privées et vos coordonnées de connexion dans un espace sécurisé.</p></div>
+      </header>
+      <div class="account-redesign-body-v5">
+        <div class="account-identity-banner-v5"><span class="account-mark-v5">${esc((p.first_name||'T').slice(0,1).toUpperCase())}</span><div><b>${esc(nameOf(p))}</b><small>Informations privées · non visibles sur le profil public</small></div><span class="secure-pill-v5">● Sécurisé</span></div>
+        <section class="redesign-section-v5 account-section-v5">
+          <div class="redesign-section-head-v5"><span class="section-icon-v5">ID</span><div><b>Identité</b><small>Nom et prénom associés à votre compte</small></div></div>
+          <div class="redesign-grid-v5 two">
+            <div class="redesign-field-v5"><label><span>Prénom</span><input id="asFirst" value="${esc(p.first_name||'')}" ${locked?'disabled':''} autocomplete="given-name"></label></div>
+            <div class="redesign-field-v5"><label><span>Nom</span><input id="asLast" value="${esc(p.last_name||'')}" ${locked?'disabled':''} autocomplete="family-name"></label></div>
+          </div>
+          <div class="account-note-v5">${locked?`🔒 Nom et prénom verrouillés jusqu’au ${next.toLocaleDateString('fr-FR')}.`:'✓ Votre nom et prénom peuvent être modifiés une fois tous les 15 jours.'}</div>
+        </section>
+        <section class="redesign-section-v5 account-section-v5">
+          <div class="redesign-section-head-v5"><span class="section-icon-v5">@</span><div><b>Coordonnées</b><small>Utilisées pour vous connecter et récupérer votre compte</small></div></div>
+          <div class="redesign-field-v5 wide"><label><span>E-mail</span><input id="asEmail" value="${esc(authEmail)}" type="email" autocomplete="email"></label></div>
+          <div class="redesign-field-v5 wide"><label><span>Numéro de téléphone</span><div class="phone-field-v5"><span>${esc(phoneMeta().code)}</span><input id="asPhone" value="${esc(normalizePhone(p.phone||"",phoneMeta()))}" type="tel" inputmode="numeric" maxlength="${phoneMeta().digits}" placeholder="${phoneMeta().placeholder}" autocomplete="tel-national"></div><small>Pays détecté automatiquement : ${esc(phoneMeta().name)} · Entrez uniquement le numéro national.</small></label></div>
+        </section>
+        <section class="redesign-section-v5 account-section-v5">
+          <div class="redesign-section-head-v5"><span class="section-icon-v5">••</span><div><b>Informations personnelles</b><small>Ces données restent liées à votre compte</small></div></div>
+          <div class="redesign-grid-v5 two">
+            <div class="redesign-field-v5"><label><span>Date de naissance</span><input id="asBirth" value="${esc(p.birth||'')}" type="date"></label></div>
+            <div class="redesign-field-v5"><label><span>Genre</span><select id="asGender"><option value="">Choisir</option><option value="Homme" ${p.gender==='Homme'?'selected':''}>Homme</option><option value="Femme" ${p.gender==='Femme'?'selected':''}>Femme</option><option value="Autre" ${p.gender==='Autre'?'selected':''}>Autre</option></select></label></div>
+          </div>
+        </section>
+      </div>
+      <footer class="redesign-modal-footer-v5"><button class="ghost-action" data-action="close-modal">Annuler</button><button class="primary big" data-action="save-account-settings"><span>✓</span> Enregistrer</button></footer>
+    </div>`);
+  }
+
+  async function saveAccountSettings() {
+    const p=state.profile||{}, first=$("asFirst")?.value.trim()||'', last=$("asLast")?.value.trim()||'', oldFirst=String(p.first_name||'').trim(), oldLast=String(p.last_name||'').trim();
+    const changed=first!==oldFirst||last!==oldLast;
+    if(changed&&p.name_changed_at&&Date.now()<new Date(p.name_changed_at).getTime()+15*86400000) return toast('Le nom et le prénom sont encore verrouillés.');
+    const birth=$("asBirth")?.value||null, gender=$("asGender")?.value||'', phone=normalizePhone($("asPhone")?.value||'',phoneMeta()), newEmail=$("asEmail")?.value.trim()||'', oldEmail=state.user?.email||p.email||'';
+    if(!first||!last||!birth||!gender||!phone||!phoneMeta().test.test(phone)||!newEmail||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) return toast('Remplissez correctement toutes les informations obligatoires.');
+    try {
+      if(changed){
+        const identity=await identityProtectionCheck({first_name:first,last_name:last,username:p.username||"",context:"profile_name"});
+        if(!identity.allowed) throw new Error(identity.message||"Modification refusée : identité protégée.");
+      }
+      if(newEmail.toLowerCase()!==oldEmail.toLowerCase()){ const er=await sb.auth.updateUser({email:newEmail}); if(er.error) throw new Error(er.error.message); }
+      const patch={first_name:first,last_name:last,birth,gender,phone,phone_code:phoneMeta().code,email:newEmail,country:phoneMeta().name};
+      if(changed) patch.name_changed_at=new Date().toISOString();
+      const r=await sb.from('profiles').update(patch).eq('id',state.user.id); if(r.error)throw new Error(r.error.message);
+      closeModal(); await loadProfile(); await settingsPage(); toast(newEmail.toLowerCase()!==oldEmail.toLowerCase()?'E-mail mis à jour. Vérifiez votre nouvelle adresse si Supabase demande une confirmation.':'Informations du compte enregistrées.');
+    } catch(e){toast(e.message)}
+  }
+
+  async function saveProfile() {
+    const p = state.profile || {};
+    const currentInput = $("pfCityCurrent");
+    const originInput = $("pfCityOrigin");
+    const currentCity = currentInput?.value.trim() || "";
+    const originCity = originInput?.value.trim() || "";
+    const bio = $("pfBio")?.value.trim() || "";
+
+    // La ville d'origine est facultative. Une modification de profil ne doit
+    // jamais être bloquée simplement parce que ce champ est vide.
+    if (currentCity && currentInput?.dataset.placeValid !== "true") {
+      return toast('Sélectionnez la ville actuelle dans la liste proposée.');
+    }
+    if (originCity && originInput?.dataset.placeValid !== "true") {
+      return toast("Sélectionnez la ville d'origine dans la liste proposée.");
+    }
+
+    const patch = {
+      country: p.country || "Madagascar",
+      city_current: currentCity,
+      city_origin: originCity,
+      bio,
+      location: currentCity
+    };
+    const btn = document.querySelector('[data-action="save-profile"]');
+    setLoading(btn, true, 'Enregistrer');
+
+    try {
+      // Uploads are completed before the database update so that the profile
+      // row always points to a real public media URL.
+      for (const [file, key] of [[$('pfAvatar')?.files?.[0], "avatar_url"], [$('pfCover')?.files?.[0], "cover_url"]]) {
+        if (!file) continue;
+        if (!file.type.startsWith('image/')) throw new Error('Choisissez uniquement une image.');
+        if (file.size > 8 * 1024 * 1024) throw new Error('Image trop volumineuse (maximum 8 Mo).');
+        const moderation = await moderationCheckMedia(file, key === 'avatar_url' ? 'profile_avatar' : 'profile_cover');
+        if (!moderation.ok) throw new Error('Image protégée de l’administration Tafaß.');
+        const identity = await identityProtectionCheck({
+          first_name: p.first_name,
+          last_name: p.last_name,
+          username: p.username || "",
+          mediaHash: moderation.hash || "",
+          context: key === 'avatar_url' ? 'profile_avatar' : 'profile_cover'
+        });
+        if (!identity.allowed) throw new Error(identity.message || 'Image protégée : compte suspendu.');
+        const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+        const path = `${state.user.id}/${key.replace('_url','')}-${crypto.randomUUID()}.${ext}`;
+        const up = await uploadPostMedia(path, file, { upsert: false, contentType: file.type || 'image/jpeg' });
+        if (up.error) throw new Error('Upload : ' + up.error.message);
+        patch[key] = sb.storage.from('posts').getPublicUrl(path).data.publicUrl;
+        if (moderation?.hash) await registerAdminMediaHash(moderation.hash, key === 'avatar_url' ? 'profile_avatar' : 'profile_cover', patch[key]);
+      }
+
+      // One atomic profile update. select(*) lets us verify exactly what the
+      // database accepted instead of closing the modal after an unconfirmed write.
+      const updated = await sb.from('profiles')
+        .update({...patch, updated_at: new Date().toISOString()})
+        .eq('id', state.user.id)
+        .select('*')
+        .maybeSingle();
+      if (updated.error) throw new Error(updated.error.message);
+      if (!updated.data) throw new Error("Le profil n'a pas été enregistré. Vérifiez les droits de modification du profil.");
+
+      // Optimistic + server-confirmed state: every visible profile component
+      // immediately receives the exact saved values, while Realtime will also
+      // propagate the change to other open sessions.
+      state.profile = {...state.profile, ...updated.data};
+      const sideName = $("sideName");
+      if (sideName) sideName.textContent = nameOf(state.profile);
+      const sideAvatar = $("sideAvatar");
+      if (sideAvatar) sideAvatar.outerHTML = avatarHTML(state.profile, "avatar").replace("<span ", '<span id="sideAvatar" ');
+
+      setLoading(btn, false, 'Enregistrer');
+      closeModal();
+      if (state.route === "profile") {
+        state.viewingProfileId = state.user.id;
+        await profilePage(state.profileTab || "posts");
+      } else {
+        await loadProfile();
+      }
+      toast('✓ Profil enregistré et synchronisé.');
+    } catch (e) {
+      setLoading(btn, false, 'Enregistrer');
+      toast(e?.message || "Impossible d'enregistrer le profil.");
+    }
+  }
+
+
+  // V35: explicit root-table projections prevent ambiguous owner_id references
+  // when pages/groups are queried alongside member/profile relations.
+  const PAGE_FIELDS = "id,name,logo_url,cover_url,owner_id,username,category,bio,created_at,address,contact_email,contact_phone,website_url,deletion_status,deletion_requested_at,deletion_scheduled_at";
+  const GROUP_FIELDS = "id,name,description,cover_url,owner_id,privacy,created_at";
+
+  async function fetchPageById(id) {
+    const {data,error}=await sb.from("pages").select(PAGE_FIELDS).eq("id",id).maybeSingle();
+    return {data,error};
+  }
+
+  async function fetchGroupById(id) {
+    const {data,error}=await sb.from("groups").select(GROUP_FIELDS).eq("id",id).maybeSingle();
+    return {data,error};
+  }
+
+  async function pageBusinessSuite() {
+    const token = state.renderToken;
+    const {data: pages, error} = await sb.from("pages")
+      .select("id,name,username,category,bio,logo_url,cover_url,owner_id,created_at")
+      .eq("owner_id", state.user.id)
+      .order("created_at",{ascending:false});
+
+    if (error) return toast(error.message);
+    if (token !== state.renderToken || !state.user) return;
+
+    const pageIds = (pages || []).map(p => p.id);
+    const stats = new Map();
+
+    if (pageIds.length) {
+      const [followersR, postsR, messagesR, membersR] = await Promise.all([
+        sb.from("page_followers").select("page_id").in("page_id", pageIds),
+        sb.from("page_posts").select("id,page_id,created_at,content,media_url,media_type").in("page_id", pageIds).order("created_at",{ascending:false}).limit(80),
+        sb.from("page_messages").select("id,page_id,sender_id,created_at,message").in("page_id", pageIds).order("created_at",{ascending:false}).limit(80),
+        sb.from("page_members").select("page_id,user_id,role").in("page_id", pageIds)
+      ]);
+      const f = followersR.data || [], po = postsR.data || [], me = messagesR.data || [], mm = membersR.data || [];
+      pages.forEach(p => stats.set(p.id,{
+        followers:f.filter(x=>x.page_id===p.id).length,
+        posts:po.filter(x=>x.page_id===p.id),
+        messages:me.filter(x=>x.page_id===p.id),
+        members:mm.filter(x=>x.page_id===p.id)
+      }));
+    }
+
+    const totalFollowers=[...stats.values()].reduce((n,x)=>n+x.followers,0);
+    const totalPosts=[...stats.values()].reduce((n,x)=>n+x.posts.length,0);
+    const totalMessages=[...stats.values()].reduce((n,x)=>n+x.messages.length,0);
+    const totalManagers=[...stats.values()].reduce((n,x)=>n+x.members.filter(m=>m.role && m.role!=="member").length,0);
+
+    const pageRows=(pages||[]).map(p=>{
+      const s=stats.get(p.id)||{followers:0,posts:[],messages:[],members:[]};
+      return `<article class="tbs-page-row">
+        <button class="tbs-page-main" data-action="page-open" data-id="${esc(p.id)}">
+          ${entityAvatarHTML(p,"page","tbs-page-avatar")}
+          <span><b>${esc(p.name)}</b><small>${s.followers} abonnés · ${s.posts.length} publications · ${s.messages.length} messages</small>${p.category?`<em>${esc(p.category)}</em>`:""}</span>
+        </button>
+        <div class="tbs-page-actions">
+          <button class="fb-gray-btn" data-action="page-switch" data-id="${esc(p.id)}">Mode Page</button>
+          <button class="fb-more-btn" data-action="edit-page" data-id="${esc(p.id)}" aria-label="Gérer la Page">•••</button>
+        </div>
+      </article>`;
+    }).join("");
+
+    const recent = [];
+    for (const p of pages||[]) {
+      const s=stats.get(p.id); (s?.posts||[]).slice(0,5).forEach(post=>recent.push({...post,pageName:p.name}));
+    }
+    recent.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+    const recentRows=recent.slice(0,8).map(p=>`<div class="tbs-activity-row"><span class="tbs-activity-dot"></span><div class="grow"><b>${esc(p.pageName)}</b><small>${p.content?esc(p.content.slice(0,90)):p.media_url?"Publication média":"Nouvelle publication"} · ${timeAgo(p.created_at)}</small></div></div>`).join("") || `<div class="tbs-empty">Aucune publication de Page pour le moment.</div>`;
+
+    state.businessSuiteOpen = true;
+    openModal(`<div class="modal-box tbs-modal" id="tbsBusinessSuite">
+      <button class="modal-close" data-action="close-business-suite">×</button>
+      <div class="tbs-header">
+        <div class="tbs-brand-icon">${menuIcon("pages")}</div>
+        <div><span class="eyebrow">TAFAß • BUSINESS</span><h2>Tafaß Business Suite</h2><p>Gérez vos Pages, publications, messages et équipes depuis un seul espace.</p></div>
+      </div>
+
+      <div class="tbs-metrics">
+        <div><b>${pages?.length||0}</b><small>Pages</small></div>
+        <div><b>${totalFollowers}</b><small>Abonnés</small></div>
+        <div><b>${totalPosts}</b><small>Publications</small></div>
+        <div><b>${totalMessages}</b><small>Messages</small></div>
+      </div>
+
+      <div class="tbs-toolbar">
+        <button class="primary" data-action="create-page">＋ Créer une Page</button>
+        <button class="fb-gray-btn" data-action="business-refresh">Actualiser</button>
+      </div>
+
+      <div class="tbs-section">
+        <div class="tbs-section-head"><div><h3>Vos Pages</h3><small class="admin-section-note">${totalManagers} gestionnaire(s) avec rôle enregistré</small></div></div>
+        <div class="tbs-pages-list">${pageRows || `<div class="tbs-empty"><b>Aucune Page</b><span>Créez votre première Page pour commencer à utiliser Tafaß Business Suite.</span><button class="primary" data-action="create-page">Créer une Page</button></div>`}</div>
+      </div>
+
+      <div class="tbs-section">
+        <div class="tbs-section-head"><div><h3>Activité récente</h3><small class="admin-section-note">Données chargées depuis vos Pages Tafaß</small></div></div>
+        <div class="tbs-activity">${recentRows}</div>
+      </div>
+
+      <div class="tbs-tools-grid">
+        <button data-action="business-open-messages"><span>${menuIcon("messages")}</span><b>Messages</b><small>Consulter les messages reçus par vos Pages</small></button>
+        <button data-action="business-open-pages"><span>${menuIcon("pages")}</span><b>Publications & Pages</b><small>Ouvrir la gestion réelle de vos Pages</small></button>
+        <button data-action="business-open-team"><span>${menuIcon("friends")}</span><b>Équipe</b><small>Gérer les rôles des gestionnaires</small></button>
+        <button data-action="business-open-settings"><span>${menuIcon("settings")}</span><b>Paramètres</b><small>Configurer une Page existante</small></button>
+      </div>
+    </div>`);
+  }
+
+
+  let tafaV80EntityChannel=null;
+  async function stopTafaV80EntityRealtime(){ if(tafaV80EntityChannel){try{await sb.removeChannel(tafaV80EntityChannel);}catch(_){ } tafaV80EntityChannel=null;} }
+  function tafaV80PageStatus(p){ if(p.deletion_status==='pending_deletion' && p.deletion_scheduled_at) return `Suppression prévue le ${new Date(p.deletion_scheduled_at).toLocaleDateString('fr-FR')}`; return 'Active'; }
+  function tafaV80GroupStatus(g){ if(g.deletion_status==='pending_deletion' && g.deletion_scheduled_at) return `Suppression prévue le ${new Date(g.deletion_scheduled_at).toLocaleDateString('fr-FR')}`; return 'Actif'; }
+  // V83: single realtime coordinator for Pages/Groups.
+  // It coalesces bursts of database events instead of reloading the same
+  // screen once per row change. The server/RLS remains authoritative.
+  let tafaV83EntityChannel=null;
+  let tafaV83RefreshTimer=null;
+  async function stopTafaV83Realtime(){
+    if(tafaV83EntityChannel){try{await sb.removeChannel(tafaV83EntityChannel);}catch(_){ } tafaV83EntityChannel=null;}
+    if(tafaV83RefreshTimer){clearTimeout(tafaV83RefreshTimer);tafaV83RefreshTimer=null;}
+  }
+  async function setupTafaV80Realtime(kind, entityId=null){
+    await stopTafaV83Realtime();
+    const isPage=kind==='page';
+    const mainTable=isPage?'pages':'groups';
+    const childTables=isPage?['page_followers','page_posts','page_post_reactions','page_post_comments','page_post_shares']:['group_members','group_posts'];
+    const channelName=`tafass-v83-${kind}-${entityId||'hub'}`;
+    const schedule=()=>{
+      if(tafaV83RefreshTimer)clearTimeout(tafaV83RefreshTimer);
+      tafaV83RefreshTimer=setTimeout(()=>{
+        tafaV83RefreshTimer=null;
+        if(isPage){
+          if(entityId && document.querySelector(`[data-page-id=\"${CSS.escape(String(entityId))}\"]`)) openPageDetail(entityId);
+          else if(!entityId && state.route==='pages') pagesV80Hub();
+        }else{
+          if(entityId && state.route==='groups') openGroupDetail(entityId);
+          else if(!entityId && state.route==='groups') groupsV80Hub();
+        }
+      },220);
+    };
+    let ch=sb.channel(channelName);
+    ch=ch.on('postgres_changes',{event:'*',schema:'public',table:mainTable},schedule);
+    for(const table of childTables){
+      const filter=entityId ? (isPage?'page_id':'group_id')+`=eq.${entityId}` : undefined;
+      const cfg={event:'*',schema:'public',table};
+      if(filter)cfg.filter=filter;
+      ch=ch.on('postgres_changes',cfg,schedule);
+    }
+    tafaV83EntityChannel=ch;
+    ch.subscribe();
+  }
+  function supabaseReady(){ return !!(sb && state.user); }
+  async function pagesV80Hub(){
+    const {data,error}=await sb.from('pages').select(`${PAGE_FIELDS},deletion_status,deletion_requested_at,deletion_scheduled_at`).neq('deletion_status','deleted').order('created_at',{ascending:false}).limit(100);
+    if(error)return simplePage('Pages',`<div class="empty-block"><b>Impossible de charger les Pages.</b><small>${esc(error.message)}</small></div>`);
+    const rows=data||[], ids=rows.map(x=>x.id);
+    const fr=ids.length?await sb.from('page_followers').select('page_id,user_id').in('page_id',ids):{data:[]};
+    const fc=new Map(), following=new Set(); (fr.data||[]).forEach(x=>{fc.set(x.page_id,(fc.get(x.page_id)||0)+1);if(x.user_id===state.user.id)following.add(x.page_id);});
+    const mine=rows.filter(x=>x.owner_id===state.user.id), discover=rows.filter(x=>x.owner_id!==state.user.id);
+    const list=state.pagesTab==='mine'?mine:discover;
+    const card=p=>{const own=p.owner_id===state.user.id, fol=following.has(p.id);return `<article class="tfa-v80-entity-card"><button class="tfa-v80-entity-main" data-action="page-open" data-id="${esc(p.id)}">${entityAvatarHTML(p,'page','tfa-v80-entity-avatar')}<span><b>${esc(p.name)}</b><small>${fc.get(p.id)||0} abonnés · ${esc(p.category||'Page')}</small><em>${esc(p.bio||'Page Tafaß')}</em></span></button><div class="tfa-v80-entity-actions">${own?`<button class="tfa-v80-btn secondary" data-action="page-switch" data-id="${esc(p.id)}">Basculer</button>`:`<button class="tfa-v80-btn ${fol?'secondary':'primary'}" data-action="toggle-page-follow" data-id="${esc(p.id)}">${fol?'✓ Suivie':'＋ Suivre'}</button>`}</div></article>`};
+    await setupTafaV80Realtime('page');
+    return simplePage('Pages',`<section class="tfa-v80-hub"><header class="tfa-v80-hero"><div><span class="eyebrow">TAFAß • PAGES</span><h2>Pages</h2><p>Suivez les Pages et recevez leurs publications dans votre fil Actualités.</p></div><button class="tfa-v80-btn primary" data-action="create-page">＋ Créer une Page</button></header><nav class="tfa-v80-tabs"><button class="${state.pagesTab==='mine'?'active':''}" data-action="pages-tab" data-tab="mine">Mes Pages <small>${mine.length}</small></button><button class="${state.pagesTab==='discover'?'active':''}" data-action="pages-tab" data-tab="discover">Découvrir <small>${discover.length}</small></button></nav><div class="tfa-v80-list">${list.length?list.map(card).join(''):`<div class="tfa-v80-empty"><b>${state.pagesTab==='mine'?'Aucune Page créée':'Aucune Page à découvrir'}</b><span>${state.pagesTab==='mine'?'Créez votre Page professionnelle.':'Les Pages publiques apparaîtront ici.'}</span></div>`}</div></section>`);
+  }
+  async function groupsV80Hub(){
+    const {data,error}=await sb.from('groups').select(`${GROUP_FIELDS},deletion_status,deletion_requested_at,deletion_scheduled_at`).neq('deletion_status','deleted').order('created_at',{ascending:false}).limit(100);
+    if(error)return simplePage('Groupes',`<div class="empty-block"><b>Impossible de charger les Groupes.</b><small>${esc(error.message)}</small></div>`);
+    const rows=data||[], ids=rows.map(x=>x.id), mr=ids.length?await sb.from('group_members').select('group_id,user_id,role').in('group_id',ids):{data:[]};
+    const counts=new Map(), mine=new Set(); (mr.data||[]).forEach(m=>{counts.set(m.group_id,(counts.get(m.group_id)||0)+1);if(m.user_id===state.user.id)mine.add(m.group_id);});
+    const own=rows.filter(x=>x.owner_id===state.user.id), joined=rows.filter(x=>mine.has(x.id));
+    const list=state.groupsTab==='mine'?joined:rows;
+    const card=g=>{const isMember=mine.has(g.id), isOwner=g.owner_id===state.user.id;return `<article class="tfa-v80-entity-card"><button class="tfa-v80-entity-main" data-action="group-open" data-id="${esc(g.id)}">${entityAvatarHTML(g,'group','tfa-v80-entity-avatar')}<span><b>${esc(g.name)}</b><small>${counts.get(g.id)||0} membres · ${esc(g.privacy==='private'?'Privé':'Public')}</small><em>${esc(g.description||'Communauté Tafaß')}</em></span></button><div class="tfa-v80-entity-actions">${isMember||isOwner?`<button class="tfa-v80-btn secondary" data-action="group-open" data-id="${esc(g.id)}">Ouvrir</button>`:`<button class="tfa-v80-btn primary" data-action="toggle-group-member" data-id="${esc(g.id)}">＋ Rejoindre</button>`}<button class="tfa-v80-btn icon" data-action="group-more" data-id="${esc(g.id)}">•••</button></div></article>`};
+    await setupTafaV80Realtime('group');
+    return simplePage('Groupes',`<section class="tfa-v80-hub"><header class="tfa-v80-hero"><div><span class="eyebrow">TAFAß • GROUPES</span><h2>Groupes</h2><p>Rejoignez des communautés et retrouvez les publications de leurs membres.</p></div><button class="tfa-v80-btn primary" data-action="create-group">＋ Créer un groupe</button></header><nav class="tfa-v80-tabs"><button class="${state.groupsTab==='mine'?'active':''}" data-action="groups-tab" data-tab="mine">Mes groupes <small>${joined.length}</small></button><button class="${state.groupsTab==='discover'?'active':''}" data-action="groups-tab" data-tab="discover">Découvrir <small>${rows.length}</small></button></nav><div class="tfa-v80-list">${list.length?list.map(card).join(''):`<div class="tfa-v80-empty"><b>${state.groupsTab==='mine'?'Aucun groupe rejoint':'Aucun groupe disponible'}</b><span>${state.groupsTab==='mine'?'Rejoignez un groupe pour commencer.':'Créez le premier groupe Tafaß.'}</span></div>`}</div></section>`);
+  }
+  async function pagesHub() {
+    const token = state.renderToken;
+    const tab = state.pagesTab || "mine";
+    let rows = [], followerRows = [], ownerMap = new Map();
+    let q = sb.from("pages").select(PAGE_FIELDS).order("created_at",{ascending:false}).limit(60);
+    if (tab === "mine") q = q.eq("owner_id", state.user.id);
+    const {data,error} = await q;
+    if (token !== state.renderToken || state.route !== "pages") return;
+    if (error) return simplePage("Pages", `<div class="empty-block"><b>Impossible de charger les Pages.</b><small>${esc(error.message)}</small><button class="primary big" data-action="retry-route" data-route-target="pages">Réessayer</button></div>`);
+    rows=data||[];
+    const ids=rows.map(x=>x.id);
+    if(ids.length){
+      const f=await sb.from("page_followers").select("page_id,user_id").in("page_id",ids);
+      if(!f.error) followerRows=f.data||[];
+    }
+    const followersCount=new Map(), following=new Set();
+    followerRows.forEach(x=>{
+      followersCount.set(x.page_id,(followersCount.get(x.page_id)||0)+1);
+      if(x.user_id===state.user.id) following.add(x.page_id);
+    });
+    const mine=new Set(rows.filter(x=>x.owner_id===state.user.id).map(x=>x.id));
+    const pageCard=x=>{
+      const isMine=mine.has(x.id), isFollowing=following.has(x.id);
+      return `<article class="fb-entity-row page-row">
+        <button class="fb-entity-main" data-action="page-open" data-id="${esc(x.id)}">
+          ${entityAvatarHTML(x,"page","fb-entity-avatar")}
+          <span class="fb-entity-copy"><b>${esc(x.name)}</b><small>${followersCount.get(x.id)||0} abonnés${x.category?` · ${esc(x.category)}`:""}</small>${x.bio?`<em>${esc(x.bio)}</em>`:""}</span>
+        </button>
+        <div class="fb-entity-actions">
+          ${isMine?`<button class="fb-blue-btn" data-action="page-switch" data-id="${esc(x.id)}">Basculer</button><button class="fb-more-btn" data-action="edit-page" data-id="${esc(x.id)}" aria-label="Gérer">•••</button>`
+          :`<button class="${isFollowing?'fb-gray-btn':'fb-blue-btn'}" data-action="toggle-page-follow" data-id="${esc(x.id)}">${isFollowing?'Suivi(e)':'Suivre'}</button>`}
+        </div>
+      </article>`;
+    };
+    const title=tab==="mine"?"Vos Pages":"Découvrir";
+    const content=rows.length?rows.map(pageCard).join(""):`<div class="fb-empty"><div>▣</div><b>${tab==="mine"?"Vous n’avez encore créé aucune Page":"Aucune Page disponible"}</b><span>${tab==="mine"?"Créez votre première Page pour commencer.":"Les Pages publiques apparaîtront ici."}</span><button class="fb-blue-btn" data-action="create-page">Créer une Page</button></div>`;
+    return simplePage("Pages", `<section class="fb-hub fb-pages-hub">
+      <div class="fb-top-tabs">
+        <button class="${tab==="mine"?"active":""}" data-action="pages-tab" data-tab="mine">Vos Pages</button>
+        <button class="fb-create-top" data-action="create-page">＋ Créer</button>
+        <button class="${tab==="discover"?"active":""}" data-action="pages-tab" data-tab="discover">◉ Découvrir</button>
+      </div>
+      <div class="fb-section-heading"><h3>${title}</h3><button class="fb-link-btn" data-action="pages-tab" data-tab="discover">${tab==="mine"?"Découvrir":"Retour"}</button></div>
+      ${tab==="mine"?`<div class="fb-business-card"><div class="fb-business-icon">◒</div><div><b>Tafaß Business Suite</b><small>Gérez les publications, messages et équipe de vos Pages.</small></div><button class="fb-gray-btn" data-action="page-business">Ouvrir</button></div>`:""}
+      <div class="fb-entity-list">${content}</div>
+    </section>`);
+  }
+
+  function groupSortMenu() {
+    openModal(`<div class="modal-box fb-more-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • GROUPES</span><h3>Trier les groupes</h3><div class="fb-more-list"><button data-action="group-sort" data-sort="recent">🕘 <span>Plus récents</span></button><button data-action="group-sort" data-sort="members">👥 <span>Plus de membres</span></button><button data-action="group-sort" data-sort="name">A–Z <span>Nom du groupe</span></button></div></div>`);
+  }
+
+  async function groupsHub() {
+    const token = state.renderToken;
+    const tab = state.groupsTab || "mine";
+    let rows=[], members=[];
+    if(tab==="posts"){
+      const {data:posts,error}=await sb.from("group_posts").select("*,profiles(first_name,last_name,username,avatar_url),group_post_reactions(id,user_id,reaction_type),group_post_comments(id,user_id,content,created_at,profiles(first_name,last_name,username,avatar_url))").order("created_at",{ascending:false}).limit(40);
+      let postGroups=new Map();
+      const postGroupIds=[...new Set((posts||[]).map(p=>p.group_id).filter(Boolean))];
+      if(postGroupIds.length){
+        const gr=await sb.from("groups").select(GROUP_FIELDS).in("id",postGroupIds);
+        if(gr.error) return simplePage("Groupes",`<div class="empty-block"><b>Impossible de charger les Groupes.</b><small>${esc(gr.error.message)}</small></div>`);
+        postGroups=new Map((gr.data||[]).map(g=>[g.id,g]));
+      }
+      if(token!==state.renderToken || state.route!=="groups")return;
+      if(error)return simplePage("Groupes",`<div class="empty-block"><b>Impossible de charger les publications des groupes.</b><small>${esc(error.message)}</small></div>`);
+      const postRows=(posts||[]).map(p=>{
+        const g=postGroups.get(p.group_id)||{}, rs=p.group_post_reactions||[], cs=p.group_post_comments||[], mine=rs.some(r=>r.user_id===state.user.id);
+        return `<article class="fb-group-post"><div class="fb-post-head">${avatarHTML(p.profiles||{},'avatar avatar-sm')}<div><b>${esc(nameOf(p.profiles||{}))}</b><small>dans <button class="fb-inline-link" data-action="group-open" data-id="${esc(g.id||"")}">${esc(g.name||"Groupe")}</button> · ${timeAgo(p.created_at)}</small></div></div>${p.content?`<p>${esc(p.content)}</p>`:""}${p.media_url?(String(p.media_type||"").startsWith("video")?`<video class="post-media" src="${esc(p.media_url)}" controls playsinline></video>`:`<img class="post-media" src="${esc(p.media_url)}" alt="Publication" loading="lazy">`):""}<div class="fb-post-counts"><span>${rs.length} réaction${rs.length!==1?"s":""}</span><span>${cs.length} commentaire${cs.length!==1?"s":""}</span></div><div class="fb-post-actions"><button class="${mine?"active":""}" data-action="group-post-like" data-id="${esc(p.id)}" data-entity-id="${esc(g.id||"")}">♡ J’aime</button><button data-action="group-post-comment" data-id="${esc(p.id)}" data-entity-id="${esc(g.id||"")}">💬 Commenter</button><button data-action="share-group-post" data-id="${esc(p.id)}" data-entity-id="${esc(g.id||"")}">↗ Partager</button></div></article>`;
+      }).join("");
+      return simplePage("Groupes", `<section class="fb-hub fb-groups-hub"><div class="fb-top-tabs"><button data-action="groups-tab" data-tab="mine">👥 Vos groupes</button><button class="active" data-action="groups-tab" data-tab="posts">▣ Publications</button><button data-action="groups-tab" data-tab="discover">◉ Découvrir</button></div><div class="fb-section-heading"><h3>Publications des groupes</h3><button class="fb-link-btn" data-action="groups-tab" data-tab="discover">Découvrir</button></div><div class="fb-post-feed">${postRows||`<div class="fb-empty"><div>▣</div><b>Aucune publication de groupe</b><span>Rejoignez des groupes pour retrouver leurs publications ici.</span></div>`}</div></section>`);
+    }
+    const groupQuery=sb.from("groups").select(GROUP_FIELDS).order("created_at",{ascending:false}).limit(60);
+    const {data:all,error}=await groupQuery;
+    if(token!==state.renderToken || state.route!=="groups")return;
+    if(error)return simplePage("Groupes",`<div class="empty-block"><b>Impossible de charger les Groupes.</b><small>${esc(error.message)}</small><button class="primary big" data-action="retry-route" data-route-target="groups">Réessayer</button></div>`);
+    const ids=(all||[]).map(x=>x.id);
+    if(ids.length){const r=await sb.from("group_members").select("group_id,user_id,role").in("group_id",ids);if(!r.error)members=r.data||[];}
+    const memberSet=new Set(members.filter(m=>m.user_id===state.user.id).map(m=>m.group_id));
+    rows=tab==="mine"?(all||[]).filter(x=>memberSet.has(x.id)):(all||[]);
+    const counts=new Map();members.forEach(m=>counts.set(m.group_id,(counts.get(m.group_id)||0)+1));
+    rows.sort((a,b)=>{
+      if(state.groupSort==="members") return (counts.get(b.id)||0)-(counts.get(a.id)||0);
+      if(state.groupSort==="name") return String(a.name||"").localeCompare(String(b.name||""));
+      return new Date(b.created_at||0)-new Date(a.created_at||0);
+    });
+    const card=x=>`<article class="fb-entity-row group-row"><button class="fb-entity-main" data-action="group-open" data-id="${esc(x.id)}">${entityAvatarHTML(x,"group","fb-entity-avatar")}<span class="fb-entity-copy"><b>${esc(x.name)}</b><small>${counts.get(x.id)||0} membres${x.privacy?` · ${x.privacy==="private"?"Privé":"Public"}`:""}</small>${x.description?`<em>${esc(x.description)}</em>`:""}</span></button><div class="fb-entity-actions">${memberSet.has(x.id)?`<button class="fb-gray-btn" data-action="group-open" data-id="${esc(x.id)}">Ouvrir</button>`:`<button class="fb-blue-btn" data-action="toggle-group-member" data-id="${esc(x.id)}">Rejoindre</button>`}<button class="fb-more-btn" data-action="group-open" data-id="${esc(x.id)}">•••</button></div></article>`;
+    return simplePage("Groupes", `<section class="fb-hub fb-groups-hub">
+      <div class="fb-top-tabs"><button class="${tab==="mine"?"active":""}" data-action="groups-tab" data-tab="mine">👥 Vos groupes</button><button data-action="groups-tab" data-tab="posts">▣ Publications</button><button class="${tab==="discover"?"active":""}" data-action="groups-tab" data-tab="discover">◉ Découvrir</button></div>
+      <div class="fb-section-heading"><h3>${tab==="mine"?"Les plus visités":"Découvrir les groupes"}</h3><button class="fb-link-btn" data-action="${tab==="mine"?"group-sort-menu":"groups-tab"}" data-tab="mine">${tab==="mine"?"Trier":"Vos groupes"}</button></div>
+      ${tab==="mine"?`<button class="fb-create-row" data-action="create-group"><span>＋</span><b>Créer un groupe</b></button>`:""}
+      <div class="fb-entity-list">${rows.map(card).join("")||`<div class="fb-empty"><div>👥</div><b>${tab==="mine"?"Vous n’avez rejoint aucun groupe":"Aucun groupe disponible"}</b><span>${tab==="mine"?"Découvrez des communautés et rejoignez celles qui vous intéressent.":"Créez la première communauté."}</span><button class="fb-blue-btn" data-action="${tab==="mine"?"groups-tab":"create-group"}" data-tab="discover">${tab==="mine"?"Découvrir":"Créer un groupe"}</button></div>`}</div>
+    </section>`);
+  }
+
+async function genericListPage(route) {
+    const token = state.renderToken;
+    if (route === "reels") {
+      const wanted = ["reel","video"];
+      const rows = state.posts.filter(p => wanted.includes(p.media_type));
+      if (token !== state.renderToken || state.route !== route) return;
+      $("content").innerHTML = `<div class="card"><div class="page-header"><h2>Reels</h2><span class="muted">Découvrir</span></div>${rows.length?rows.map(p=>`<article class="post"><div class="post-head">${profileLink(p.author, avatarHTML(p.author), "profile-link profile-avatar-link")}<div class="meta">${profileLink(p.author, `<span class="post-author-name">${displayNameHTML(p.author)}</span>`, "profile-link profile-meta-link")}<span class="post-time"><small>${timeAgo(p.created_at)}</small></span></div></div>${p.content?`<div class="post-body">${esc(p.content)}</div>`:""}<video class="post-media" data-post-viewable="1" data-post-id="${esc(p.id)}" src="${esc(p.media_url)}" controls></video></article>`).join(""):`<div class="empty">Aucun Reel pour le moment.</div>`}</div>`;
+      return;
+    }
+    if (route === "pages") return navigate("notifications", {replaceStack:true});
+    if (route === "groups") return groupsV80Hub();
+    if (route === "saved") {
+      const token2=state.renderToken;
+      const r=await sb.from("saved_posts").select("id,post_id,created_at").eq("user_id",state.user.id).order("created_at",{ascending:false});
+      if (token2 !== state.renderToken || state.route !== route) return;
+      const saves=r.data||[];
+      const ids=saves.map(x=>x.post_id).filter(Boolean);
+      let posts=[];
+      if(ids.length){ const pr=await sb.from("posts").select("*").in("id",ids); posts=pr.data||[]; }
+      const byId=new Map(posts.map(p=>[p.id,p]));
+      const rows=saves.map(s=>{ const p=byId.get(s.post_id); if(!p)return `<article class="saved-premium-card saved-missing"><div class="saved-card-icon">♡</div><div class="saved-card-copy"><b>Contenu indisponible</b><small>Cette publication n’est plus accessible, mais votre enregistrement peut encore être retiré.</small><span>${timeAgo(s.created_at)}</span></div><button class="ghost-action" data-action="unsave-post" data-id="${esc(s.post_id)}">Retirer</button></article>`; const author=p.author||{}; const media=p.media_url?(String(p.media_type||'').startsWith('video')||p.media_type==='reel'?`<video src="${esc(p.media_url)}" muted playsinline></video>`:`<img src="${esc(p.media_url)}" alt="">`):''; return `<article class="saved-premium-card"><div class="saved-card-media">${media||'<div class="saved-card-icon">♡</div>'}</div><div class="saved-card-copy"><b>${esc(nameOf(author)||p.user_id||'Publication Tafaß')}</b><p>${esc((p.content||'Publication enregistrée').slice(0,180))}</p><span>Enregistré ${timeAgo(s.created_at)}</span></div><div class="saved-card-actions"><button class="secondary-action" data-action="search-post" data-id="${esc(p.id)}">Ouvrir</button><button class="ghost-action" data-action="unsave-post" data-id="${esc(p.id)}">Retirer</button></div></article>`; }).join('');
+      return simplePage("Enregistrements",`<section class="saved-premium-page"><div class="saved-hero"><div><span class="eyebrow">TAFAß • BIBLIOTHÈQUE PERSONNELLE</span><h3>Vos contenus, au même endroit.</h3><p>Retrouvez les publications que vous avez choisi de conserver. Les enregistrements sont personnels : retirer un élément ici ne supprime pas la publication originale.</p></div><div class="saved-hero-count"><b>${saves.length}</b><small>enregistré${saves.length>1?'s':''}</small></div></div><div class="saved-info-grid"><div><b>Retrouver</b><small>Ouvrez le contenu sauvegardé lorsque la publication est encore disponible.</small></div><div><b>Conserver</b><small>Gardez les publications utiles sans les partager automatiquement avec vos contacts.</small></div><div><b>Nettoyer</b><small>Retirez rapidement les éléments dont vous n’avez plus besoin.</small></div></div><div class="saved-section-title"><div><span class="eyebrow">COLLECTION</span><h3>Derniers enregistrements</h3></div></div><div class="saved-list">${rows||'<div class="saved-empty"><div>♡</div><b>Aucun enregistrement pour le moment</b><p>Lorsque vous enregistrerez une publication, elle apparaîtra ici avec son auteur, son contenu et ses actions.</p></div>'}</div></section>`);
+    }
+  }
+
+  async function toggleTafabFavorite(listingId){
+    const q=await sb.from("tafab_favorites").select("id").eq("listing_id",listingId).eq("user_id",state.user.id).maybeSingle();
+    if(q.data){ const d=await sb.from("tafab_favorites").delete().eq("id",q.data.id); if(d.error)return toast(d.error.message); toast("Retiré des favoris"); }
+    else { const i=await sb.from("tafab_favorites").insert({listing_id:listingId,user_id:state.user.id}); if(i.error)return toast(i.error.message); toast("Ajouté aux favoris"); }
+    return tafabPage();
+  }
+  async function orderTafabListing(id){
+    const {data:x,error}=await sb.from("tafab_listings").select("*").eq("id",id).maybeSingle();
+    if(error||!x)return toast(error?.message||"Offre introuvable");
+    if(x.seller_id===state.user.id)return toast("Vous ne pouvez pas commander votre propre offre.");
+    openModal(`<div class="modal-box v22-order-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • COMMANDE</span><h3>${esc(x.title)}</h3><p class="muted">Passez une demande de commande au vendeur.</p><div class="form-stack"><label>Quantité<input id="orderQty" type="number" min="1" value="1"></label><label>Note au vendeur<textarea id="orderNote" maxlength="1000" placeholder="Adresse, préférence de livraison, question…"></textarea></label><button class="primary big" data-action="confirm-tafab-order" data-id="${esc(id)}">Confirmer la commande</button></div></div>`);
+  }
+  async function confirmTafabOrder(id){
+    const qty=Math.max(1,Number($("orderQty")?.value||1));
+    const note=$("orderNote")?.value.trim()||"";
+    const {data:x,error}=await sb.from("tafab_listings").select("id,seller_id,price,currency,title").eq("id",id).maybeSingle();
+    if(error||!x)return toast(error?.message||"Offre introuvable");
+    const total=x.price==null?null:Number(x.price)*qty;
+    const r=await sb.from("tafab_orders").insert({buyer_id:state.user.id,seller_id:x.seller_id,status:"pending",total_amount:total,currency:x.currency||"MGA",note}).select().single();
+    if(r.error)return toast(r.error.message);
+    const oi=await sb.from("tafab_order_items").insert({order_id:r.data.id,listing_id:id,quantity:qty,unit_price:x.price});
+    if(oi.error){ await sb.from("tafab_orders").delete().eq("id",r.data.id); return toast(oi.error.message); }
+    await logActivity("tafab_order_created","Commande Tafaß créée","tafab_order",r.data.id);
+    closeModal(); toast("Commande envoyée au vendeur");
+  }
+  async function showTafabOrders(){
+    const {data:orders,error}=await sb.from("tafab_orders").select("id,status,total_amount,currency,note,created_at").or(`buyer_id.eq.${state.user.id},seller_id.eq.${state.user.id}`).order("created_at",{ascending:false}).limit(50);
+    if(error)return toast(error.message);
+    openModal(`<div class="modal-box v22-orders-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • COMMANDES</span><h3>Mes commandes</h3><div class="v22-order-list">${(orders||[]).map(o=>`<div class="v22-order-row"><div><b>#${esc(String(o.id).slice(0,8))}</b><small>${esc(o.status)} · ${timeAgo(o.created_at)}</small></div><strong>${o.total_amount==null?'Prix à confirmer':esc(o.total_amount)+" "+esc(o.currency||"MGA")}</strong></div>`).join("")||'<div class="empty">Aucune commande.</div>'}</div></div>`);
+  }
+
+const TAFAß_EMOJI_CATALOG = ["⌚","⌛","⏩","⏪","⏫","⏬","⏰","⏳","◽","◾","☔","☕","♈","♉","♊","♋","♌","♍","♎","♏","♐","♑","♒","♓","♿","⚓","⚡","⚪","⚫","⚽","⚾","⛄","⛅","⛎","⛔","⛪","⛲","⛳","⛵","⛺","⛽","✅","✊","✋","✨","❌","❎","❓","❔","❕","❗","➕","➖","➗","➰","➿","⬛","⬜","⭐","⭕","🀄","🃏","🆎","🆑","🆒","🆓","🆔","🆕","🆖","🆗","🆘","🆙","🆚","🇦","🇧","🇨","🇩","🇪","🇫","🇬","🇭","🇮","🇯","🇰","🇱","🇲","🇳","🇴","🇵","🇶","🇷","🇸","🇹","🇺","🇻","🇼","🇽","🇾","🇿","🈁","🈚","🈯","🈲","🈳","🈴","🈵","🈶","🈸","🈹","🈺","🉐","🉑","🌀","🌁","🌂","🌃","🌄","🌅","🌆","🌇","🌈","🌉","🌊","🌋","🌌","🌍","🌎","🌏","🌐","🌑","🌒","🌓","🌔","🌕","🌖","🌗","🌘","🌙","🌚","🌛","🌜","🌝","🌞","🌟","🌠","🌭","🌮","🌯","🌰","🌱","🌲","🌳","🌴","🌵","🌷","🌸","🌹","🌺","🌻","🌼","🌽","🌾","🌿","🍀","🍁","🍂","🍃","🍄","🍅","🍆","🍇","🍈","🍉","🍊","🍋","🍌","🍍","🍎","🍏","🍐","🍑","🍒","🍓","🍔","🍕","🍖","🍗","🍘","🍙","🍚","🍛","🍜","🍝","🍞","🍟","🍠","🍡","🍢","🍣","🍤","🍥","🍦","🍧","🍨","🍩","🍪","🍫","🍬","🍭","🍮","🍯","🍰","🍱","🍲","🍳","🍴","🍵","🍶","🍷","🍸","🍹","🍺","🍻","🍼","🍾","🍿","🎀","🎁","🎂","🎃","🎄","🎅","🎆","🎇","🎈","🎉","🎊","🎋","🎌","🎍","🎎","🎏","🎐","🎑","🎒","🎓","🎠","🎡","🎢","🎣","🎤","🎥","🎦","🎧","🎨","🎩","🎪","🎫","🎬","🎭","🎮","🎯","🎰","🎱","🎲","🎳","🎴","🎵","🎶","🎷","🎸","🎹","🎺","🎻","🎼","🎽","🎾","🎿","🏀","🏁","🏂","🏃","🏄","🏅","🏆","🏇","🏈","🏉","🏊","🏏","🏐","🏑","🏒","🏓","🏠","🏡","🏢","🏣","🏤","🏥","🏦","🏧","🏨","🏩","🏪","🏫","🏬","🏭","🏮","🏯","🏰","🏴","🏸","🏹","🏺","🐀","🐁","🐂","🐃","🐄","🐅","🐆","🐇","🐈","🐉","🐊","🐋","🐌","🐍","🐎","🐏","🐐","🐑","🐒","🐓","🐔","🐕","🐖","🐗","🐘","🐙","🐚","🐛","🐜","🐝","🐞","🐟","🐠","🐡","🐢","🐣","🐤","🐥","🐦","🐧","🐨","🐩","🐪","🐫","🐬","🐭","🐮","🐯","🐰","🐱","🐲","🐳","🐴","🐵","🐶","🐷","🐸","🐹","🐺","🐻","🐼","🐽","🐾","👀","👂","👃","👄","👅","👆","👇","👈","👉","👊","👋","👌","👍","👎","👏","👐","👑","👒","👓","👔","👕","👖","👗","👘","👙","👚","👛","👜","👝","👞","👟","👠","👡","👢","👣","👤","👥","👦","👧","👨","👩","👪","👫","👬","👭","👮","👯","👰","👱","👲","👳","👴","👵","👶","👷","👸","👹","👺","👻","👼","👽","👾","👿","💀","💁","💂","💃","💄","💅","💆","💇","💈","💉","💊","💋","💌","💍","💎","💏","💐","💑","💒","💓","💔","💕","💖","💗","💘","💙","💚","💛","💜","💝","💞","💟","💠","💡","💢","💣","💤","💥","💦","💧","💨","💩","💪","💫","💬","💭","💮","💯","💰","💱","💲","💳","💴","💵","💶","💷","💸","💹","💺","💻","💼","💽","💾","💿","📀","📁","📂","📃","📄","📅","📆","📇","📈","📉","📊","📋","📌","📍","📎","📏","📐","📑","📒","📓","📔","📕","📖","📗","📘","📙","📚","📛","📜","📝","📞","📟","📠","📡","📢","📣","📤","📥","📦","📧","📨","📩","📪","📫","📬","📭","📮","📯","📰","📱","📲","📳","📴","📵","📶","📷","📸","📹","📺","📻","📼","📿","🔀","🔁","🔂","🔃","🔄","🔅","🔆","🔇","🔈","🔉","🔊","🔋","🔌","🔍","🔎","🔏","🔐","🔑","🔒","🔓","🔔","🔕","🔖","🔗","🔘","🔙","🔚","🔛","🔜","🔝","🔞","🔟","🔠","🔡","🔢","🔣","🔤","🔥","🔦","🔧","🔨","🔩","🔪","🔫","🔬","🔭","🔮","🔯","🔰","🔱","🔲","🔳","🔴","🔵","🔶","🔷","🔸","🔹","🔺","🔻","🔼","🔽","🕋","🕌","🕍","🕎","🕐","🕑","🕒","🕓","🕔","🕕","🕖","🕗","🕘","🕙","🕚","🕛","🕜","🕝","🕞","🕟","🕠","🕡","🕢","🕣","🕤","🕥","🕦","🕧","🕺","🖕","🖖","🖤","🗻","🗼","🗽","🗾","🗿","😀","😁","😂","😃","😄","😅","😆","😇","😈","😉","😊","😋","😌","😍","😎","😏","😐","😑","😒","😓","😔","😕","😖","😗","😘","😙","😚","😛","😜","😝","😞","😟","😠","😡","😢","😣","😤","😥","😦","😧","😨","😩","😪","😫","😬","😭","😮","😯","😰","😱","😲","😳","😴","😵","😶","😷","😸","😹","😺","😻","😼","😽","😾","😿","🙀","🙁","🙂","🙃","🙄","🙅","🙆","🙇","🙈","🙉","🙊","🙋","🙌","🙍","🙎","🙏","🚀","🚁","🚂","🚃","🚄","🚅","🚆","🚇","🚈","🚉","🚊","🚋","🚌","🚍","🚎","🚏","🚐","🚑","🚒","🚓","🚔","🚕","🚖","🚗","🚘","🚙","🚚","🚛","🚜","🚝","🚞","🚟","🚠","🚡","🚢","🚣","🚤","🚥","🚦","🚧","🚨","🚩","🚪","🚫","🚬","🚭","🚮","🚯","🚰","🚱","🚲","🚳","🚴","🚵","🚶","🚷","🚸","🚹","🚺","🚻","🚼","🚽","🚾","🚿","🛀","🛁","🛂","🛃","🛄","🛅","🛌","🛐","🛑","🛒","🛕","🛖","🛗","🛜","🛝","🛞","🛟","🛫","🛬","🛴","🛵","🛶","🛷","🛸","🛹","🛺","🛻","🛼","🟠","🟡","🟢","🟣","🟤","🟥","🟦","🟧","🟨","🟩","🟪","🟫","🟰","🤌","🤍","🤎","🤏","🤐","🤑","🤒","🤓","🤔","🤕","🤖","🤗","🤘","🤙","🤚","🤛","🤜","🤝","🤞","🤟","🤠","🤡","🤢","🤣","🤤","🤥","🤦","🤧","🤨","🤩","🤪","🤫","🤬","🤭","🤮","🤯","🤰","🤱","🤲","🤳","🤴","🤵","🤶","🤷","🤸","🤹","🤺","🤼","🤽","🤾","🤿","🥀","🥁","🥂","🥃","🥄","🥅","🥇","🥈","🥉","🥊","🥋","🥌","🥍","🥎","🥏","🥐","🥑","🥒","🥓","🥔","🥕","🥖","🥗","🥘","🥙","🥚","🥛","🥜","🥝","🥞","🥟","🥠","🥡","🥢","🥣","🥤","🥥","🥦","🥧","🥨","🥩","🥪","🥫","🥬","🥭","🥮","🥯","🥰","🥱","🥲","🥳","🥴","🥵","🥶","🥷","🥸","🥹","🥺","🥻","🥼","🥽","🥾","🥿","🦀","🦁","🦂","🦃","🦄","🦅","🦆","🦇","🦈","🦉","🦊","🦋","🦌","🦍","🦎","🦏","🦐","🦑","🦒","🦓","🦔","🦕","🦖","🦗","🦘","🦙","🦚","🦛","🦜","🦝","🦞","🦟","🦠","🦡","🦢","🦣","🦤","🦥","🦦","🦧","🦨","🦩","🦪","🦫","🦬","🦭","🦮","🦯","🦰","🦱","🦲","🦳","🦴","🦵","🦶","🦷","🦸","🦹","🦺","🦻","🦼","🦽","🦾","🦿","🧀","🧁","🧂","🧃","🧄","🧅","🧆","🧇","🧈","🧉","🧊","🧋","🧌","🧍","🧎","🧏","🧐","🧑","🧒","🧓","🧔","🧕","🧖","🧗","🧘","🧙","🧚","🧛","🧜","🧝","🧞","🧟","🧠","🧡","🧢","🧣","🧤","🧥","🧦","🧧","🧨","🧩","🧪","🧫","🧬","🧭","🧮","🧯","🧰","🧱","🧲","🧳","🧴","🧵","🧶","🧷","🧸","🧹","🧺","🧻","🧼","🧽","🧾","🧿","🩰","🩱","🩲","🩳","🩴","🩵","🩶","🩷","🩸","🩹","🩺","🩻","🩼","🪀","🪁","🪂","🪃","🪄","🪅","🪆","🪇","🪈","🪉","🪏","🪐","🪑","🪒","🪓","🪔","🪕","🪖","🪗","🪘","🪙","🪚","🪛","🪜","🪝","🪞","🪟","🪠","🪡","🪢","🪣","🪤","🪥","🪦","🪧","🪨","🪩","🪪","🪫","🪬","🪭","🪮","🪯","🪰","🪱","🪲","🪳","🪴","🪵","🪶","🪷","🪸","🪹","🪺","🪻","🪼","🪽","🪾","🪿","🫀","🫁","🫂","🫃","🫄","🫅","🫆","🫎","🫏","🫐","🫑","🫒","🫓","🫔","🫕","🫖","🫗","🫘","🫙","🫚","🫛","🫜","🫟","🫠","🫡","🫢","🫣","🫤","🫥","🫦","🫧","🫨","🫩","🫰","🫱","🫲","🫳","🫴","🫵","🫶","🫷","🫸"];
+  let emojiPickerState = { category: "all", query: "" };
+  function openMessageEmojiPicker(){
+    const cats=[
+      ["all","Tous"],["smileys","😀 Smileys"],["people","🧑 Personnes"],["animals","🐶 Animaux"],
+      ["food","🍕 Nourriture"],["travel","🚗 Voyage"],["activities","⚽ Activités"],["objects","💡 Objets"],["symbols","❤️ Symboles"]
+    ];
+    openModal(`<div class="modal-box emoji-picker-modal"><button class="modal-close" data-action="close-modal">×</button><div class="emoji-picker-head"><div><span class="eyebrow">TAFAß • EMOJI</span><h3>Choisir un emoji</h3><small class="admin-section-note">Plus de 1 000 emojis disponibles · touchez pour insérer</small></div><b class="emoji-count-badge">${TAFAß_EMOJI_CATALOG.length}+</b></div><input id="emojiSearch" class="premium-input emoji-search" placeholder="Rechercher ou choisir…" autocomplete="off"><div class="emoji-categories">${cats.map(c=>`<button type="button" class="emoji-cat ${c[0]==='all'?'active':''}" data-emoji-category="${c[0]}">${c[1]}</button>`).join('')}</div><div id="emojiGrid" class="emoji-grid"></div></div>`);
+    renderEmojiGrid();
+    setTimeout(()=>{ const q=$("emojiSearch"); if(q){q.addEventListener('input',()=>{emojiPickerState.query=q.value.trim();renderEmojiGrid();}); q.focus();} document.querySelectorAll('[data-emoji-category]').forEach(b=>b.addEventListener('click',()=>{emojiPickerState.category=b.dataset.emojiCategory||'all';document.querySelectorAll('[data-emoji-category]').forEach(x=>x.classList.toggle('active',x===b));renderEmojiGrid();})); },20);
+  }
+  function emojiCategoryMatch(ch,cat){
+    const cp=ch.codePointAt(0);
+    if(cat==='all') return true;
+    if(cat==='smileys') return (cp>=0x1F600&&cp<=0x1F64F)||(cp>=0x1F910&&cp<=0x1F92F)||(cp>=0x1FA70&&cp<=0x1FAFF);
+    if(cat==='people') return (cp>=0x1F466&&cp<=0x1F487)||(cp>=0x1F575&&cp<=0x1F64F)||(cp>=0x1F9D0&&cp<=0x1F9FF);
+    if(cat==='animals') return (cp>=0x1F400&&cp<=0x1F43F)||(cp>=0x1F980&&cp<=0x1F9AE);
+    if(cat==='food') return (cp>=0x1F32D&&cp<=0x1F37F)||(cp>=0x1F950&&cp<=0x1F96F);
+    if(cat==='travel') return (cp>=0x1F680&&cp<=0x1F6FF)||(cp>=0x1F3E0&&cp<=0x1F3FF);
+    if(cat==='activities') return (cp>=0x1F3A0&&cp<=0x1F3FF)||(cp>=0x1F93C&&cp<=0x1F94F);
+    if(cat==='objects') return (cp>=0x1F4A0&&cp<=0x1F5FF)||(cp>=0x1F6CB&&cp<=0x1F6FF);
+    if(cat==='symbols') return cp<0x1F300 || (cp>=0x1F7E0&&cp<=0x1FAFF);
+    return true;
+  }
+  function renderEmojiGrid(){
+    const grid=$("emojiGrid"); if(!grid)return;
+    const q=String(emojiPickerState.query||'').toLowerCase();
+    let list=TAFAß_EMOJI_CATALOG.filter(e=>emojiCategoryMatch(e,emojiPickerState.category));
+    if(q) list=list.filter(e=>e.includes(q));
+    grid.innerHTML=list.map((e,i)=>`<button type="button" class="emoji-cell" title="Emoji ${i+1}" data-emoji-value="${esc(e)}">${e}</button>`).join('')||'<div class="emoji-empty">Aucun emoji trouvé.</div>';
+    grid.querySelectorAll('[data-emoji-value]').forEach(btn=>btn.addEventListener('click',()=>insertMessageEmoji(btn.dataset.emojiValue||'')));
+  }
+  function insertMessageEmoji(emoji){
+    const input=$("messageText"); if(!input||!emoji)return;
+    const start=Number.isInteger(input.selectionStart)?input.selectionStart:input.value.length; const end=Number.isInteger(input.selectionEnd)?input.selectionEnd:input.value.length;
+    input.value=input.value.slice(0,start)+emoji+input.value.slice(end); const pos=start+emoji.length; input.focus(); try{input.setSelectionRange(pos,pos);}catch(_){}
+    try{const recent=JSON.parse(localStorage.getItem('tafass_recent_emojis')||'[]'); const next=[emoji,...recent.filter(x=>x!==emoji)].slice(0,32); localStorage.setItem('tafass_recent_emojis',JSON.stringify(next));}catch(_){}
+  }
+  function openMessageAttachment(){ $("messageAttachment")?.click(); }
+  async function sendMessageAttachment(){
+    const input=$('messageAttachment'), file=input?.files?.[0]; if(!file)return;
+    if(file.size>100*1024*1024)return toast('Fichier trop volumineux. Limite : 100 Mo.');
+    const id=state.selectedConversation; if(!id)return;
+    const bar=document.createElement('div'); bar.className='message-upload-progress'; bar.id='messageUploadProgress'; bar.innerHTML=`<div><b>Envoi de ${esc(file.name)}</b><span>0%</span></div><progress value="0" max="100"></progress>`; $('messageForm')?.before(bar);
+    try{
+      const ext=(file.name.split('.').pop()||'bin').toLowerCase(); const path=`${state.user.id}/messages/${id}-${crypto.randomUUID()}.${ext}`;
+      const up=await sb.storage.from('posts').upload(path,file,{upsert:false,contentType:file.type||'application/octet-stream'});
+      if(up.error)throw up.error;
+      bar.querySelector('progress').value=100; bar.querySelector('span').textContent='100%';
+      const url=sb.storage.from('posts').getPublicUrl(path).data.publicUrl;
+      const r=await sb.from('messages').insert({conversation_id:id,sender_id:state.user.id,content:file.name,media_url:url,media_type:file.type||'application/octet-stream',is_read:false});
+      if(r.error)throw r.error; input.value=''; toast('Fichier envoyé'); await openConversation(id);
+    }catch(e){toast('Upload impossible : '+(e.message||e));}finally{bar.remove();}
+  }
+  async function toggleVoiceRecording(){
+    if(state.recording){state.recording.stop();return;}
+    if(!navigator.mediaDevices?.getUserMedia||typeof MediaRecorder==='undefined')return toast('Les messages vocaux ne sont pas disponibles sur cet appareil.');
+    try{
+      const stream=await navigator.mediaDevices.getUserMedia({audio:true}); const rec=new MediaRecorder(stream); state.recording=rec; state.recordedChunks=[];
+      rec.ondataavailable=e=>{if(e.data.size)state.recordedChunks.push(e.data)};
+      rec.onstop=()=>{stream.getTracks().forEach(t=>t.stop());state.recording=null;const blob=new Blob(state.recordedChunks,{type:rec.mimeType||'audio/webm'});state.recordedChunks=[];if(blob.size)showVoicePreview(blob);};
+      rec.start(); toast('Enregistrement… appuyez à nouveau pour arrêter');
+      const btn=document.querySelector('[data-action="message-voice"]'); if(btn){btn.textContent='⏹️';btn.classList.add('recording');}
+    }catch(e){toast('Autorisez le microphone pour enregistrer un message vocal.');}
+  }
+  function showVoicePreview(blob){
+    if(state.voicePreviewUrl)URL.revokeObjectURL(state.voicePreviewUrl); state.voiceDraft=blob; state.voicePreviewUrl=URL.createObjectURL(blob);
+    const form=$('messageForm'); if(!form)return;
+    let box=$('voicePreviewBox'); if(!box){box=document.createElement('div');box.id='voicePreviewBox';box.className='voice-preview-box';form.before(box);}
+    box.innerHTML=`<div><b>Écouter avant d’envoyer</b><small>Vous pouvez supprimer et réenregistrer.</small></div><audio controls src="${esc(state.voicePreviewUrl)}"></audio><div><button type="button" class="ghost-action" data-action="discard-voice">Supprimer</button><button type="button" class="primary" data-action="send-voice-draft">Envoyer</button></div></div>`;
+    const btn=document.querySelector('[data-action="message-voice"]');if(btn){btn.textContent='🎙️';btn.classList.remove('recording');}
+  }
+  function discardVoice(){if(state.voicePreviewUrl)URL.revokeObjectURL(state.voicePreviewUrl);state.voicePreviewUrl=null;state.voiceDraft=null;$('voicePreviewBox')?.remove();}
+  async function sendVoiceDraft(){
+    const blob=state.voiceDraft,id=state.selectedConversation;if(!blob||!id)return;
+    const box=$('voicePreviewBox'); if(box)box.innerHTML='<b>Envoi du vocal…</b><progress max="100" value="70"></progress>';
+    const path=`${state.user.id}/messages/${id}-${crypto.randomUUID()}.webm`; const up=await sb.storage.from('posts').upload(path,blob,{upsert:false,contentType:blob.type||'audio/webm'});
+    if(up.error)return toast('Upload audio impossible : '+up.error.message);
+    const url=sb.storage.from('posts').getPublicUrl(path).data.publicUrl;const r=await sb.from('messages').insert({conversation_id:id,sender_id:state.user.id,content:'🎙️ Message vocal',media_url:url,media_type:blob.type||'audio/webm',is_read:false});
+    if(r.error)return toast(r.error.message);discardVoice();toast('Message vocal envoyé');return openConversation(id);
+  }
+  async function downloadMessageFile(url,name){try{const r=await fetch(url);if(!r.ok)throw new Error();const b=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name||'fichier';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}catch(_){window.open(url,'_blank');}}
+  async function deleteConversationForMe(id){const r=await sb.from('tafab_deleted_conversations').upsert({user_id:state.user.id,conversation_id:id},{onConflict:'user_id,conversation_id'});if(r.error)return toast(r.error.message);closeModal();return messagesPage();}
+  async function blockMessagesUser(id){const r=await sb.from('tafab_message_blocks').upsert({blocker_id:state.user.id,blocked_id:id},{onConflict:'blocker_id,blocked_id'});if(r.error)return toast(r.error.message);closeModal();toast('Messages bloqués pour ce compte');return messagesPage();}
+  async function blockUserAll(id){return blockProfile(id);}
+  function conversationActionMenu(id){
+    const row=document.querySelector(`[data-action="open-conversation"][data-id="${CSS.escape(String(id))}"]`);const name=row?.querySelector('b')?.textContent||'cette personne';
+    openModal(`<div class="modal-box message-action-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">CONVERSATION</span><h3>${esc(name)}</h3><div class="message-menu-list"><button data-action="confirm-delete-conversation" data-id="${esc(id)}"><span class="menu-action-icon">⌫</span><span><b>Supprimer la conversation</b><small>La retirer de votre liste.</small></span><i>›</i></button><button data-action="block-messages-user" data-id="${esc(row?.dataset.otherId||'')}"><span class="menu-action-icon">◌</span><span><b>Bloquer les messages</b><small>Empêcher ce compte de vous écrire.</small></span><i>›</i></button><button data-action="message-aliases" data-id="${esc(id)}"><span class="menu-action-icon">✎</span><span><b>Modifier les pseudos</b><small>Changer le nom affiché du compte 1 et du compte 2.</small></span><i>›</i></button><button data-action="message-theme" data-id="${esc(id)}"><span class="menu-action-icon">🎨</span><span><b>Thème de la conversation</b><small>Choisir le fond et le style partagé des messages.</small></span><i>›</i></button></div></div>`);
+  }
+  function bindConversationLongPress(){
+    document.querySelectorAll('.message-conversation').forEach(el=>{let timer=null,long=false;const start=e=>{long=false;timer=setTimeout(()=>{long=true;const id=el.dataset.id;const other=el.dataset.otherId;openConversationActions(id,other);},600)};const cancel=()=>{if(timer)clearTimeout(timer)};el.addEventListener('pointerdown',start);el.addEventListener('pointerup',cancel);el.addEventListener('pointerleave',cancel);el.addEventListener('pointercancel',cancel);el.addEventListener('contextmenu',e=>{e.preventDefault();openConversationActions(el.dataset.id,el.dataset.otherId)});});
+  }
+  function openConversationActions(id,otherId){const row=document.querySelector(`[data-action="open-conversation"][data-id="${CSS.escape(String(id))}"]`);const name=row?.querySelector('b')?.textContent||'Conversation';openModal(`<div class="modal-box message-action-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">CONVERSATION</span><h3>${esc(name)}</h3><div class="message-menu-list"><button data-action="confirm-delete-conversation" data-id="${esc(id)}"><span class="menu-action-icon">⌫</span><span><b>Supprimer la conversation</b><small>La retirer uniquement de votre liste.</small></span><i>›</i></button><button data-action="block-messages-user" data-id="${esc(otherId||'')}"><span class="menu-action-icon">◌</span><span><b>Bloquer les messages</b><small>Ne plus recevoir de messages de cette personne.</small></span><i>›</i></button><button data-action="message-aliases" data-id="${esc(id)}"><span class="menu-action-icon">✎</span><span><b>Modifier les pseudos</b><small>Changer le nom affiché du compte 1 et du compte 2.</small></span><i>›</i></button><button data-action="message-theme" data-id="${esc(id)}"><span class="menu-action-icon">🎨</span><span><b>Thème de la conversation</b><small>Choisir le fond et le style partagé des messages.</small></span><i>›</i></button><button class="danger-row" data-action="block-user-all" data-id="${esc(otherId||'')}"><span class="menu-action-icon">⊘</span><span><b>Bloquer partout</b><small>Bloquer le compte et toutes les interactions.</small></span><i>›</i></button></div></div>`)}
+
+  async function eventsPage(){
+    const token=state.renderToken;
+    const [ev, mine] = await Promise.all([
+      sb.from("tafab_events").select("*").eq("status","published").order("starts_at",{ascending:true}).limit(60),
+      sb.from("tafab_event_attendees").select("event_id,status").eq("user_id",state.user.id)
+    ]);
+    if(ev.error) return simplePage("Évènements",`<div class="empty">${esc(ev.error.message)}</div>`);
+    if(token!==state.renderToken)return;
+    const myMap=new Map((mine.data||[]).map(x=>[x.event_id,x.status]));
+    const now=new Date();
+    const cards=(ev.data||[]).map(x=>{
+      const status=myMap.get(x.id); const start=new Date(x.starts_at); const end=x.ends_at?new Date(x.ends_at):null;
+      const when=start.toLocaleString("fr-FR",{dateStyle:"medium",timeStyle:"short"});
+      return `<article class="v23-event-card"><div class="v23-event-date"><b>${start.toLocaleDateString("fr-FR",{day:"2-digit"})}</b><small>${start.toLocaleDateString("fr-FR",{month:"short"}).replace('.','')}</small></div><div class="grow"><span class="eyebrow">${esc(x.visibility||"PUBLIC")}</span><h3>${esc(x.title)}</h3><p>${esc(x.description||"")}</p><div class="v23-event-meta">📅 ${esc(when)} ${x.location?` · 📍 ${esc(x.location)}`:""}</div><div class="v23-event-actions"><button class="primary" data-action="event-rsvp" data-id="${esc(x.id)}" data-status="going">${status==='going'?'✓ Je participe':'Je participe'}</button><button class="ghost-action" data-action="event-rsvp" data-id="${esc(x.id)}" data-status="interested">${status==='interested'?'★ Intéressé':'☆ Intéressé'}</button><button class="ghost-action" data-action="event-detail" data-id="${esc(x.id)}">Détails</button></div></div></article>`;
+    }).join("");
+    simplePage("Évènements",`<div class="v23-hero"><div><span class="eyebrow">TAFAß • EVENTS</span><h3>Vos moments, en un seul endroit.</h3><p>Créez des évènements publics ou privés, invitez vos amis et gardez les participants synchronisés.</p></div><button class="primary big" data-action="create-event">＋ Créer un évènement</button></div><div class="page-header-actions"><button class="ghost-action" data-action="my-events">Mes participations</button></div><div class="v23-event-grid">${cards||`<div class="empty" style="grid-column:1/-1"><b>Aucun évènement publié.</b><small>Créez le premier évènement Tafaß.</small></div>`}</div>`);
+  }
+  function openCreateEvent(){
+    openModal(`<div class="modal-box v23-event-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • EVENTS</span><h3>Créer un évènement</h3><label>Titre<input id="eventTitle" maxlength="120" placeholder="Ex. Rencontre Tafaß"></label><label>Description<textarea id="eventDesc" maxlength="3000" placeholder="Présentez votre évènement…"></textarea></label><div class="grid2"><label>Date et heure<input id="eventStart" type="datetime-local"></label><label>Fin (facultatif)<input id="eventEnd" type="datetime-local"></label></div><label>Lieu<input id="eventLocation" maxlength="180" placeholder="Ex. Antananarivo ou En ligne"></label><label>Visibilité<select id="eventVisibility"><option value="public">Public</option><option value="private">Privé</option></select></label><button class="primary big" data-action="save-event">Publier l’évènement</button></div>`);
+    setTimeout(()=>$("eventTitle")?.focus(),40);
+  }
+  async function saveEvent(){
+    const title=$("eventTitle")?.value.trim(), description=$("eventDesc")?.value.trim()||"", start=$("eventStart")?.value, end=$("eventEnd")?.value||null, location=$("eventLocation")?.value.trim()||null, visibility=$("eventVisibility")?.value||"public";
+    if(!title||!start)return toast("Ajoutez un titre et une date.");
+    const sd=new Date(start), ed=end?new Date(end):null; if(Number.isNaN(sd.getTime())||sd<=new Date())return toast("La date de début doit être dans le futur."); if(ed&&(!Number.isFinite(ed.getTime())||ed<=sd))return toast("La fin doit être après le début.");
+    const r=await sb.from("tafab_events").insert({creator_id:state.user.id,title,description,starts_at:sd.toISOString(),ends_at:ed?ed.toISOString():null,location,visibility,status:"published"}).select("id").single();
+    if(r.error)return toast(r.error.message); await sb.from("tafab_event_attendees").insert({event_id:r.data.id,user_id:state.user.id,status:"going"}); await logActivity("tafab_event_created","Évènement Tafaß créé","tafab_event",r.data.id); closeModal(); toast("Évènement publié"); return eventsPage();
+  }
+  async function eventRsvp(id,status){
+    const existing=await sb.from("tafab_event_attendees").select("id").eq("event_id",id).eq("user_id",state.user.id).maybeSingle();
+    const r=existing.data ? await sb.from("tafab_event_attendees").update({status,updated_at:new Date().toISOString()}).eq("id",existing.data.id) : await sb.from("tafab_event_attendees").insert({event_id:id,user_id:state.user.id,status});
+    if(r.error)return toast(r.error.message); toast(status==='going'?"Participation confirmée":"Ajouté à vos intérêts"); return eventsPage();
+  }
+  async function eventDetail(id){
+    const r=await sb.from("tafab_events").select("*").eq("id",id).maybeSingle(); if(r.error||!r.data)return toast("Évènement introuvable.");
+    const e=r.data, a=await sb.from("tafab_event_attendees").select("status,profiles(first_name,last_name,username,avatar_url)").eq("event_id",id).order("created_at",{ascending:false}).limit(100); const rows=(a.data||[]).map(x=>`<div class="v23-attendee">${avatarHTML(x.profiles||{})}<span><b>${esc(nameOf(x.profiles||{}))}</b><small>${esc(x.status||"interested")}</small></span></div>`).join("");
+    openModal(`<div class="modal-box v23-event-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • ÉVÈNEMENT</span><h3>${esc(e.title)}</h3><p>${esc(e.description||"")}</p><div class="v23-detail-meta">📅 ${esc(new Date(e.starts_at).toLocaleString("fr-FR"))}${e.ends_at?` → ${esc(new Date(e.ends_at).toLocaleString("fr-FR"))}`:""}<br>${e.location?`📍 ${esc(e.location)}`:"🌐 En ligne"}</div><div class="v23-rsvp-row"><button class="primary" data-action="event-rsvp" data-id="${esc(id)}" data-status="going">Je participe</button><button class="ghost-action" data-action="event-rsvp" data-id="${esc(id)}" data-status="interested">Intéressé</button></div><h4>Participants</h4><div class="v23-attendees">${rows||`<div class="empty">Aucun participant pour le moment.</div>`}</div></div>`);
+  }
+  async function creatorStudioPage(){
+    const r=await sb.from("tafab_creator_drafts").select("*").eq("creator_id",state.user.id).order("updated_at",{ascending:false}).limit(50);
+    if(r.error)return simplePage("Creator Studio",`<div class="empty">${esc(r.error.message)}</div>`);
+    const drafts=r.data||[];
+    const posts=(state.posts||[]).filter(x=>x.user_id===state.user.id);
+    simplePage("Creator Studio",`<div class="v23-hero studio"><div><span class="eyebrow">TAFAß • CREATOR STUDIO</span><h3>Créez. Publiez. Analysez.</h3><p>Centralisez vos brouillons, vos contenus et vos statistiques de base.</p></div><button class="primary big" data-action="new-creator-draft">＋ Nouveau contenu</button></div><div class="v23-stats"><div><b>${posts.length}</b><small>Publications</small></div><div><b>${posts.reduce((n,p)=>n+Number(p.views_count||0),0)}</b><small>Vues</small></div><div><b>${posts.reduce((n,p)=>n+Number(p.likes_count||0),0)}</b><small>J'aime</small></div><div><b>${posts.reduce((n,p)=>n+Number(p.comments_count||0),0)}</b><small>Commentaires</small></div></div><section class="v23-studio-section"><div class="section-title"><h3>Brouillons</h3><small class="admin-section-note">Vos contenus en préparation</small></div><div class="v23-draft-grid">${drafts.map(d=>`<article class="v23-draft"><span class="eyebrow">${esc(d.content_type||"post").toUpperCase()}</span><h3>${esc(d.title||"Sans titre")}</h3><p>${esc(d.body||"")}</p><small>${d.scheduled_at?`Programmé · ${new Date(d.scheduled_at).toLocaleString("fr-FR")}`:`Modifié ${timeAgo(d.updated_at)}`}</small><div><button class="ghost-action" data-action="edit-creator-draft" data-id="${esc(d.id)}">Modifier</button><button class="danger-action" data-action="delete-creator-draft" data-id="${esc(d.id)}">Supprimer</button></div></article>`).join("")||`<div class="empty" style="grid-column:1/-1">Aucun brouillon.</div>`}</div></section>`);
+  }
+  function openCreatorDraft(id=""){
+    const load=id?sb.from("tafab_creator_drafts").select("*").eq("id",id).maybeSingle():Promise.resolve({data:null,error:null});
+    load.then(r=>{if(r.error)return toast(r.error.message);const d=r.data||{};openModal(`<div class="modal-box v23-studio-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • STUDIO</span><h3>${id?'Modifier':'Nouveau'} contenu</h3><label>Titre<input id="draftTitle" maxlength="140" value="${esc(d.title||"")}" placeholder="Titre de votre contenu"></label><label>Type<select id="draftType"><option value="post" ${d.content_type==='post'?'selected':''}>Publication</option><option value="video" ${d.content_type==='video'?'selected':''}>Vidéo</option><option value="reel" ${d.content_type==='reel'?'selected':''}>Reel</option><option value="story" ${d.content_type==='story'?'selected':''}>Story</option></select></label><label>Description / texte<textarea id="draftBody" maxlength="5000" placeholder="Écrivez votre contenu…">${esc(d.body||"")}</textarea><div class="grid2"><label>Programmer<input id="draftSchedule" type="datetime-local" value="${d.scheduled_at?new Date(d.scheduled_at).toISOString().slice(0,16):""}"></label><label>Statut<select id="draftStatus"><option value="draft">Brouillon</option><option value="scheduled">Programmé</option></select></label></div><button class="primary big" data-action="save-creator-draft" data-id="${esc(id)}">Enregistrer</button></div>`);setTimeout(()=>$("draftTitle")?.focus(),40);});
+  }
+  async function saveCreatorDraft(id=""){
+    const title=$("draftTitle")?.value.trim()||"Sans titre", body=$("draftBody")?.value.trim()||"", type=$("draftType")?.value||"post", schedule=$("draftSchedule")?.value||null, status=$("draftStatus")?.value||"draft";
+    const payload={creator_id:state.user.id,title,body,content_type:type,scheduled_at:schedule?new Date(schedule).toISOString():null,status,updated_at:new Date().toISOString()};
+    const r=id?await sb.from("tafab_creator_drafts").update(payload).eq("id",id).eq("creator_id",state.user.id):await sb.from("tafab_creator_drafts").insert(payload);
+    if(r.error)return toast(r.error.message); closeModal(); toast(status==='scheduled'?"Contenu programmé":"Brouillon enregistré"); return creatorStudioPage();
+  }
+  async function deleteCreatorDraft(id){const r=await sb.from("tafab_creator_drafts").delete().eq("id",id).eq("creator_id",state.user.id);if(r.error)return toast(r.error.message);toast("Brouillon supprimé");return creatorStudioPage();}
+
+  async function tafabPage() {
+    const token = state.renderToken;
+    const [listR, adsR, favR] = await Promise.all([
+      sb.from("tafab_listings").select("*").eq("status","active").order("created_at",{ascending:false}).limit(50),
+      sb.from("tafab_ads").select("*").eq("status","active").order("created_at",{ascending:false}).limit(20),
+      sb.from("tafab_favorites").select("listing_id").eq("user_id",state.user.id)
+    ]);
+    if (listR.error) return simplePage("Tafaß", `<div class="empty">${esc(listR.error.message)}</div>`);
+    if (token !== state.renderToken) return;
+    const listings=listR.data||[], ads=adsR.data||[], favorites=new Set((favR.data||[]).map(x=>x.listing_id));
+    simplePage("Tafaß", `
+      <div class="tafab-hero premium-hero clean-tafab-hero">
+        <div class="tafab-brand-mark">T</div><div class="grow"><span class="eyebrow">TAFAß • MARCHÉ</span><h3>Vente & échanges</h3><p class="page-subtitle">Des offres publiées par les membres, synchronisées en temps réel.</p></div>
+      </div>
+      <div class="page-header-actions"><button class="primary" data-action="create-tafab-listing">＋ Publier une offre</button><button class="ghost-action" data-action="show-tafab-orders">📦 Commandes</button><button class="ghost-action" data-action="create-tafab-ad">＋ Publicité</button></div>
+      <div class="tafab-grid">
+        ${listings.map(x=>`<article class="tafab-card tafab-ad"><div class="tafab-ad-label">OFFRE RÉELLE • TAFAß</div><h3>${esc(x.title)}</h3><p>${esc(x.description||"")}</p><div class="tafab-meta-line">${esc(x.location||"")} ${x.location&&x.price!=null?'• ':''}${x.price!=null?esc(x.price)+" "+esc(x.currency||"MGA"):""}</div><div class="tafab-actions v22-market-actions"><button class="primary" data-action="tafab-order" data-id="${esc(x.id)}">🛒 Commander</button><button class="ghost-action" data-action="tafab-contact" data-id="${esc(x.id)}">💬 Contacter</button><button class="ghost-action" data-action="tafab-favorite" data-id="${esc(x.id)}">${favorites.has(x.id)?'♥':'♡'} Favori</button><button class="ghost-action" data-action="tafab-info" data-id="${esc(x.id)}">Détails</button></div></article>`).join("")}
+        ${ads.map(a=>`<article class="tafab-card tafab-discussion"><div class="tafab-card-head"><span class="tafab-icon">📢</span><div><b>${esc(a.title)}</b><small>Publicité Tafaß</small></div></div><p>${esc(a.description||"")}</p>${a.image_url?`<img class="post-media" src="${esc(a.image_url)}" alt="Publicité">`:""}<button class="primary big" data-action="tafab-ad" data-id="${esc(a.id)}">Voir la publicité</button></article>`).join("")}
+        ${!listings.length&&!ads.length?`<div class="empty tafab-empty" style="grid-column:1/-1"><b>Aucune offre ni publicité pour le moment.</b><small>Les contenus apparaîtront ici dès qu'un membre en publiera un.</small></div>`:""}
+      </div>`);
+  }
+
+  function menuIcon(type) {
+    const paths = {
+      home:'<path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V20h13V9.5M9.5 20v-6h5v6"/>',
+      messages:'<path d="M4 5.5A3.5 3.5 0 0 1 7.5 2h9A3.5 3.5 0 0 1 20 5.5v7A3.5 3.5 0 0 1 16.5 16H10l-5.5 4v-4.6A3.5 3.5 0 0 1 4 12.5z"/><path d="M8 7h8M8 11h5"/>',
+      notifications:'<path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/>',
+      profile:'<circle cx="12" cy="8" r="3"/><path d="M5 20c.7-4 2.9-6 7-6s6.3 2 7 6"/>',
+      friends:'<circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3.5 20c.6-3.5 2.6-5.5 5.5-5.5s4.9 2 5.5 5.5M14.5 15c3.2-.2 5.2 1.4 6 4.5"/>',
+      groups:'<circle cx="12" cy="8" r="3"/><path d="M4 20c.8-3.7 3.5-5.5 8-5.5s7.2 1.8 8 5.5"/>',
+      pages:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 7h6M9 11h6M9 15h4"/>',
+      saved:'<path d="M6 4h12v17l-6-3.5L6 21z"/>',
+      videos:'<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3z"/>',
+      reels:'<rect x="4" y="4" width="16" height="16" rx="4"/><path d="m8 4 3 4m2-4 3 4M4 9h16M10 12l5 3-5 3z"/>',
+      settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-2.5V20a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1-1.8-1.8.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H6v-2.5h.2a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-1.8.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V4h2.5v.2a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v2.5h-.2a1.7 1.7 0 0 0-1.6 1z"/>',
+      share:'<path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 12v8h14v-8"/>' ,
+      search:'<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/>',
+      history:'<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5M12 7v5l3 2"/>',
+      help:'<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.7 2.7 0 1 1 4.2 2.2c-1.1.7-1.7 1.2-1.7 2.6M12 17h.01"/>',
+      privacy:'<rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+      tafab:'<path d="M6 4h7a5 5 0 0 1 0 10H9v6H6z"/><path d="M9 8h4a1.5 1.5 0 0 1 0 3H9z"/><path d="M16 15l3 3-3 3"/>',
+      payment:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/>',
+      logout:'<path d="M10 5H5v14h5M14 8l5 4-5 4M19 12H9"/>',
+      business:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 20v-6h8v6M8 8h8M8 11h8"/>'
+    };
+    return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[type] || paths.settings}</svg>`;
+  }
+
+  async function pageSettings(id){
+    const {data:p,error}=await fetchPageById(id||state.activePage?.id);
+    if(error||!p)return toast(error?.message||'Page introuvable.');
+    const key=`tafass_page_settings_${p.id}`;
+    let saved={}; try{saved=JSON.parse(localStorage.getItem(key)||'{}')||{};}catch{}
+    const toggle=(k,title,sub,def=true)=>`<label class="page-setting-row"><span><b>${title}</b><small>${sub}</small></span><input type="checkbox" data-page-setting="${k}" ${saved[k]??def?'checked':''}></label>`;
+    openModal(`<div class="modal-box page-settings-modal"><button class="modal-close" data-action="close-modal">×</button><div class="page-settings-hero">${entityAvatarHTML(p,'page','page-settings-avatar')}<div><span class="eyebrow">TAFAß • PARAMÈTRES</span><h2>${esc(p.name)}</h2><p>Centre de contrôle complet de votre Page.</p></div></div>
+      <div class="page-settings-section"><h3>Identité</h3><button class="page-setting-action" data-action="edit-page" data-id="${esc(p.id)}"><span>✎</span><div><b>Nom et informations</b><small>Nom, @username, catégorie, bio, contacts et visuels</small></div><strong>›</strong></button><button class="page-setting-action" data-action="page-name-history" data-id="${esc(p.id)}"><span>◷</span><div><b>Historique des noms</b><small>Consulter les anciens noms et les dates de changement</small></div><strong>›</strong></button></div>
+      <div class="page-settings-section"><h3>Communauté</h3>${toggle('allow_invites','Invitations par les membres','Tous les utilisateurs peuvent inviter leurs amis à suivre la Page',true)}${toggle('allow_messages','Messages de la Page','Permettre aux visiteurs de contacter la Page',true)}${toggle('notify_followers','Alertes aux abonnés','Conserver les notifications importantes pour les abonnés',true)}</div>
+      <div class="page-settings-section"><h3>Visibilité</h3>${toggle('public_profile','Profil public','La Page reste visible dans les recherches et partages',true)}${toggle('show_followers','Afficher les abonnés','Afficher le nombre d’abonnés sur le profil public',true)}</div>
+      <button class="primary big" data-action="save-page-settings" data-id="${esc(p.id)}">Enregistrer les paramètres</button></div>`);
+  }
+
+  async function pageNameHistory(id){
+    const {data:p}=await fetchPageById(id); if(!p)return toast('Page introuvable.');
+    const r=await sb.from('activity_history').select('description,created_at').eq('user_id',state.user.id).eq('entity_type','page').eq('entity_id',id).eq('action_type','page_name_changed').order('created_at',{ascending:false}).limit(30);
+    if(r.error)return toast(r.error.message);
+    const rows=(r.data||[]).map(x=>`<div class="page-history-row"><span>◷</span><div><b>${esc(x.description||'Nom de Page modifié')}</b><small>${new Date(x.created_at).toLocaleString('fr-FR')}</small></div></div>`).join('')||`<div class="empty">Aucun ancien nom enregistré. Le nom actuel est « ${esc(p.name)} ».</div>`;
+    openModal(`<div class="modal-box page-settings-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • HISTORIQUE</span><h3>Historique des noms</h3><p class="muted">Nom actuel : <b>${esc(p.name)}</b>. Un changement de nom est autorisé une fois tous les 15 jours.</p><div class="page-history-list">${rows}</div></div>`);
+  }
+
+  async function menuPage() {
+    state.backOverride = null;
+    // V95: the account Menu is deliberately Page-free. The old Page Menu is removed
+    // completely; a new dedicated Page Menu will be introduced separately.
+    const pageMenuLegacySelectors = [".p91-page-menu",".tafa-v65-page-shell",".page-menu-dashboard",".page-menu-hero",".page-menu-card"];
+    pageMenuLegacySelectors.forEach(sel=>document.querySelectorAll(sel).forEach(el=>el.remove()));
+    /* ADMIN MENU: resolve the server-side role before rendering the Menu.
+       This makes Administration appear immediately for a real Supabase admin. */
+    // V98: admin status is resolved by render() once in the background.
+    // Do not trigger a second Menu render from inside menuPage(); that used to
+    // destroy the user's scroll position and make the Menu feel stuck.
+    if(!pageModeActive()) state.__isAdmin = state.__isAdmin === true;
+    const p = state.profile || {};
+    const items = [
+      ["profile","profile","Profil","Voir votre profil"],
+      ["friends","friends","Amis","Votre réseau"],
+      ["messages","messages","Messages","Vos conversations"],
+      ["notifications","history","Alertes","Vos notifications"],
+      ["groups","groups","Groupes","Communautés"],
+      ["reels","reels","Reels","Formats courts"],
+      ["events","history","Évènements","Créer et découvrir des évènements"],
+      ["studio","videos","Creator Studio","Créer et analyser vos contenus"],
+      ["creator","payment","Monétisation","Coins, revenus et soutien aux créateurs"],
+      ["ai","sparkles","Tafaß AI","Assistant, traduction, rédaction et résumé"],
+      ["music","music","Tafaß Music","Artistes, albums, playlists et favoris"],
+      ["business","business","Business & Publicité","Campagnes, audience et analytics"],
+      ["saved","saved","Enregistrements","Vos contenus sauvegardés"],
+      ["search","search","Rechercher","Trouver un compte ou contenu"],
+      ["settings","settings","Para & Conf","Compte et confidentialité"]
+    ];
+    const adminCard = state.__isAdmin ? [
+      ["admin","shield","Administration","Centre unique : comptes, vérifications, monétisation, signalements et sécurité"]
+    ] : [];
+    const verificationCard = !state.__isAdmin ? [["verification","shield","Badge officiel","Nouveau parcours sécurisé pour demander le badge bleu"]] : [];
+    const actions = [
+      ["history","history","Historique d'activité","Vos actions enregistrées", "activity"],
+      ["payment","payment","Paiement","Vos paiements et transactions", "payment"],
+      ["help","help","Aide","Assistance et signalement", "help"]
+    ];
+    const card = x => `<button type="button" class="menu-card premium-menu-card ${x[0]==="admin" ? "admin-menu-card" : ""}" ${x[4] ? `data-action="menu-service" data-name="${esc(x[2])}" data-service="${esc(x[4])}"` : `data-action="menu-route" data-route-target="${esc(x[0])}"`} aria-label="${esc(x[2])}"><span class="menu-icon">${menuIcon(x[1])}</span><span class="menu-card-copy"><b>${esc(x[2])}</b><small title="${esc(x[3])}">${esc(x[3])}</small></span>${x[0]==="admin"?`<span class="admin-menu-badge" data-admin-badge aria-label="Alertes administration"></span>`:""}<span class="menu-arrow">›</span></button>`;
+    simplePage("Menu", `<div class="menu-section-title menu-shortcuts-title">Raccourcis</div><div class="menu-grid premium-menu-grid">${items.map(card).join("")}</div>${state.__isAdmin ? `<div class="menu-section-title admin-menu-section-title">Administration</div><div class="menu-grid premium-menu-grid admin-menu-grid">${adminCard.map(card).join("")}</div>` : `<div class="menu-section-title">Services</div><div class="menu-grid premium-menu-grid">${verificationCard.map(card).join("")}${actions.map(card).join("")}</div>`}<div class="menu-section-title">Compte</div><div class="menu-grid premium-menu-grid"><button class="menu-card premium-menu-card danger-card" data-action="new-logout"><span class="menu-icon">${menuIcon("logout")}</span><span class="menu-card-copy"><b>Quitter le compte</b><small>Fermer la session sur cet appareil</small></span><span class="menu-arrow">›</span></button></div>`);
+  }
+
+  function openHelpTopic(topicId,fallbackName="Aide"){
+    const topics={
+      diagnostic:["Diagnostic express","TAFAß • DIAGNOSTIC","Distinguer rapidement navigation, connexion, affichage et données.",[["01 · Ne pas multiplier les clics","Une action en cours doit être laissée à son terme. Appuyer plusieurs fois peut lancer plusieurs requêtes ou rendre l’écran difficile à lire.","Attendez la fin du chargement puis réessayez une seule fois."],["02 · Vérifier la section","Si une donnée paraît absente, contrôlez d’abord la section concernée et vérifiez que l’action a réellement été validée.","Un écran vide peut simplement signifier qu’aucune donnée réelle n’est disponible."],["03 · Reproduire","Notez le nom de la page, l’action effectuée et le résultat obtenu. Reproduire le problème avec peu d’étapes facilite l’analyse.","Ajoutez le message d’erreur exact lorsqu’il existe."],["04 · Assistance","Si le problème reste reproductible, utilisez le guide technique et transmettez uniquement les informations nécessaires.","Ne partagez jamais de secret de connexion."]]],
+      start:["Bien démarrer","TAFAß • PREMIERS PAS","Comprendre l’organisation de Tafaß et construire un espace personnel cohérent.",[["Votre identité","Le profil rassemble votre nom, nom d’utilisateur, photo, couverture et publications. Il constitue le point d’entrée vers votre activité.","Touchez un nom ou un avatar lié pour ouvrir le profil correspondant."],["Votre fil","Actualités regroupe les contenus accessibles à votre compte. Réactions, commentaires et partages sont séparés des actions publicitaires.","Un contenu sponsorisé doit rester identifiable comme tel."],["Votre réseau","Amis, Messages, Alertes, Groupes, Pages, Reels et Enregistrements ont chacun leur rôle afin d’éviter les écrans mélangés.","Chaque navigation doit ouvrir la bonne section."],["Vos réglages","Para & Conf regroupe les contrôles d’audience, notifications, recherche, présence, blocage et autres préférences.","Revoyez ces options lorsque votre usage change."]]],
+      publications:["Publications & médias","TAFAß • CRÉATION","Créer et gérer du contenu avec des contrôles clairs.",[["Créer","Ajoutez un texte ou un média, vérifiez son contenu puis choisissez l’audience disponible avant validation.","Une publication normale n’est pas une publicité."],["Interagir","Les réactions, commentaires et réponses permettent une discussion structurée. Les outils de gestion dépendent de votre rôle sur le contenu.","Le signalement sert à demander un examen, pas simplement à exprimer un désaccord."],["Partager","Le partage fait circuler un contenu selon les règles d’audience. Vérifiez toujours ce que vous partagez.","Partager et booster sont deux actions différentes."],["Modifier / supprimer","Lorsque vous êtes propriétaire, Modifier ou Supprimer peuvent être proposés. Une validation protège contre les actions accidentelles.","Après validation, contrôlez immédiatement le résultat."]]],
+      community:["Communauté & échanges","TAFAß • COMMUNAUTÉ","Garder les relations, conversations et alertes lisibles et maîtrisables.",[["Amis","Les suggestions et demandes servent à construire votre réseau. Acceptez uniquement les demandes que vous souhaitez réellement recevoir.","Les paramètres permettent de limiter certaines sollicitations."],["Messages","Chaque conversation doit rester liée au bon contact. Les notifications et la présence dépendent de vos préférences.","Évitez de partager des informations sensibles inutilement."],["Alertes","Les alertes regroupent les événements qui nécessitent votre attention : interactions, demandes et autres événements de compte.","Une alerte peut être marquée comme vue lorsque vous l’ouvrez."],["Mentions","Les mentions relient un compte à un contenu. Les réglages d’identification déterminent comment elles peuvent être contrôlées.","Pour un contenu problématique, utilisez les outils de signalement ou de retrait disponibles."]]],
+      privacy:["Confidentialité","TAFAß • CONTRÔLE","La confidentialité combine plusieurs réglages, pas un seul bouton.",[["Audience","Choisissez qui peut voir vos futures publications et les éléments publics de votre profil.","Vérifiez l’audience avant chaque publication importante."],["Recherche","Les contrôles de recherche déterminent certaines façons dont votre compte peut être retrouvé.","Réduire la recherche peut aussi réduire la facilité de retrouver votre compte."],["Blocage","Le blocage protège votre espace contre un compte que vous ne souhaitez plus laisser interagir avec vous.","La liste de blocage permet de revoir les comptes concernés."],["Localisation","La localisation précise est une donnée sensible : activez-la uniquement lorsqu’une fonction le nécessite.","Évitez de publier une adresse exacte sans raison."]]],
+      security:["Sécurité du compte","TAFAß • PROTECTION","Protéger l’accès au compte et reconnaître rapidement les situations inhabituelles.",[["Secrets de connexion","Ne communiquez jamais mot de passe, code reçu, code de récupération ou jeton de session.","Une assistance sérieuse ne doit pas demander votre secret."],["Connexions","Consultez les connexions actives lorsqu’elles sont disponibles et examinez toute connexion inconnue.","Révoquez une connexion non reconnue si l’outil le permet."],["Messages suspects","Méfiez-vous des promesses de gains, demandes de paiement urgent ou demandes d’informations privées.","N’ouvrez pas automatiquement un lien provenant d’un compte inconnu."],["Après un incident","Sécurisez l’accès, examinez l’activité récente et utilisez l’assistance si le problème persiste.","Conservez les faits utiles sans transmettre de données secrètes."]]],
+      saved:["Enregistrements","TAFAß • BIBLIOTHÈQUE","Une bibliothèque personnelle pour retrouver rapidement les contenus utiles.",[["Retrouver","Les publications sauvegardées apparaissent dans un espace dédié avec leur auteur et leur contenu lorsqu’ils sont encore disponibles.","Une publication supprimée par son auteur peut ne plus être accessible."],["Ouvrir","Chaque fiche peut proposer une action pour revenir au contenu d’origine ou consulter son contexte.","L’enregistrement ne partage pas automatiquement le contenu."],["Retirer","Retirer un enregistrement enlève votre sauvegarde mais ne supprime pas la publication originale.","Seul le propriétaire dispose des contrôles de suppression de son contenu."],["Garder propre","Retirez régulièrement les éléments devenus inutiles pour conserver une bibliothèque rapide à parcourir.","Les futurs filtres peuvent enrichir cet espace sans changer son principe."]]],
+      creator:["Pages, Groupes & créateurs","TAFAß • COMMUNAUTÉS","Séparer clairement profil personnel, Page, groupe et activité créateur.",[["Pages","Une Page peut représenter une activité, un projet ou une présence publique. Ses outils de gestion sont distincts du profil personnel.","Les fonctions de gestion sont réservées aux comptes autorisés."],["Groupes","Les groupes permettent des discussions autour d’un thème. Leurs règles peuvent compléter les standards généraux.","La visibilité dépend du type de groupe."],["Créateurs","Les outils créateur servent à publier, analyser l’activité et, lorsque l’éligibilité est remplie, utiliser certaines fonctions de monétisation.","Aucune monétisation ne garantit un revenu automatique."],["Administration","Les actions sensibles doivent être réservées aux rôles autorisés et rester cohérentes avec les données serveur.","Une décision administrative n’est pas simplement un élément visuel d’interface."]]],
+      boost:["Boost & sponsorisation","TAFAß • ADS","Distinguer clairement une publication normale d’un contenu Boosté.",[["Publication normale","Une publication organique suit les règles habituelles d’audience et de distribution.","Elle ne doit pas afficher la marque publicitaire du Boost."],["Créer un Boost","Le Boost ajoute objectif, audience, budget et durée puis suit un parcours de paiement et de validation.","Créer une campagne ne signifie pas qu’elle est déjà active."],["Marquage","Un contenu sponsorisé doit être immédiatement identifiable. Tafaß utilise une marque du type « TAFAß ADS · SPONSORISÉ · BOOST ».","Cette identification accompagne la diffusion de la campagne."],["Statistiques","Les impressions, portée et clics doivent correspondre aux événements enregistrés côté serveur.","Les chiffres publicitaires ne doivent pas être présentés comme des résultats fictifs."]]],
+      technical:["Assistance technique","TAFAß • SUPPORT","Une méthode claire pour les écrans lents, bloqués ou incomplets.",[["Écran bloqué","Attendez la fin du chargement puis revenez une seule fois à la section précédente avant de réessayer.","Évitez les doubles clics pendant une transition."],["Donnée absente","Contrôlez que l’action a été validée et regardez la section où le résultat devrait apparaître.","Une erreur serveur peut empêcher une donnée de s’afficher."],["Lenteur","Vérifiez la connexion et évitez de lancer plusieurs actions simultanément.","Indiquez quelle section est lente plutôt que toute l’application."],["Rapport utile","Donnez la section, l’action, le résultat attendu, le résultat obtenu et le message d’erreur éventuel.","Une capture peut aider si elle ne contient aucun secret."]]],
+      ideas:["Idées & amélioration","TAFAß • ÉVOLUTION","Transformer une idée en proposition claire et exploitable.",[["Le besoin","Expliquez ce que vous voulez accomplir et à quel endroit de l’application.","Un exemple concret est plus utile qu’une demande très générale."],["Le bénéfice","Précisez si l’idée améliore vitesse, lisibilité, sécurité, découverte ou gestion.","Cela aide à comprendre sa valeur."],["La priorité","Une amélioration fréquente peut être plus utile qu’une fonction complexe rarement utilisée.","Regrouper les idées proches évite les doublons."],["La confidentialité","N’incluez pas d’informations personnelles inutiles dans une suggestion.","Utilisez des exemples génériques lorsque c’est suffisant."]]],
+      report:["Signalement","TAFAß • MODÉRATION","Signaler un problème avec précision sans exposer de données privées.",[["Choisir l’élément","Utilisez le signalement depuis le compte, la publication ou l’élément concerné lorsqu’il est disponible.","Sélectionner l’élément précis facilite l’examen."],["Décrire les faits","Expliquez ce qui s’est passé avec des informations factuelles et utiles.","Évitez les insultes et les données privées inutiles."],["Ne pas confondre désaccord et infraction","Un contenu peut ne pas vous plaire sans enfreindre une règle.","Réservez le signalement aux situations qui nécessitent réellement un examen."],["Après l’envoi","Le signalement demande un examen ; il ne constitue pas automatiquement une décision de modération.","Les mesures dépendent des règles et des informations disponibles."]]]
+    };
+    const d=topics[topicId]||topics.technical;
+    const blocks=d[3].map(s=>`<article class="help-detail-block"><h4>${esc(s[0])}</h4><p>${esc(s[1])}</p><div class="help-detail-note">${esc(s[2])}</div></article>`).join("");
+    openModal(`<div class="modal-box help-detail-modal"><button class="modal-close" data-action="close-modal">×</button><div class="help-detail-head"><span class="help-detail-mark">?</span><div><span class="eyebrow">${esc(d[1])}</span><h3>${esc(d[0]||fallbackName)}</h3><p>${esc(d[2])}</p></div></div><div class="help-detail-body">${blocks}</div><button class="primary big" data-action="close-modal">J’ai compris</button></div>`);
+  }
+
+  async function servicePage(service) {
+    state.backOverride = "menu";
+    if(service === "activity") {
+      const [activityR, searchR] = await Promise.all([
+        sb.from("activity_history").select("*").eq("user_id",state.user.id).order("created_at",{ascending:false}).limit(100),
+        sb.from("search_history").select("*").eq("user_id",state.user.id).order("created_at",{ascending:false}).limit(100)
+      ]);
+      const activityRows=(activityR.data||[]).map(x=>`<div class="list-row history-row"><div class="grow"><b>${esc(x.description||x.action_type||"Activité")}</b><small>${esc(x.entity_type||"")} · ${timeAgo(x.created_at)}</small></div></div>`).join("") || `<div class="empty">Aucune activité enregistrée.</div>`;
+      const searchRows=(searchR.data||[]).map(x=>`<div class="list-row history-row"><div class="history-search-icon">⌕</div><div class="grow"><b>${esc(x.search_text||"")}</b><small>Recherche · ${timeAgo(x.created_at)}</small></div><button class="ghost-action history-delete-btn" data-action="delete-search-history" data-id="${esc(x.id)}" aria-label="Supprimer cette recherche">Supprimer</button></div>`).join("") || `<div class="empty">Aucune recherche enregistrée.</div>`;
+      return simplePage("Historique d'activité", `<div class="history-table-head"><div><h3 class="menu-section-title">Historique de recherche</h3><p>Vos recherches sont conservées ici, séparément de la page Rechercher.</p></div><button class="ghost-action danger-history-action" data-action="clear-search-history">Tout effacer</button></div><div class="clean-list history-search-list">${searchRows}</div><div class="history-table-head activity-head"><div><h3 class="menu-section-title">Activité récente</h3><p>Les actions enregistrées sur votre compte.</p></div></div><div class="clean-list">${activityRows}</div>`);
+    }
+    if(service === "privacy") return settingsPage();
+    if(service === "help") {
+      const topics=[
+        ["diagnostic","⌁","Diagnostic express","Un parcours rapide pour identifier une lenteur, une page bloquée ou une donnée absente."],
+        ["start","✦","Bien démarrer","Configurer son profil, trouver sa communauté et comprendre l’organisation de Tafaß."],
+        ["publications","▣","Publications & médias","Créer, modifier, supprimer, commenter, réagir, partager et comprendre les audiences."],
+        ["community","◌","Communauté & échanges","Amis, demandes, messages, alertes, mentions et réponses : chaque interaction a son espace."],
+        ["privacy","⌑","Confidentialité","Audience, recherche, présence, localisation et blocage : les contrôles essentiels expliqués simplement."],
+        ["security","◈","Sécurité du compte","Protéger l’accès, reconnaître une activité inhabituelle et réagir sans communiquer ses secrets."],
+        ["saved","♡","Enregistrements","Retrouver vos contenus sauvegardés, les ouvrir rapidement et retirer ceux qui ne sont plus utiles."],
+        ["creator","▰","Pages, Groupes & créateurs","Comprendre les espaces communautaires, les outils professionnels et les fonctions créateur."],
+        ["boost","✦","Boost & sponsorisation","Comprendre la différence entre contenu normal, Boost et publicité sponsorisée avec son marquage dédié."],
+        ["technical","⌘","Assistance technique","Méthode pour signaler un écran qui ne s’ouvre pas, un bouton inactif ou une synchronisation lente."],
+        ["ideas","⌁","Idées & amélioration","Décrire une suggestion utile, son objectif et le bénéfice attendu pour l’expérience."],
+        ["report","⚑","Signalement","Choisir le bon élément, expliquer les faits et protéger les informations privées lors d’un signalement."]
+      ];
+      const cards=topics.map(([id,icon,title,desc])=>`<button type="button" class="help-topic-card" data-action="help-item" data-name="${esc(title)}" data-help-topic="${esc(id)}"><span class="help-topic-icon">${icon}</span><span class="help-topic-copy"><b>${esc(title)}</b><small>${esc(desc)}</small></span><span class="help-topic-arrow">›</span></button>`).join("");
+      return simplePage("Aide", `<section class="help-center-premium"><div class="help-hero"><div class="help-hero-mark">?</div><div><span class="eyebrow">TAFAß • ASSISTANCE</span><h3>Un centre d’aide différent, conçu comme un parcours.</h3><p>Trouvez une explication, un diagnostic ou une action précise sans parcourir une longue liste de réglages. Chaque rubrique ci-dessous ouvre un guide détaillé avec plusieurs étapes, des conseils pratiques et les limites à connaître.</p></div></div><div class="help-quick-grid"><button class="help-quick" data-action="help-item" data-help-topic="diagnostic" data-name="Diagnostic express"><b>⌁ Diagnostic</b><small>Vérifier les points essentiels</small></button><button class="help-quick" data-action="help-item" data-help-topic="security" data-name="Sécurité du compte"><b>◈ Sécurité</b><small>Protéger l’accès au compte</small></button><button class="help-quick" data-action="help-item" data-help-topic="technical" data-name="Assistance technique"><b>⌘ Technique</b><small>Résoudre un blocage</small></button><button class="help-quick" data-action="help-item" data-help-topic="report" data-name="Signalement"><b>⚑ Signaler</b><small>Choisir le bon signalement</small></button></div><div class="help-section-heading"><span class="eyebrow">GUIDES TAFAß</span><h3>Choisissez votre parcours</h3><p>Les descriptions restent visibles sur deux lignes ou plus afin de donner un vrai contexte avant d’ouvrir chaque rubrique.</p></div><div class="help-topic-grid">${cards}</div><div class="help-footer-card"><b>Besoin d’aide personnalisée ?</b><p>Indiquez l’écran, l’action effectuée, le résultat attendu, le résultat obtenu et le message d’erreur éventuel. Ne transmettez jamais un mot de passe, un code de connexion ou un jeton de session.</p><button class="primary big" data-action="help-item" data-help-topic="technical" data-name="Assistance technique">Ouvrir le guide technique</button></div></section>`);
+    }
+    if(service === "payment") {
+      const r=await sb.from("payment_transactions").select("*").eq("user_id",state.user.id).order("created_at",{ascending:false}).limit(50);
+      if(r.error) return simplePage("Paiement", `<section class="payment-page-premium"><div class="premium-hero payment-hero"><span class="eyebrow">TAFAß • PAIEMENT</span><h3>Paiement sécurisé</h3><p class="page-subtitle">Les demandes sont enregistrées dans Tafaß et traitées après vérification. Aucun paiement fictif n’est affiché comme réussi.</p></div><div class="payment-method-card"><div><b>Airtel Money / Yas Money</b><small>Choisissez un moyen et créez une seule demande vérifiable.</small></div><button class="primary" data-action="payment-request" data-method="Airtel Money">Créer une demande</button></div><div class="clean-section"><h3 class="menu-section-title">Historique</h3><div class="clean-list"><div class="empty">Le service de paiement n’est pas encore configuré côté Supabase. Exécutez TAFASS_PAYMENT_SETUP.sql.</div></div></div></section>`);
+      const rows=(r.data||[]);
+      const unique=[]; const seen=new Set();
+      for(const x of rows){ const key=`${x.id||''}|${x.method||''}|${x.amount||''}|${x.created_at||''}`; if(!seen.has(key)){seen.add(key);unique.push(x);} }
+      return simplePage("Paiement", `<section class="payment-page-premium"><div class="premium-hero payment-hero"><span class="eyebrow">TAFAß • PAIEMENT</span><h3>Paiement sécurisé</h3><p class="page-subtitle">Une seule interface de paiement. Les demandes restent en attente jusqu’à validation réelle.</p></div><div class="payment-method-card"><div><b>Airtel Money / Yas Money</b><small>Créer une demande de paiement réelle enregistrée dans votre compte.</small></div><button class="primary" data-action="payment-request" data-method="Airtel Money">Nouvelle demande</button></div><div class="clean-section"><h3 class="menu-section-title">Historique</h3><div class="clean-list">${unique.map(x=>`<div class="list-row payment-history-row"><div class="grow"><b>${esc(x.method||"Paiement")}</b><small>${esc(x.status||"pending")} · ${esc(String(x.amount||0))} ${esc(x.currency||"MGA")} · ${timeAgo(x.created_at)}</small></div></div>`).join("")||`<div class="empty">Aucune transaction.</div>`}</div></div></section>`);
+    }
+  }
+  function createPaymentRequest(method="Airtel Money"){
+    openModal(`<div class="modal-box payment-modal-premium"><button class="modal-close" data-action="close-modal">×</button><div class="payment-brand"><span class="payment-brand-icon">₿</span><div><span class="eyebrow">TAFAß • PAIEMENT</span><h3>Nouvelle demande</h3></div></div><div class="payment-stepper"><span class="active">1<small>Montant</small></span><i></i><span>2<small>Vérification</small></span><i></i><span>3<small>Confirmation</small></span></div><div class="payment-methods"><button class="payment-method active" data-action="select-payment-method" data-payment-method="Airtel Money"><b>📱 Airtel Money</b><small>Paiement mobile</small></button><button class="payment-method" data-action="select-payment-method" data-payment-method="Yas Money"><b>📲 Yas Money</b><small>Paiement mobile</small></button></div><label class="payment-field">Montant (MGA)<input id="paymentAmount" type="number" min="1" step="1" inputmode="numeric" placeholder="Ex. 10 000"></label><label class="payment-field">Numéro de paiement<input id="paymentPhone" type="tel" inputmode="tel" placeholder="03x xx xxx xx"></label><div class="payment-secure-note"><span>🔐</span><div><b>Paiement sécurisé</b><small>La demande est enregistrée dans Tafaß et reste en attente jusqu'à validation réelle. Aucun lien externe n'est affiché.</small></div></div><button class="primary big" data-action="payment-review">Continuer vers la vérification</button></div>`);
+  }
+  async function submitPaymentRequest(method,amount,phone){
+    const n=Number(amount); if(!Number.isFinite(n)||n<=0)return toast("Montant invalide."); if(!phone.trim())return toast("Ajoutez le numéro de paiement.");
+    const existing=await sb.from("payment_transactions").select("id,status").eq("user_id",state.user.id).eq("method",method).eq("amount",n).eq("status","pending").limit(1); if(existing.error)return toast(existing.error.message); if((existing.data||[]).length)return toast("Une demande identique est déjà en attente.");
+    const r=await sb.from("payment_transactions").insert({user_id:state.user.id,method,amount:n,currency:"MGA",status:"pending",external_reference:phone.trim()}).select("id").single(); if(r.error)return toast(r.error.message);
+    await logActivity("payment_request_created",`Demande de paiement ${method}`,"payment",r.data?.id||null);
+    openModal(`<div class="modal-box payment-modal-premium payment-confirm-modal"><div class="payment-success-mark">✓</div><span class="eyebrow">TAFAß • DEMANDE ENREGISTRÉE</span><h3>Demande envoyée</h3><p class="muted">Votre demande de <b>${n.toLocaleString("fr-FR")} MGA</b> via <b>${esc(method)}</b> est enregistrée et attend une validation réelle.</p><div class="payment-receipt"><span>Montant</span><b>${n.toLocaleString("fr-FR")} MGA</b><span>Méthode</span><b>${esc(method)}</b><span>Numéro</span><b>${esc(phone.trim())}</b><span>État</span><b class="payment-pending">EN ATTENTE</b></div><button class="primary big" data-action="close-payment">Terminer</button></div>`);
+  }
+
+  async function settingsPage() {
+    state.settingsDetailAction = null;
+    const token = state.renderToken;
+    let cfg = state.user ? (await sb.from("user_settings").select("*").eq("user_id", state.user.id).maybeSingle()).data : null;
+    if (!cfg && state.user) {
+      const r = await sb.from("user_settings").insert({ user_id: state.user.id }).select().single();
+      cfg = r.data || {};
+    }
+    if (token !== state.renderToken || state.route !== "settings") return;
+
+    const icon = type => menuIcon(type);
+    const row = (action, type, title, sub, extra="") =>
+      `<button type="button" class="fb-settings-row" data-action="${esc(action)}">
+        <span class="fb-settings-icon">${icon(type)}</span>
+        <span class="fb-settings-copy"><b>${esc(title)}</b>${sub ? `<small>${esc(sub)}</small>` : ""}</span>
+        ${extra || `<span class="fb-settings-chevron">›</span>`}
+      </button>`;
+
+    const on = v => v !== false ? "Activé" : "Désactivé";
+    const visibility = cfg?.profile_visibility || "public";
+    const dark = state.theme === "dark";
+
+    simplePage("Para & Conf", `
+      <section class="fb-settings-page">
+        <div class="fb-settings-mobile-head"><button data-action="page-back" aria-label="Retour">‹</button><b>Paramètres et confidentialité</b><button data-action="settings-focus-search" aria-label="Rechercher">${icon("search")}</button></div>
+        <div class="fb-settings-search">
+          <span>${icon("search")}</span><input id="settingsSearch" type="search" placeholder="Rechercher dans les paramètres" autocomplete="off">
+        </div>
+
+        <div class="fb-settings-group">
+          <h3>Votre compte</h3>
+          ${row("account-settings","profile","Espace Compte","Mot de passe, sécurité, informations personnelles, expériences partagées, préférences publicitaires, vérification")}
+        </div>
+
+        <div class="fb-settings-group">
+          <h3>Outils et ressources</h3>
+          <p class="fb-settings-note">Nos outils vous aident à contrôler et gérer votre confidentialité.</p>
+          ${row("privacy-settings","privacy","Assistance confidentialité","Contrôlez la visibilité de votre profil et la façon dont les autres vous trouvent")}
+          ${row("family-center","friends","Centre familial","Contrôles et conseils pour les comptes et les relations")}
+          ${row("audience-defaults","groups","Paramètres d’audience par défaut","Choisissez l’audience utilisée par défaut pour vos nouvelles publications")}
+        </div>
+
+        <div class="fb-settings-group">
+          <h3>Préférences</h3>
+          <p class="fb-settings-note">Personnalisez votre expérience sur Tafaß.</p>
+          ${row("reaction-settings","reels","Préférences des réactions","Gérez vos réactions et leur affichage")}
+          ${row("notifications-settings","history","Notifications",on(cfg?.notifications_enabled))}
+          ${row("accessibility-settings","settings","Accessibilité","Préférences d’affichage et d’interaction")}
+          ${row("language-settings","language","Langue et région",cfg?.language === "mg" ? "Malagasy" : "Français")}
+          ${row("media-settings","videos","Contenu multimédia","Lecture et affichage des photos et vidéos")}
+          ${row("time-management","history","Gestion du temps","Contrôlez votre temps passé sur Tafaß")}
+          ${row("effects-settings","profile","Effets pour le visage et les mains","Préférences des effets disponibles sur votre appareil")}
+        </div>
+
+        <div class="fb-settings-group">
+          <h3>Audience et visibilité</h3>
+          <p class="fb-settings-note">Choisissez qui voit ce que vous partagez sur Tafaß.</p>
+          ${row("profile-lock","privacy", "Verrouillage du profil", visibility === "private" ? "Verrouillé" : "Non verrouillé")}
+          ${row("account-settings","profile","Informations du profil","Informations personnelles et coordonnées")}
+          ${row("find-contact-settings","friends","Comment les autres peuvent vous trouver et vous contacter","Demandes d’amis, messages et recherche")}
+          ${row("post-privacy","home","Publications","Audience de vos publications")}
+          ${row("story-privacy","reels","Stories","Audience de vos stories")}
+          ${row("followers-public","friends","Followers et contenu public","Abonnés et visibilité du contenu public")}
+          ${row("profile-identification","profile","Profil et identification","Profil, identification et apparence publique")}
+          ${row("blocking","privacy","Blocage","Comptes bloqués et restrictions")}
+          ${row("online-status","messages","Statut En ligne","Gérez la visibilité de votre présence")}
+        </div>
+
+        <div class="fb-settings-group">
+          <h3>Paiements</h3>
+          <p class="fb-settings-note">Gérez vos infos de paiement et votre activité.</p>
+          ${row("payment-settings","payment","Paiement des publicités","Demandes et historique de paiement réel")}
+        </div>
+
+        <div class="fb-settings-group">
+          <h3>Votre activité</h3>
+          <p class="fb-settings-note">Examinez votre activité et le contenu dans lequel vous êtes identifié(e).</p>
+          ${row("activity-settings","history","Historique d’activité","Actions et recherches enregistrées")}
+          ${row("location-settings","profile","Localisation","Ville et informations de localisation de votre profil")}
+          ${row("apps-web","pages","Applications et sites Web","Connexions et intégrations disponibles")}
+          ${row("information-management","settings","Comment gérer vos informations","Contrôle des informations de votre compte")}
+        </div>
+
+        <div class="fb-settings-group">
+          <h3>Standards de la communauté et mentions légales</h3>
+          ${row("terms","settings","Conditions de service","Règles et conditions d’utilisation de Tafaß")}
+          ${row("privacy-policy","privacy","Politique de confidentialité","Comment Tafaß traite les informations")}
+          ${row("cookies","settings","Politique d’utilisation des cookies","Informations sur les cookies et technologies similaires")}
+          ${row("community-standards","friends","Standards de la communauté","Règles applicables aux contenus et comportements")}
+          ${row("about-tafass","tafab","À propos","Informations sur Tafaß")}
+        </div>
+
+        <div class="fb-settings-footer">
+          <button class="fb-settings-account-action" data-action="security-settings">${icon("privacy")}<span>Sécurité et connexion</span></button>
+          <button class="fb-settings-account-action" data-action="new-logout">${icon("logout")}<span>Quitter le compte</span></button>
+        </div>
+      </section>
+    `);
+
+    const input = $("settingsSearch");
+    input?.addEventListener("input", () => {
+      const q = input.value.trim().toLowerCase();
+      document.querySelectorAll(".fb-settings-row").forEach(el => {
+        el.hidden = !!q && !el.textContent.toLowerCase().includes(q);
+      });
+      document.querySelectorAll(".fb-settings-group").forEach(group => {
+        const visible = [...group.querySelectorAll(".fb-settings-row")].some(x => !x.hidden);
+        group.hidden = !!q && !visible;
+      });
+    });
+  }
+  async function openSettingControl(action) {
+    const cfg = (await sb.from("user_settings").select("*").eq("user_id", state.user.id).maybeSingle()).data || {};
+    const labels = {
+      "friend-settings":["Demandes d’amis","allow_friend_requests","Autoriser les autres membres à vous envoyer des demandes d’ami"],
+      "message-settings":["Messages","allow_messages","Autoriser les autres membres à vous envoyer des messages"],
+      "search-privacy-settings":["Recherche","search_privacy","Autoriser la recherche de votre compte par téléphone ou e-mail"],
+      "language-settings":["Langue","language","Langue de l’interface"],
+      "message-notification-settings":["Notifications de messages","message_notifications","Recevoir les alertes de messages"],
+      "friend-notification-settings":["Notifications d’amis","friend_notifications","Recevoir les alertes liées aux demandes et relations"],
+      "reaction-notification-settings":["Notifications de réactions","reaction_notifications","Recevoir les alertes de réactions"],
+      "comment-notification-settings":["Notifications de commentaires","comment_notifications","Recevoir les alertes de commentaires"]
+    };
+    const [title,key,desc] = labels[action];
+    if (key === "search_privacy") {
+      return openModal(`<div class="modal-box settings-modal"><button class="modal-close" data-action="close-modal">×</button><h3>${esc(title)}</h3><label><input id="allowSearchPhone" type="checkbox" ${cfg.allow_search_by_phone !== false ? "checked" : ""}> Recherche par téléphone</label><label><input id="allowSearchEmail" type="checkbox" ${cfg.allow_search_by_email !== false ? "checked" : ""}> Recherche par e-mail</label><button class="primary big" data-action="save-search-privacy">Enregistrer</button></div>`);
+    }
+    if (key === "language") return openModal(`<div class="modal-box settings-modal"><button class="modal-close" data-action="close-modal">×</button><h3>Langue</h3><label>Langue<select id="languageSelect"><option value="fr" ${cfg.language === "fr" || !cfg.language ? "selected" : ""}>Français</option><option value="mg" ${cfg.language === "mg" ? "selected" : ""}>Malagasy</option></select></label><button class="primary big" data-action="save-language">Enregistrer</button></div>`);
+    const current = cfg[key] !== false;
+    return openModal(`<div class="modal-box settings-modal"><button class="modal-close" data-action="close-modal">×</button><h3>${esc(title)}</h3><p class="muted">${esc(desc)}</p><label class="setting-switch-line"><input id="settingToggle" type="checkbox" ${current ? "checked" : ""}><span>${current ? "Activé" : "Désactivé"}</span></label><button class="primary big" data-action="save-setting-toggle" data-setting-key="${esc(key)}">Enregistrer</button></div>`);
+  }
+
+  async function saveUserSetting(patch) {
+    const { error } = await sb.from("user_settings").upsert({ user_id: state.user.id, ...patch }, { onConflict:"user_id" });
+    if (error) return toast(error.message);
+    toast("Paramètre enregistré");
+    if(state.route==="settings" && state.settingsDetailAction) return openAdvancedSetting(state.settingsDetailAction);
+  }
+
+  async function getSettingsTable(table) {
+    const r = await sb.from(table).select("*").eq("user_id", state.user.id).maybeSingle();
+    if (r.error) throw r.error;
+    if (r.data) return r.data;
+    const i = await sb.from(table).insert({ user_id: state.user.id }).select("*").single();
+    if (i.error) throw i.error;
+    return i.data;
+  }
+
+  function settingsBackToHub() {
+    state.backOverride = "settings";
+  }
+
+  function settingsDetail(title, eyebrow, description, body) {
+    settingsBackToHub();
+    simplePage(title, `<section class="settings-detail-page">
+      <div class="settings-detail-intro"><span class="eyebrow">${esc(eyebrow || "TAFAß • PARAMÈTRES")}</span>${description ? `<p>${esc(description)}</p>` : ""}</div>
+      ${body}
+    </section>`);
+  }
+
+  function settingSwitch(id, title, sub, checked, extra="") {
+    return `<label class="settings-control-row" for="${esc(id)}"><span class="settings-control-copy"><b>${esc(title)}</b>${sub ? `<small>${esc(sub)}</small>` : ""}</span><span class="settings-switch"><input id="${esc(id)}" type="checkbox" ${checked ? "checked" : ""}><i></i></span>${extra}</label>`;
+  }
+
+  function settingChoice(id, title, sub, value, options) {
+    return `<label class="settings-control-row settings-choice-row" for="${esc(id)}"><span class="settings-control-copy"><b>${esc(title)}</b>${sub ? `<small>${esc(sub)}</small>` : ""}</span><select id="${esc(id)}">${options.map(o=>`<option value="${esc(o[0])}" ${o[0]===value?"selected":""}>${esc(o[1])}</option>`).join("")}</select></label>`;
+  }
+
+  async function saveSettingsTable(table, patch, success="Paramètres enregistrés") {
+    const r = await sb.from(table).upsert({ user_id: state.user.id, ...patch }, { onConflict:"user_id" });
+    if (r.error) return toast(r.error.message);
+    await logActivity("settings_updated", success, table);
+    toast(success);
+    return openAdvancedSetting(state.settingsDetailAction || "privacy-settings");
+  }
+
+  async function openAdvancedSetting(action) {
+    state.settingsDetailAction = action;
+    try {
+      if (action === "profile-lock") {
+        const cfg = (await sb.from("user_settings").select("profile_visibility").eq("user_id",state.user.id).maybeSingle()).data || {};
+        const pc=(await sb.from("privacy_protection_settings").select("capture_protection,private_media_longpress").eq("user_id",state.user.id).maybeSingle()).data || {};
+        settingsDetail("Verrouiller votre profil","TAFAß • CONFIDENTIALITÉ","Le verrouillage limite réellement l’accès au profil. Les protections média sont appliquées côté interface et, lorsque l’APK fournit un bridge sécurisé, au niveau natif.",
+          `<div class="settings-hero-lock"><div class="settings-lock-icon">🔒</div><b>${cfg.profile_visibility === "private" ? "Votre profil est verrouillé" : "Votre profil est public"}</b><small>${cfg.profile_visibility === "private" ? "Les visiteurs non autorisés ne peuvent pas consulter vos publications privées." : "Votre profil est actuellement accessible selon vos règles d’audience."}</small></div>
+           <div class="settings-control-list">${settingSwitch("profileLockToggle","Verrouiller le profil","Restreindre l’accès aux personnes autorisées.",cfg.profile_visibility === "private")}
+           ${settingSwitch("protectCapture","Protection du contenu","Activer la protection contre la capture lorsque le conteneur Android Tafaß expose la fonction sécurisée.",pc.capture_protection !== false)}
+           ${settingSwitch("protectLongPress","Protection des médias","Désactiver le menu contextuel et l’enregistrement direct par appui long sur les médias protégés.",pc.private_media_longpress !== false)}</div>
+           <div class="settings-info-card"><b>Protection anti-capture</b><small>Un site Web ne peut pas garantir à lui seul l’impossibilité d’une capture d’écran. L’APK peut toutefois activer le mode sécurisé natif (FLAG_SECURE) lorsqu’il expose le bridge Tafaß.</small></div>
+           <button class="primary big settings-save" data-action="save-profile-lock">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "privacy-settings") {
+        const [u,a,p] = await Promise.all([
+          sb.from("user_settings").select("profile_visibility,allow_friend_requests,allow_messages,allow_search_by_phone,allow_search_by_email").eq("user_id",state.user.id).maybeSingle(),
+          sb.from("audience_settings").select("default_post_audience,story_audience,followers_visibility").eq("user_id",state.user.id).maybeSingle(),
+          sb.from("profile_identification_settings").select("allow_tagging,review_tags,search_engine_index").eq("user_id",state.user.id).maybeSingle()
+        ]);
+        const x=u.data||{}, y=a.data||{}, z=p.data||{};
+        settingsDetail("Assistance confidentialité","TAFAß • CONFIDENTIALITÉ","Nous vous aidons à prendre les bonnes décisions pour préserver votre compte et votre contenu.",
+          `<div class="privacy-choice-grid">
+            <button class="privacy-choice" data-action="profile-identification"><span class="privacy-choice-icon">◉</span><b>Qui peut voir ce que vous partagez</b><small>Publications, stories et contenu public</small></button>
+            <button class="privacy-choice" data-action="followers-public"><span class="privacy-choice-icon">◎</span><b>Comment les autres peuvent vous trouver</b><small>Followers, recherche et profil public</small></button>
+            <button class="privacy-choice" data-action="profile-lock"><span class="privacy-choice-icon">▣</span><b>Verrouiller votre profil</b><small>${x.profile_visibility === "private" ? "Activé" : "Désactivé"}</small></button>
+            <button class="privacy-choice" data-action="blocking"><span class="privacy-choice-icon">⊘</span><b>Comment protéger votre compte</b><small>Blocage et restrictions</small></button>
+          </div>
+          <div class="settings-section-block"><h3>Réglages rapides</h3>
+            ${settingSwitch("privacyFriend","Autoriser les demandes d’amis","Les autres membres peuvent vous envoyer une demande.",x.allow_friend_requests !== false)}
+            ${settingSwitch("privacyMessage","Autoriser les messages","Les autres membres peuvent vous contacter.",x.allow_messages !== false)}
+            ${settingSwitch("privacyPhone","Recherche par téléphone","Votre compte peut être trouvé avec votre numéro.",x.allow_search_by_phone !== false)}
+            ${settingSwitch("privacyEmail","Recherche par e-mail","Votre compte peut être trouvé avec votre adresse e-mail.",x.allow_search_by_email !== false)}
+          </div>
+          <button class="primary big settings-save" data-action="save-privacy-assistance">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "find-contact-settings") {
+        const x=(await sb.from("user_settings").select("allow_friend_requests,allow_messages,allow_search_by_phone,allow_search_by_email").eq("user_id",state.user.id).maybeSingle()).data||{};
+        settingsDetail("Comment les autres peuvent vous trouver et vous contacter","TAFAß • CONTACT","Contrôlez qui peut vous trouver, vous contacter et vous envoyer une demande.",
+          `<div class="settings-section-block"><h3>Demandes et contacts</h3>
+            ${settingSwitch("findFriends","Demandes d’amis","Autoriser les autres membres à vous envoyer une demande d’ami.",x.allow_friend_requests !== false)}
+            ${settingSwitch("findMessages","Messages","Autoriser les autres membres à vous envoyer des messages.",x.allow_messages !== false)}
+            ${settingSwitch("findPhone","Recherche par téléphone","Permettre de trouver votre compte avec votre numéro.",x.allow_search_by_phone !== false)}
+            ${settingSwitch("findEmail","Recherche par e-mail","Permettre de trouver votre compte avec votre adresse e-mail.",x.allow_search_by_email !== false)}
+          </div><button class="primary big settings-save" data-action="save-find-contact-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "notifications-settings") {
+        const x=(await sb.from("user_settings").select("notifications_enabled,message_notifications,friend_notifications,reaction_notifications,comment_notifications").eq("user_id",state.user.id).maybeSingle()).data||{};
+        settingsDetail("Notifications","TAFAß • NOTIFICATIONS","Choisissez les alertes que vous souhaitez recevoir en temps réel.",
+          `<div class="settings-section-block"><h3>Vos notifications</h3>
+            ${settingSwitch("notifAll","Notifications générales","Activer les notifications Tafaß.",x.notifications_enabled !== false)}
+            ${settingSwitch("notifMessages","Messages","Nouveaux messages et activités de conversation.",x.message_notifications !== false)}
+            ${settingSwitch("notifFriends","Amis","Demandes d’amis et changements de relation.",x.friend_notifications !== false)}
+            ${settingSwitch("notifReactions","Réactions","Réactions sur vos publications.",x.reaction_notifications !== false)}
+            ${settingSwitch("notifComments","Commentaires","Nouveaux commentaires sur vos publications.",x.comment_notifications !== false)}
+          </div>
+          <section class="tafa-push-device-card" aria-label="Notifications sur cet appareil">
+            <div class="tafa-push-device-head"><span class="tafa-push-device-icon">⌁</span><div><strong>Notifications sur cet appareil</strong><small>Recevez les alertes Tafaß même lorsque l’application est en arrière-plan.</small></div></div>
+            <button type="button" class="tafa-push-device-button" data-action="enable-push-notifications"><span>Activer les notifications</span><span class="tafa-push-device-arrow">›</span></button>
+            <p class="tafa-push-device-note"><span>ⓘ</span><span>Une autorisation Android peut apparaître. Elle est demandée uniquement lorsque vous appuyez sur le bouton.</span></p>
+          </section>
+          <button class="primary big settings-save" data-action="save-notification-settings">Enregistrer les modifications</button>`);
+        return;
+      }
+
+      if (action === "family-center") {
+        const x=await getSettingsTable("family_settings");
+        settingsDetail("Centre familial","TAFAß • FAMILLE","Des contrôles simples pour la sécurité, les relations et la confidentialité des comptes.",
+          `<div class="settings-info-card"><b>Activité et contrôles</b><small>Gérez les protections disponibles dans votre compte Tafaß.</small></div>
+           <div class="settings-section-block"><h3>Ressources pour les familles</h3>
+             ${settingSwitch("familySafety","Mode sécurité","Renforcer les restrictions de contact et de visibilité.",x.safety_mode)}
+             ${settingSwitch("familyContacts","Restrictions de contact","Limiter certaines interactions avec les comptes non autorisés.",x.contact_restrictions)}
+           </div>
+           <button class="primary big settings-save" data-action="save-family-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "media-settings") {
+        const x=await getSettingsTable("media_settings");
+        settingsDetail("Économiseur de données","TAFAß • MULTIMÉDIA","Réduisez la consommation de données mobiles sans désactiver les fonctions essentielles.",
+          `<div class="settings-section-block"><h3>Économiseur de données</h3>
+            ${settingSwitch("mediaSaver","Économiseur de données","Réduire la qualité et les téléchargements automatiques.",x.data_saver)}
+            ${settingSwitch("mediaAutoplay","Lecture automatique des vidéos","Lire automatiquement les vidéos lorsque c’est possible.",x.autoplay_videos)}
+            ${settingChoice("mediaQuality","Qualité vidéo et photo","Choisissez la qualité utilisée pour les médias.",x.upload_quality||"standard",[["data_saver","Économiseur de données"],["standard","Optimisée"],["high","Haute qualité"]])}
+          </div>
+          <button class="primary big settings-save" data-action="save-media-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "time-management") {
+        settingsDetail("Gestion du temps","TAFAß • VOTRE TEMPS","Les limites Tafaß sont affichées clairement avant et pendant l’utilisation.",timeLimitSettingsHTML());
+        return;
+      }
+
+      if (action === "reaction-settings") {
+        const x=await getSettingsTable("reaction_settings");
+        settingsDetail("Préférences des réactions","TAFAß • RÉACTIONS","Contrôlez l’affichage des réactions sur vos publications et personnalisez votre expérience.",
+          `<div class="settings-reaction-preview"><span>J’aime</span><span>J’adore</span><span>Solidaire</span><span>Haha</span><span>Waouh</span><span>Triste</span><span>En colère</span></div>
+           <div class="settings-section-block">
+             ${settingSwitch("reactionCounts","Masquer le nombre de réactions","Les autres ne voient pas le total de réactions sur vos publications.",!x.show_reaction_counts)}
+             ${settingSwitch("reactionPersonalized","Réactions personnalisées","Utiliser les préférences de réactions adaptées à votre compte.",x.personalized_reactions)}
+           </div><button class="primary big settings-save" data-action="save-reaction-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "story-privacy") {
+        const [a,b]=(await Promise.all([getSettingsTable("audience_settings"),getSettingsTable("story_settings")]));
+        settingsDetail("Stories","TAFAß • STORIES","Choisissez qui peut voir vos stories et ce que les autres peuvent en faire.",
+          `<div class="settings-section-block"><h3>Contenu de vos stories</h3>
+            ${settingChoice("storyAudience","Qui peut voir vos stories","Audience appliquée aux nouvelles stories.",a.story_audience||"public",[["public","Public"],["friends","Amis"],["private","Moi uniquement"]])}
+            ${settingSwitch("storyPublicShare","Autoriser le partage des stories publiques","Les autres peuvent partager une story publique.",b.allow_public_sharing)}
+            ${settingSwitch("storyPersonalShare","Autoriser le partage des stories personnelles","Autoriser le partage lorsque l’audience personnelle le permet.",b.allow_personal_sharing)}
+            ${settingSwitch("storyMentionShare","Autoriser le partage des stories où vous êtes mentionné(e)","Contrôler le partage des stories contenant une mention.",b.allow_mention_sharing)}
+            ${settingSwitch("storyShare","Autoriser le partage des stories","Contrôle général du partage des stories.",b.allow_story_sharing)}
+            ${settingSwitch("storyArchive","Archiver les stories","Conserver automatiquement vos stories après leur expiration.",b.archive_stories)}
+            ${settingSwitch("storyMuted","Stories mises en sourdine","Masquer les stories des comptes que vous avez mis en sourdine.",b.muted_stories_enabled)}
+          </div><button class="primary big settings-save" data-action="save-story-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "post-privacy") {
+        const x=await getSettingsTable("publication_settings");
+        settingsDetail("Publications","TAFAß • PUBLICATIONS","Définissez l’audience de vos publications et les contrôles de partage.",
+          `<div class="settings-section-block"><h3>Publications</h3>
+            ${settingChoice("futureAudience","Qui peut voir vos futures publications","Audience par défaut des nouvelles publications.",x.future_audience||"public",[["public","Public"],["friends","Amis"],["private","Moi uniquement"]])}
+            ${settingSwitch("limitOldPosts","Limiter qui peut voir les anciennes publications","Réduire l’audience des anciennes publications lorsque cette option est activée.",x.limit_old_posts)}
+            ${settingSwitch("commentSummaries","Autoriser les résumés de commentaires","Afficher les résumés lorsqu’ils sont disponibles.",x.comment_summaries)}
+            ${settingSwitch("sharePostsStory","Toujours partager les publications dans une story","Partager automatiquement les nouvelles publications dans votre story.",x.share_posts_to_story)}
+          </div><button class="primary big settings-save" data-action="save-publication-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "audience-defaults") {
+        const x=await getSettingsTable("audience_settings");
+        settingsDetail("Paramètres d’audience par défaut","TAFAß • AUDIENCE","Définissez l’audience utilisée lorsque vous publiez du nouveau contenu.",
+          `<div class="settings-section-block"><h3>Audience par défaut</h3>${settingChoice("audienceValue","Nouvelles publications","Audience utilisée par défaut.",x.default_post_audience||"public",[["public","Public"],["friends","Amis"],["private","Moi uniquement"]])}</div>
+           <button class="primary big settings-save" data-action="save-audience-setting" data-audience-key="default_post_audience">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "followers-public") {
+        const x=await getSettingsTable("public_content_settings");
+        settingsDetail("Followers et contenu public","TAFAß • CONTENU PUBLIC","Contrôlez les personnes qui peuvent vous suivre et les règles appliquées à votre contenu public.",
+          `<div class="settings-section-block"><h3>Followers et contenu public</h3>
+            ${settingChoice("followersVisibility","Qui peut me suivre","Détermine l’accès au suivi de votre compte.",x.followers_visibility||"public",[["public","Public"],["friends","Amis"],["private","Personne / privé"]])}
+            ${settingChoice("followingVisibility","Qui peut voir les personnes et les Pages que vous suivez","Contrôle la visibilité de votre liste de suivi.",x.following_visibility||"private",[["public","Public"],["friends","Amis"],["private","Moi uniquement"]])}
+            ${settingChoice("publicComments","Qui peut commenter vos publications publiques","Détermine qui peut commenter votre contenu public.",x.public_comments||"public",[["public","Tout le monde"],["followers","Followers"],["friends","Amis"],["private","Personne"]])}
+            ${settingSwitch("publicNotifications","Notifications de publications publiques","Recevoir les notifications liées au contenu public.",x.public_post_notifications)}
+            ${settingSwitch("publicProfileInfo","Informations de profil publiques","Afficher les informations publiques de votre profil.",x.public_profile_info)}
+            ${settingSwitch("relevantComments","Afficher les commentaires les plus pertinents en premier","Trier les commentaires selon leur pertinence.",x.relevant_comments_first)}
+            ${settingSwitch("offFacebookPreview","Aperçu hors Tafaß","Autoriser un aperçu de votre contenu public lorsqu’il est partagé hors de Tafaß.",x.off_facebook_preview)}
+            ${settingSwitch("blocklistFilter","Filtre de la liste de blocage","Appliquer les règles de blocage au contenu public.",x.blocklist_filter)}
+          </div><button class="primary big settings-save" data-action="save-public-content-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "profile-identification") {
+        const x=await getSettingsTable("profile_identification_settings");
+        settingsDetail("Profil et identification","TAFAß • PROFIL","Contrôlez les identifications, la validation des tags et la visibilité dans les moteurs de recherche.",
+          `<div class="settings-section-block">
+            ${settingSwitch("tagging","Autoriser les identifications","Les autres peuvent vous identifier dans les publications.",x.allow_tagging)}
+            ${settingSwitch("reviewTags","Vérifier les identifications avant publication","Examiner les identifications avant qu’elles apparaissent sur votre profil.",x.review_tags)}
+            ${settingSwitch("searchIndex","Autoriser l’indexation publique","Permettre aux moteurs de recherche d’indexer votre profil public.",x.search_engine_index)}
+          </div><button class="primary big settings-save" data-action="save-profile-identification">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "online-status") {
+        const x=await getSettingsTable("online_status_settings");
+        settingsDetail("Indiquer si vous êtes en ligne","TAFAß • MESSAGERIE","Choisissez si vos contacts peuvent voir votre présence et votre dernière activité.",
+          `<div class="settings-info-card"><b>Votre statut En ligne</b><small>Ce réglage est appliqué à votre présence dans la messagerie Tafaß.</small></div>
+           <div class="settings-section-block">${settingSwitch("onlineVisible","Indiquer quand vous êtes en ligne","Autoriser les autres à voir votre présence.",x.visible)}${settingSwitch("lastSeen","Afficher la dernière activité","Autoriser l’affichage de votre dernière activité.",x.last_seen_visible)}</div>
+           <button class="primary big settings-save" data-action="save-online-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "location-settings") {
+        const x=await getSettingsTable("location_settings");
+        const lr=await sb.from("profile_locations").select("latitude,longitude,accuracy_m,place_name,updated_at").eq("user_id",state.user.id).maybeSingle();
+        const loc=lr.data;
+        const locText=loc ? `📍 ${esc(loc.place_name||"Position exacte enregistrée")} · précision ${Math.round(Number(loc.accuracy_m||0))} m · ${timeAgo(loc.updated_at)}` : "Aucune position exacte enregistrée sur cet appareil.";
+        settingsDetail("Localisation","TAFAß • LOCALISATION","Utilisez la position réelle fournie par le GPS de votre appareil. La précision dépend du signal disponible et de l’autorisation accordée.",
+          `<div class="settings-location-live"><b>Position actuelle</b><small id="locationLiveStatus">${locText}</small></div>
+           <div class="settings-section-block">${settingSwitch("profileLocation","Localisation du profil","Afficher la ville/zone publique de votre profil.",x.profile_location_enabled)}${settingSwitch("preciseLocation","Localisation précise","Autoriser Tafaß à enregistrer les coordonnées GPS exactes lorsque vous le demandez.",x.precise_location_enabled)}</div>
+           <button class="secondary-pill big" data-action="capture-exact-location">📍 Utiliser ma position exacte maintenant</button>
+           <button class="primary big settings-save" data-action="save-location-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "professional-mode") {
+        return settingsDetail("Fonctionnalité indisponible","TAFAß • PARAMÈTRES","Les espaces de Page ne font pas partie de cette version de l’application.",`<div class="settings-info-card"><b>Mode professionnel indisponible</b><small>Votre espace personnel reste inchangé.</small></div>`);
+        const x=await getSettingsTable("professional_settings");
+        settingsDetail("Mode professionnel","TAFAß • PROFESSIONNEL","Activez les outils professionnels de Tafaß. Vos Pages restent indépendantes de votre profil personnel.",
+          `<div class="settings-section-block">${settingSwitch("professionalEnabled","Mode professionnel","Activer les outils professionnels disponibles pour votre compte.",x.enabled)}</div>
+           <div class="settings-section-block"><h3>Vos Pages</h3>${pageRows}</div>
+           <button class="primary big settings-save" data-action="save-professional-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "page-privacy") {
+        return settingsDetail("Fonctionnalité indisponible","TAFAß • PARAMÈTRES","Les espaces de Page ne font pas partie de cette version de l’application.",`<div class="settings-info-card"><b>Pages indisponibles</b><small>Cette rubrique n’est plus proposée.</small></div>`);
+        settingsDetail("Pages","TAFAß • PAGES","Gérez les Pages que vous administrez. Les permissions sont appliquées côté Supabase.",
+          `<div class="settings-section-block"><h3>Vos Pages</h3>${pageRows}</div>
+           <button class="ghost-action big" data-route="pages">Ouvrir Pages</button>`);
+        return;
+      }
+
+      if (action === "blocking") {
+        const r=await sb.from("blocked_profiles").select("id,blocked_id,created_at").eq("blocker_id",state.user.id).order("created_at",{ascending:false});
+        if(r.error) throw r.error;
+        const rows=r.data||[]; let profiles=[];
+        if(rows.length){ const ids=rows.map(x=>x.blocked_id); profiles=(await sb.from("profiles").select("id,first_name,last_name,username,avatar_url").in("id",ids)).data||[]; }
+        const map=new Map(profiles.map(x=>[x.id,x]));
+        const blockedRows=rows.length ? rows.map(x=>{const u=map.get(x.blocked_id)||{}; const avatar=avatarHTML(u); const nm=esc(nameOf(u)||u.username||"Compte"); const handle=u.username?"@"+esc(u.username):"Compte bloqué"; return `<div class="blocked-row"><div class="blocked-avatar">${avatar}</div><div class="grow"><b>${nm}</b><small>${handle}</small></div><button class="ghost-action" data-action="unblock-from-settings" data-id="${esc(x.blocked_id)}">Débloquer</button></div>`}).join("") : `<div class="settings-empty">Aucun compte bloqué.</div>`;
+        settingsDetail("Blocage","TAFAß • PROTECTION","Les personnes que vous bloquez ne peuvent plus interagir avec vous selon les règles de sécurité Tafaß.",
+          `<div class="settings-section-block"><h3>Personnes bloquées</h3>${blockedRows}</div>`);
+        return;
+      }
+
+      if (action === "apps-web") {
+        const r=await sb.from("connected_apps").select("id,app_name,provider,status,connected_at").eq("user_id",state.user.id).order("connected_at",{ascending:false});
+        if(r.error) throw r.error;
+        const sessionId=(sb.auth.getSession ? (await sb.auth.getSession()).data?.session?.access_token : null) || "browser";
+        const deviceId=`web-${btoa((navigator.userAgent||"tafass")).replace(/[^a-z0-9]/gi,"").slice(0,28)}`;
+        const currentConn=await sb.from("connected_apps").select("id").eq("user_id",state.user.id).eq("app_name","Tafaß Web").eq("provider","Tafaß Web").eq("status","active").limit(1);
+        if(!currentConn.error && !(currentConn.data||[]).length){ await sb.from("connected_apps").insert({user_id:state.user.id,app_name:"Tafaß Web",provider:"Tafaß Web",status:"active",connected_at:new Date().toISOString(),metadata:{device_id:deviceId,user_agent:navigator.userAgent||""}}); }
+        const rr=await sb.from("connected_apps").select("id,app_name,provider,status,connected_at,metadata").eq("user_id",state.user.id).eq("status","active").order("connected_at",{ascending:false});
+        const appRows=(rr.data||[]).map(x=>{const current=x.app_name==="Tafaß Web"&&x.metadata?.device_id===deviceId; const revoke=current?"":`<button class="ghost-action" data-action="revoke-connected-app" data-id="${esc(x.id)}">Révoquer</button>`; return `<div class="settings-link-row connection-real"><span><b>${esc(x.app_name)}</b><small>${current?'✓ Cet appareil · session actuelle':'✓ Connexion active'} · ${esc(x.provider||"Connexion externe")} · ${x.connected_at?timeAgo(x.connected_at):'à l’instant'}</small></span>${revoke}</div>`}).join("");
+        settingsDetail("Applications et sites Web","TAFAß • CONNEXIONS","Les connexions affichées ici correspondent aux enregistrements actifs de votre compte Tafaß. Une connexion révoquée disparaît immédiatement de cette liste.",
+          `<div class="settings-games-card"><div><span class="eyebrow">TAFAß • PLAY</span><h3>18+ Jeux premium</h3><p>Jeux intégrés et réellement jouables dans Tafaß : Ludo, Piano, Tetris, Mahjong, Échecs, Course, Football, Billard et plus.</p></div><button class="primary big" data-action="open-games">Explorer les jeux</button></div>
+           <div class="settings-section-block"><div class="section-title-line"><h3>Connexions actives (${(rr.data||[]).length})</h3><small class="admin-section-note">Synchronisé avec Supabase · session réelle</small></div>${appRows || `<div class="settings-empty">Aucune connexion active.</div>`}</div>`);
+        return;
+      }
+
+      if (action === "professional-integrations") {
+        const r=await sb.from("professional_integrations").select("id,provider,status,connected_at").eq("user_id",state.user.id).order("connected_at",{ascending:false});
+        if(r.error) throw r.error;
+        const integrationRows=(r.data||[]).length ? (r.data||[]).map(x=>{const revoke=x.status==="active"?`<button class="ghost-action" data-action="revoke-professional-integration" data-id="${esc(x.id)}">Révoquer</button>`:""; return `<div class="settings-link-row"><span><b>${esc(x.provider)}</b><small>${esc(x.status||"active")} · ${timeAgo(x.connected_at)}</small></span>${revoke}</div>`}).join("") : `<div class="settings-empty">Aucune intégration professionnelle active.</div>`;
+        settingsDetail("Intégrations professionnelles","TAFAß • BUSINESS","Gérez les intégrations professionnelles connectées à votre compte.",
+          `<div class="settings-section-block"><h3>Intégrations</h3>${integrationRows}</div>`);
+        return;
+      }
+
+      if (["terms","privacy-policy","cookies","community-standards","about-tafass"].includes(action)) {
+        const docs={
+          "terms":{title:"Conditions de service",file:"terms.html",intro:"Les règles qui encadrent l’utilisation de Tafaß et les responsabilités liées au compte.",sections:[["Acceptation","L’utilisation de Tafaß suppose l’acceptation des règles applicables au service. Les fonctions peuvent évoluer et certaines peuvent être soumises à des conditions supplémentaires."],["Compte","Les informations de compte doivent rester aussi exactes que possible. Protégez vos moyens d’accès et ne partagez pas vos codes."],["Contenu","Vous restez responsable des contenus que vous publiez. N’utilisez pas Tafaß pour frauder, nuire, contourner les protections ou porter atteinte aux droits d’autrui."],["Interactions","Les commentaires, réactions, messages, partages et mentions doivent respecter les standards de la communauté."],["Publicité et Boost","Une campagne publicitaire doit suivre le processus prévu de création, paiement et validation. Une demande créée n’est pas automatiquement une campagne active."],["Monétisation","Les revenus et retraits sont soumis aux règles d’éligibilité, de sécurité et de traitement disponibles dans Tafaß."],["Restrictions","Certaines fonctions peuvent être limitées lorsqu’un risque de sécurité, un abus ou une violation des règles doit être examiné."],["Évolution du service","Tafaß peut modifier, améliorer ou interrompre temporairement certaines fonctions pour des raisons techniques, de sécurité ou d’évolution du produit."]]},
+          "privacy-policy":{title:"Politique de confidentialité",file:"privacy.html",intro:"Comprendre les informations traitées par Tafaß, leur utilisation et les contrôles disponibles.",sections:[["Informations de compte","Selon les fonctions utilisées, Tafaß peut traiter les informations de profil, les publications, les interactions, les notifications et les données nécessaires à la sécurité."],["Authentification","Les fournisseurs d’authentification peuvent transmettre les informations autorisées par leur flux. Tafaß ne demande pas votre mot de passe à un autre service."],["Fonctionnement","Les données servent à afficher les contenus, gérer les interactions, maintenir la session et fournir les fonctions demandées."],["Publicité","Les campagnes sponsorisées peuvent utiliser les critères de ciblage disponibles et autorisés. Les événements publicitaires servent à mesurer impressions, portée et clics."],["Sécurité","Les contrôles serveur et les permissions protègent les comptes et opérations sensibles, sans qu’un service en ligne puisse promettre une sécurité absolue."],["Conservation","Les informations peuvent être conservées pendant la durée nécessaire au fonctionnement, à la sécurité, à la prévention des abus et aux obligations applicables."],["Contrôle","Les réglages du compte permettent de gérer une partie de la visibilité, des notifications, de la recherche, de la présence et du blocage."]]},
+          "cookies":{title:"Politique d’utilisation des cookies",file:"cookies.html",intro:"Expliquer les cookies et mécanismes locaux nécessaires au fonctionnement de Tafaß.",sections:[["Fonctionnement local","Le navigateur peut conserver des données techniques nécessaires à la session, aux préférences et au fonctionnement de l’interface."],["Authentification","Certains mécanismes locaux participent au maintien de la session et à la sécurité du parcours de connexion."],["Préférences","Des informations locales peuvent mémoriser des choix d’interface ou de confort afin d’éviter de les redemander."],["Services externes","Un fournisseur externe peut utiliser ses propres mécanismes lorsque vous choisissez une fonction comme l’authentification correspondante."],["Contrôle navigateur","Vous pouvez contrôler certaines données locales dans les réglages du navigateur. Désactiver une donnée strictement nécessaire peut empêcher une fonction de fonctionner correctement."]]},
+          "community-standards":{title:"Standards de la communauté",file:"community-standards.html",intro:"Des règles communes pour préserver un espace utile, respectueux et sûr.",sections:[["Respect","Les échanges doivent rester respectueux. Le harcèlement, les menaces et les comportements destinés à nuire aux autres ne sont pas acceptés."],["Contenu dangereux ou illégal","N’utilisez pas Tafaß pour diffuser ou organiser des activités illégales, frauduleuses ou dangereuses."],["Fraude et manipulation","Les faux engagements, les manipulations destinées à tromper les utilisateurs et les contournements des protections peuvent entraîner des restrictions."],["Vie privée","Ne publiez pas inutilement les informations privées d’une autre personne et respectez les contrôles de confidentialité."],["Signalement","Utilisez les outils de signalement lorsque vous pensez qu’un compte ou un contenu nécessite un examen."],["Examen","Un signalement déclenche un processus d’examen ; il ne garantit pas automatiquement une mesure précise. Les décisions dépendent des règles et des éléments disponibles."]]},
+          "about-tafass":{title:"À propos de Tafaß",file:"about-tafass.html",intro:"Tafaß est pensé comme un espace social où profil, communauté, création et services complémentaires peuvent coexister dans une interface unique.",sections:[["Identité","Tafaß — Votre réseau. Votre communauté. L’application met l’accent sur une navigation claire, des profils accessibles depuis les contenus et des espaces séparés pour chaque usage."],["Actualités","Le fil rassemble les publications et interactions disponibles : textes, médias, réactions, commentaires, réponses et partage."],["Communauté","Amis, Messages, Alertes, Groupes et Pages structurent les relations et les espaces communautaires sans mélanger leurs fonctions."],["Création","Reels, vidéos, Creator Studio, musique et autres outils peuvent accompagner les utilisateurs qui souhaitent publier et développer leur contenu."],["Tafaß ADS","Le système publicitaire distingue les contenus sponsorisés des publications normales grâce à une identification dédiée. Le Boost suit un parcours de budget, paiement et validation."],["Enregistrements","La bibliothèque personnelle permet de conserver des publications utiles et de les retirer sans supprimer le contenu original."],["Confidentialité","Les réglages permettent de contrôler plusieurs dimensions de la visibilité et des interactions. La confidentialité est traitée comme une partie centrale de l’expérience."],["Évolution","Tafaß peut évoluer avec de nouvelles fonctions, améliorations de performance et outils communautaires. Les fonctionnalités affichées dans l’application correspondent à la version disponible sur l’appareil."]]}
+        };
+        const d=docs[action];
+        const body=d.sections.map(s=>`<article class="legal-long-block"><h4>${esc(s[0])}</h4><p>${esc(s[1])}</p></article>`).join("");
+        settingsDetail(d.title,"TAFAß • DOCUMENT OFFICIEL",d.intro,`<div class="settings-legal-long">${body}</div><div class="legal-document-actions"><a class="primary big legal-open-link" href="${esc(d.file)}" target="_blank" rel="noopener">Ouvrir le document complet ↗</a><button class="secondary-action big" data-route="settings">Retour aux paramètres</button></div>`);
+        return;
+      }
+
+      if (action === "accessibility-settings") {
+        const x=await getSettingsTable("accessibility_settings");
+        settingsDetail("Accessibilité","TAFAß • ACCESSIBILITÉ","Adaptez l’affichage et les interactions pour votre confort.",
+          `<div class="settings-section-block">${settingSwitch("largeText","Texte plus grand","Augmenter la taille des textes de l’interface.",x.large_text)}${settingSwitch("reduceMotion","Réduire les animations","Réduire les transitions et animations non essentielles.",x.reduce_motion)}${settingSwitch("highContrast","Contraste renforcé","Renforcer les contrastes pour une meilleure lisibilité.",x.high_contrast)}</div>
+           <button class="primary big settings-save" data-action="save-accessibility-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "effects-settings") {
+        const x=await getSettingsTable("effects_settings");
+        settingsDetail("Effets pour le visage et les mains","TAFAß • EFFETS","Gérez les effets disponibles sur votre appareil.",
+          `<div class="settings-section-block">${settingSwitch("effectsEnabled","Effets activés","Autoriser les effets compatibles avec votre appareil.",x.effects_enabled)}${settingSwitch("faceEffects","Effets pour le visage","Autoriser les effets liés au visage.",x.face_effects)}${settingSwitch("handEffects","Effets pour les mains","Autoriser les effets liés aux mains.",x.hand_effects)}</div>
+           <button class="primary big settings-save" data-action="save-effects-settings">Enregistrer</button>`);
+        return;
+      }
+
+      if (action === "information-management") {
+        settingsDetail("Comment gérer vos informations","TAFAß • VOS INFORMATIONS","Utilisez les contrôles ci-dessous pour comprendre et gérer les informations enregistrées dans Tafaß.",
+          `<div class="settings-section-block"><button class="settings-link-row" data-action="activity-settings"><span><b>Historique d’activité</b><small>Voir vos actions et recherches enregistrées</small></span><span>›</span></button><button class="settings-link-row" data-action="account-settings"><span><b>Informations du profil</b><small>Modifier les informations de votre profil</small></span><span>›</span></button><button class="settings-link-row" data-action="privacy-settings"><span><b>Confidentialité</b><small>Contrôler la visibilité de vos informations</small></span><span>›</span></button></div>`);
+        return;
+      }
+
+      settingsDetail("Paramètre Tafaß","TAFAß • PARAMÈTRES","Cette section est disponible dans votre compte.",`<div class="settings-empty">Aucun réglage supplémentaire n’est nécessaire pour le moment.</div>`);
+    } catch(e) {
+      console.error("Tafaß settings detail:", action, e);
+      settingsDetail("Paramètres","TAFAß • PARAMÈTRES","Impossible de charger ce réglage pour le moment.",`<div class="settings-empty">${esc(e?.message||"Service indisponible")}</div>`);
+    }
+  }
+
+  async function captureExactLocation(){
+    if(!navigator.geolocation) return toast("La géolocalisation n’est pas disponible sur cet appareil.");
+    const status=$("locationLiveStatus"); if(status) status.textContent="Recherche de votre position GPS exacte…";
+    navigator.geolocation.getCurrentPosition(async pos=>{
+      const lat=Number(pos.coords.latitude), lon=Number(pos.coords.longitude), accuracy=Number(pos.coords.accuracy||0);
+      let place="Position GPS";
+      try{
+        const u=`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1`;
+        const r=await fetch(u,{headers:{"Accept":"application/json","Accept-Language":"fr"}});
+        if(r.ok){const j=await r.json(); const a=j.address||{}; place=[a.road,a.suburb,a.city||a.town||a.village,a.state,a.country].filter(Boolean).join(", ")||j.display_name||place;}
+      }catch{}
+      const r=await sb.from("profile_locations").upsert({user_id:state.user.id,latitude:lat,longitude:lon,accuracy_m:accuracy,place_name:place,source:"device_gps",updated_at:new Date().toISOString()},{onConflict:"user_id"});
+      if(r.error) return toast(r.error.message);
+      await logActivity("location_updated",`Position exacte mise à jour · précision ${Math.round(accuracy)} m`,`location`);
+      toast(`Position enregistrée · précision ${Math.round(accuracy)} m`);
+      return openAdvancedSetting("location-settings");
+    },err=>{if(status)status.textContent="Autorisation refusée ou position indisponible."; toast(err.code===1?"Autorisez la localisation pour utiliser cette fonction.":"Position GPS indisponible.");},{enableHighAccuracy:true,timeout:15000,maximumAge:0});
+  }
+
+  async function applyNativeCaptureProtection(enabled){
+    try{
+      if(window.TafassAndroid?.setSecureFlag) await window.TafassAndroid.setSecureFlag(!!enabled);
+      else if(window.AndroidTafass?.setSecureFlag) window.AndroidTafass.setSecureFlag(!!enabled);
+      document.documentElement.classList.toggle("tafass-secure-content",!!enabled);
+    }catch(e){}
+  }
+
+  async function saveSettingsDetail(action) {
+    try {
+      if(action==="save-profile-lock") {
+        const visibility=$('profileLockToggle')?.checked?"private":"public";
+        const a=await sb.from("user_settings").upsert({user_id:state.user.id,profile_visibility:visibility},{onConflict:"user_id"});
+        if(a.error)return toast(a.error.message);
+        const b=await sb.from("privacy_protection_settings").upsert({user_id:state.user.id,capture_protection:$('protectCapture')?.checked!==false,private_media_longpress:$('protectLongPress')?.checked!==false,updated_at:new Date().toISOString()},{onConflict:"user_id"});
+        if(b.error)return toast(b.error.message);
+        await applyNativeCaptureProtection($('protectCapture')?.checked!==false);
+        await logActivity("profile_privacy_updated",visibility==="private"?"Profil verrouillé":"Profil déverrouillé","profile",state.user.id);
+        toast("Confidentialité du profil enregistrée");
+        return openAdvancedSetting("profile-lock");
+      }
+      if(action==="save-privacy-assistance") return saveUserSetting({allow_friend_requests:!!$('privacyFriend')?.checked,allow_messages:!!$('privacyMessage')?.checked,allow_search_by_phone:!!$('privacyPhone')?.checked,allow_search_by_email:!!$('privacyEmail')?.checked});
+      if(action==="save-find-contact-settings") return saveUserSetting({allow_friend_requests:!!$('findFriends')?.checked,allow_messages:!!$('findMessages')?.checked,allow_search_by_phone:!!$('findPhone')?.checked,allow_search_by_email:!!$('findEmail')?.checked});
+      if(action==="save-notification-settings") return saveUserSetting({notifications_enabled:!!$('notifAll')?.checked,message_notifications:!!$('notifMessages')?.checked,friend_notifications:!!$('notifFriends')?.checked,reaction_notifications:!!$('notifReactions')?.checked,comment_notifications:!!$('notifComments')?.checked});
+      if(action==="save-family-settings") return saveSettingsTable("family_settings",{safety_mode:!!$('familySafety')?.checked,contact_restrictions:!!$('familyContacts')?.checked},"Contrôles familiaux enregistrés");
+      if(action==="save-story-settings") return saveSettingsTable("story_settings",{allow_public_sharing:!!$('storyPublicShare')?.checked,allow_personal_sharing:!!$('storyPersonalShare')?.checked,allow_mention_sharing:!!$('storyMentionShare')?.checked,allow_story_sharing:!!$('storyShare')?.checked,archive_stories:!!$('storyArchive')?.checked,muted_stories_enabled:!!$('storyMuted')?.checked},"Réglages des stories enregistrés");
+      if(action==="save-publication-settings") return saveSettingsTable("publication_settings",{future_audience:$('futureAudience')?.value||"public",limit_old_posts:!!$('limitOldPosts')?.checked,comment_summaries:!!$('commentSummaries')?.checked,share_posts_to_story:!!$('sharePostsStory')?.checked},"Réglages des publications enregistrés");
+      if(action==="save-public-content-settings") return saveSettingsTable("public_content_settings",{followers_visibility:$('followersVisibility')?.value||"public",following_visibility:$('followingVisibility')?.value||"private",public_comments:$('publicComments')?.value||"public",public_post_notifications:!!$('publicNotifications')?.checked,public_profile_info:!!$('publicProfileInfo')?.checked,relevant_comments_first:!!$('relevantComments')?.checked,off_facebook_preview:!!$('offFacebookPreview')?.checked,blocklist_filter:!!$('blocklistFilter')?.checked},"Réglages du contenu public enregistrés");
+      if(action==="save-media-settings") return saveSettingsTable("media_settings",{data_saver:!!$('mediaSaver')?.checked,autoplay_videos:!!$('mediaAutoplay')?.checked,upload_quality:$('mediaQuality')?.value||"standard"},"Préférences multimédia enregistrées");
+      if(action==="time-limit-intro"){ const mins=(state.timeLimitRuntime?.activeSeconds||0)/60; return showTimeLimitOverlay('warning',mins); }
+      if(action==="save-time-settings") return saveSettingsTable("time_management_settings",{daily_limit_minutes:Number($('timeLimit')?.value||0),reminders_enabled:!!$('timeReminders')?.checked,quiet_start:$('quietStart')?.value||"22:00",quiet_end:$('quietEnd')?.value||"06:00"},"Gestion du temps enregistrée");
+      if(action==="save-reaction-settings") return saveSettingsTable("reaction_settings",{show_reaction_counts:!$('reactionCounts')?.checked,personalized_reactions:!!$('reactionPersonalized')?.checked},"Préférences des réactions enregistrées");
+      if(action==="save-audience-setting") return saveSettingsTable("audience_settings",{[$('audienceValue')?.closest('label')?.querySelector('select')?.id?($('audienceValue')?.id):"default_post_audience"]:$('audienceValue')?.value||"public"},"Audience enregistrée").then(()=>{});
+      if(action==="save-followers-settings") return saveSettingsTable("audience_settings",{followers_visibility:$('followersVisibility')?.value||"public"},"Audience des followers enregistrée");
+      if(action==="save-profile-identification") return saveSettingsTable("profile_identification_settings",{allow_tagging:!!$('tagging')?.checked,review_tags:!!$('reviewTags')?.checked,search_engine_index:!!$('searchIndex')?.checked},"Préférences de profil enregistrées");
+      if(action==="save-online-settings") return saveSettingsTable("online_status_settings",{visible:!!$('onlineVisible')?.checked,last_seen_visible:!!$('lastSeen')?.checked},"Statut En ligne enregistré");
+      if(action==="save-location-settings") return saveSettingsTable("location_settings",{profile_location_enabled:!!$('profileLocation')?.checked,precise_location_enabled:!!$('preciseLocation')?.checked},"Préférences de localisation enregistrées");
+      if(action==="save-professional-settings") return saveSettingsTable("professional_settings",{enabled:!!$('professionalEnabled')?.checked},"Mode professionnel enregistré");
+      if(action==="save-accessibility-settings") return saveSettingsTable("accessibility_settings",{large_text:!!$('largeText')?.checked,reduce_motion:!!$('reduceMotion')?.checked,high_contrast:!!$('highContrast')?.checked},"Accessibilité enregistrée");
+      if(action==="save-effects-settings") return saveSettingsTable("effects_settings",{effects_enabled:!!$('effectsEnabled')?.checked,face_effects:!!$('faceEffects')?.checked,hand_effects:!!$('handEffects')?.checked},"Préférences des effets enregistrées");
+    } catch(e) { toast(e?.message||"Impossible d’enregistrer ce réglage."); }
+  }
+
+  async function securitySettings() {
+    const user=state.user;
+    if(!user) return toast("Session introuvable.");
+    let session=null, factors=[], activities=[];
+    try{
+      const sr=await sb.auth.getSession(); session=sr.data?.session||null;
+      const mr=await sb.auth.mfa?.listFactors?.(); factors=mr?.data?.all||[];
+      const ar=await sb.from("activity_history").select("id,action_type,description,created_at").eq("user_id",user.id).order("created_at",{ascending:false}).limit(8);
+      activities=ar.data||[];
+    }catch(e){ console.warn('[TAFAß V48] security load:',e); }
+    const verified=factors.filter(f=>f.status==='verified');
+    const pending=factors.filter(f=>f.status!=='verified');
+    const created=session?.user?.created_at||user.created_at;
+    const lastSignIn=session?.user?.last_sign_in_at||user.last_sign_in_at;
+    const fmt=d=>d?new Date(d).toLocaleString('fr-FR',{dateStyle:'medium',timeStyle:'short'}):'—';
+    openModal(`<div class="modal-box security-center-v48"><button class="modal-close" data-action="close-modal">×</button>
+      <div class="security-hero-v48"><div class="security-shield-v48">🛡️</div><div><span class="eyebrow">TAFAß • SECURITY CENTER</span><h3>Sécurité et connexion</h3><p>Renforcez la protection de votre compte et contrôlez vos sessions.</p></div></div>
+      <div class="security-status-grid-v48"><div><span>Compte</span><b>${esc(user.email||'Compte Tafaß')}</b></div><div><span>2FA</span><b class="${verified.length?'ok':''}">${verified.length?'Activée':'Non activée'}</b></div><div><span>Dernière connexion</span><b>${esc(fmt(lastSignIn))}</b></div><div><span>Compte créé</span><b>${esc(fmt(created))}</b></div></div>
+      <section class="security-card-v48"><div class="security-card-head-v48"><div><b>🔐 Authentification à deux facteurs</b><small>Ajoutez une deuxième étape avec une application d’authentification.</small></div><span class="security-pill-v48 ${verified.length?'on':''}">${verified.length?'PROTÉGÉ':'À CONFIGURER'}</span></div>
+        ${verified.length?`<div class="security-factor-row-v48"><span>✓ Facteur TOTP vérifié</span><button class="danger-outline-v48" data-action="mfa-unenroll" data-factor-id="${esc(verified[0].id)}">Désactiver</button></div>`:`<button class="primary big" data-action="mfa-enroll">Activer la 2FA</button>`}
+        ${pending.length?`<small class="security-note-v48">Une configuration 2FA incomplète existe. Vous pouvez relancer l’activation.</small>`:''}
+      </section>
+      <section class="security-card-v48"><div class="security-card-head-v48"><div><b>💻 Session actuelle</b><small>Cette session est authentifiée par Supabase.</small></div><span class="security-pill-v48 on">ACTIVE</span></div><div class="security-session-v48"><span>Utilisateur</span><b>${esc(user.email||'—')}</b><span>Expiration</span><b>${esc(fmt(session?.expires_at?Number(session.expires_at)*1000:null))}</b></div><button class="ghost-action big" data-action="security-global-logout">Déconnecter toutes les sessions</button></section>
+      <section class="security-card-v48"><div class="security-card-head-v48"><div><b>🔑 Mot de passe</b><small>Utilisez un mot de passe unique et suffisamment long.</small></div></div><div class="form-stack"><label>Nouveau mot de passe<input id="newPassword" type="password" minlength="8" autocomplete="new-password" placeholder="Au moins 8 caractères"></label><label>Confirmer<input id="confirmPassword" type="password" minlength="8" autocomplete="new-password" placeholder="Répétez le mot de passe"></label><button class="primary big" data-action="change-password">Modifier le mot de passe</button></div></section>
+      <section class="security-card-v48"><div class="security-card-head-v48"><div><b>🧾 Activité de sécurité</b><small>Les dernières actions enregistrées sur votre compte.</small></div></div><div class="security-activity-v48">${activities.length?activities.map(a=>`<div><span class="security-activity-dot"></span><div><b>${esc(a.description||a.action_type||'Activité')}</b><small>${esc(fmt(a.created_at))}</small></div></div>`).join(''):`<div class="muted">Aucune activité récente.</div>`}</div></section>
+      <div class="security-footer-v48"><button class="ghost-action" data-action="new-logout">Se déconnecter de cet appareil</button></div>
+    </div>`);
+  }
+
+  async function enrollMFA(){
+    try{
+      if(!sb.auth.mfa?.enroll) return toast("La 2FA n’est pas disponible dans cette configuration.");
+      const existing=(await sb.auth.mfa.listFactors()).data?.all||[];
+      const unverified=existing.filter(f=>f.status!=='verified');
+      for(const f of unverified){ try{await sb.auth.mfa.unenroll({factorId:f.id});}catch(_){} }
+      const r=await sb.auth.mfa.enroll({factorType:'totp',friendlyName:'Tafaß Authenticator'});
+      if(r.error) throw r.error;
+      const f=r.data;
+      openModal(`<div class="modal-box security-mfa-v48"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • 2FA</span><h3>Configurer l’authentification à deux facteurs</h3><p class="muted">Scannez le QR code avec Google Authenticator, Microsoft Authenticator ou une application TOTP compatible.</p><div class="mfa-qr-v48">${f.totp?.qr_code?`<img src="${esc(f.totp.qr_code)}" alt="QR code 2FA">`:`<div class="mfa-secret-v48">QR indisponible</div>`}</div><div class="mfa-secret-v48"><span>Clé secrète</span><b>${esc(f.totp?.secret||'—')}</b></div><label class="mfa-code-v48">Code à 6 chiffres<input id="mfaVerifyCode" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="000000"></label><button class="primary big" data-action="mfa-verify" data-factor-id="${esc(f.id)}">Vérifier et activer</button></div>`);
+    }catch(e){ toast(e?.message||"Impossible d’activer la 2FA."); }
+  }
+  async function verifyMFA(factorId){
+    const code=String($("mfaVerifyCode")?.value||'').replace(/\D/g,'');
+    if(code.length!==6)return toast("Entrez le code à 6 chiffres.");
+    try{
+      const c=await sb.auth.mfa.challenge({factorId}); if(c.error)throw c.error;
+      const v=await sb.auth.mfa.verify({factorId,challengeId:c.data.id,code}); if(v.error)throw v.error;
+      closeModal(); toast("2FA activée avec succès."); await logActivity("mfa_enabled","Authentification à deux facteurs activée","security"); return securitySettings();
+    }catch(e){ toast(e?.message||"Code 2FA invalide."); }
+  }
+  async function unenrollMFA(factorId){
+    if(!factorId)return;
+    if(!confirm("Désactiver l’authentification à deux facteurs ?"))return;
+    try{ const r=await sb.auth.mfa.unenroll({factorId}); if(r.error)throw r.error; toast("2FA désactivée."); await logActivity("mfa_disabled","Authentification à deux facteurs désactivée","security"); return securitySettings(); }
+    catch(e){ toast(e?.message||"Impossible de désactiver la 2FA."); }
+  }
+  async function globalSecurityLogout(){
+    try{ const r=await sb.auth.signOut({scope:'global'}); if(r.error)throw r.error; toast("Toutes les sessions ont été déconnectées."); }
+    catch(e){ toast(e?.message||"Impossible de fermer toutes les sessions."); }
+  }
+
+  function settingInfo(name) {
+    const bodies = {
+      "Compte":"Modifiez vos informations personnelles depuis votre Profil.",
+      "Sécurité et connexion":"Votre session Tafaß est protégée par l’authentification Supabase. Utilisez la déconnexion pour fermer immédiatement cette session.",
+      "Paiement":"Les informations de paiement seront conservées dans les fonctions de paiement activées par Tafaß.",
+      "Aide":"Utilisez cette section pour consulter l’aide et l’assistance Tafaß.",
+      "Politique de confidentialité":"Gérez qui peut voir votre profil et comment les autres membres peuvent vous contacter.",
+      "Historique d'activité":"Les actions enregistrées par Tafaß peuvent être consultées dans votre historique.",
+      "Recherche":"Les recherches effectuées peuvent être enregistrées dans votre historique de recherche."
+    };
+    openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><h3>${esc(name)}</h3><p class="muted" style="font-size:12px;line-height:1.65">${esc(bodies[name] || "Cette section est disponible dans les paramètres de votre compte.")}</p><button class="primary big" data-action="close-modal">Fermer</button></div>`);
+  }
+
+  async function logActivity(action_type, description, entity_type = "", entity_id = null) {
+    if (!state.user) return;
+    await sb.from("activity_history").insert({ user_id: state.user.id, action_type, description, entity_type, entity_id });
+  }
+
+  function createTafabListing() {
+    openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • OFFRE</span><h3>Publier une offre</h3><div class="form-stack"><label>Titre<input id="listingTitle" placeholder="Ex. Eau potable disponible" required></label><label>Description<textarea id="listingDesc" placeholder="Décrivez l'offre, la quantité et la livraison"></textarea></label><div class="grid2"><label>Prix<input id="listingPrice" type="number" min="0" placeholder="Prix"></label><label>Devise<select id="listingCurrency"><option value="MGA">MGA</option><option value="EUR">EUR</option><option value="USD">USD</option></select></label></div><label>Lieu<input id="listingLocation" placeholder="Ville / zone"></label><label>Téléphone<input id="listingPhone" type="tel" placeholder="Numéro de contact"></label><button class="primary big" data-action="save-tafab-listing">Publier</button></div></div>`);
+  }
+
+  async function saveTafabListing() {
+    const title=$("listingTitle")?.value.trim();
+    if (!title) return toast("Ajoutez un titre.");
+    const r=await sb.from("tafab_listings").insert({ seller_id:state.user.id, title, description:$("listingDesc")?.value.trim()||"", category:"eau", price:$("listingPrice")?.value?Number($("listingPrice").value):null, currency:$("listingCurrency")?.value||"MGA", location:$("listingLocation")?.value.trim()||null, phone:$("listingPhone")?.value.trim()||null, status:"active" }).select().single();
+    if(r.error) return toast(r.error.message);
+    await logActivity("tafab_listing_created", "Offre Tafaß publiée", "tafab_listing", r.data.id);
+    closeModal(); toast("Offre publiée"); await tafabPage();
+  }
+
+  function safeHttpUrl(value, {allowEmpty=true}={}) {
+    const raw=String(value||'').trim();
+    if(!raw) return allowEmpty ? null : '';
+    try {
+      const u=new URL(raw);
+      if(!['http:','https:'].includes(u.protocol)) return null;
+      return u.href;
+    } catch (_) { return null; }
+  }
+
+  function createTafabAd() {
+    openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • PUBLICITÉ</span><h3>Publier une publicité</h3><div class="form-stack"><label>Titre<input id="adTitle" placeholder="Titre de la publicité" required></label><label>Description<textarea id="adDesc" placeholder="Votre message publicitaire"></textarea></label><label>Image URL <span class="muted-inline">(optionnel)</span><input id="adImage" type="url" placeholder="https://..."></label><label>Lien <span class="muted-inline">(optionnel)</span><input id="adUrl" type="url" placeholder="https://..."></label><button class="primary big" data-action="save-tafab-ad">Publier</button></div></div>`);
+  }
+
+  async function saveTafabAd() {
+    const title=$("adTitle")?.value.trim();
+    if(!title) return toast("Ajoutez un titre.");
+    const imageUrl=safeHttpUrl($("adImage")?.value, {allowEmpty:true});
+    const targetUrl=safeHttpUrl($("adUrl")?.value, {allowEmpty:true});
+    if($("adImage")?.value.trim() && !imageUrl) return toast("L’URL de l’image doit commencer par http:// ou https://.");
+    if($("adUrl")?.value.trim() && !targetUrl) return toast("Le lien doit commencer par http:// ou https://.");
+    const r=await sb.from("tafab_ads").insert({ owner_id:state.user.id, title, description:$("adDesc")?.value.trim()||"", image_url:$("adImage")?.value.trim()||null, target_url:$("adUrl")?.value.trim()||null, status:"active" }).select().single();
+    if(r.error) return toast(r.error.message);
+    await logActivity("tafab_ad_created", "Publicité Tafaß publiée", "tafab_ad", r.data.id);
+    closeModal(); toast("Publicité publiée"); await tafabPage();
+  }
+
+  async function contactTafabListing(id) {
+    const {data:x,error}=await sb.from("tafab_listings").select("*").eq("id",id).maybeSingle();
+    if(error||!x) return toast(error?.message||"Offre introuvable");
+    openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • CONTACT</span><h3>${esc(x.title)}</h3><p class="muted">${esc(x.description||"")}</p><div class="form-stack"><label>Votre message<textarea id="listingMessage" placeholder="Bonjour, je souhaite connaître la disponibilité et les conditions..."></textarea></label><button class="primary big" data-action="send-tafab-message" data-id="${esc(x.id)}">Envoyer</button>${x.phone?`<small class="muted">Contact vendeur : ${esc(x.phone)}</small>`:""}</div></div>`);
+  }
+
+  async function sendTafabMessage(id) {
+    const message=$("listingMessage")?.value.trim(); if(!message)return toast("Écrivez un message.");
+    const r=await sb.from("tafab_listing_messages").insert({listing_id:id,sender_id:state.user.id,message});
+    if(r.error)return toast(r.error.message);
+    await logActivity("tafab_message_sent", "Message envoyé sur une offre Tafaß", "tafab_listing", id);
+    closeModal(); toast("Message envoyé en temps réel");
+  }
+
+  const PAGE_ICONS = {
+    home:"home", friends:"friends", messages:"messages", notifications:"history", profile:"profile",
+    reels:"reels", groups:"groups", saved:"saved", menu:"settings", tafab:"tafab",
+    settings:"settings", search:"search", activity:"history", payment:"payment", help:"help"
+  };
+  function pageTitleIcon(routeOrTitle) {
+    const type = PAGE_ICONS[routeOrTitle] || (String(routeOrTitle).toLowerCase().includes("message") ? "messages" : String(routeOrTitle).toLowerCase().includes("ami") ? "friends" : "settings");
+    return menuIcon(type);
+  }
+  function decoratePageHeader(route = state.route) {
+    const root = $("content")?.firstElementChild;
+    if (!root || route === "home") return;
+    const header = root.querySelector(".page-header");
+    if (!header) return;
+    const h = header.querySelector("h1,h2,h3");
+    if (h && !h.querySelector(".page-title-logo")) h.insertAdjacentHTML("afterbegin", `<span class="page-title-logo" aria-hidden="true">${pageTitleIcon(route)}</span>`);
+    if (!header.querySelector('[data-action="page-back"]') && !header.querySelector("[data-page-back]")) {
+      const back = document.createElement("button");
+      back.type = "button"; back.className = "page-back"; back.dataset.action = "page-back";
+      back.setAttribute("aria-label", "Retour"); back.innerHTML = `<span aria-hidden="true">‹</span><small>Retour</small>`;
+      header.insertBefore(back, header.firstChild);
+    }
+  }
+  function goBack() {
+    if (state.backOverride) {
+      const target = state.backOverride; state.backOverride = null;
+      state.renderToken++; state.route = target; state.selectedConversation = null;
+      state.navStack = [...state.navStack.filter(r => r !== target), target];
+      history.replaceState(null, "", "#" + target);
+      return render();
+    }
+    if (state.navStack.length > 1) {
+      state.navStack.pop();
+      const previous = state.navStack[state.navStack.length - 1] || "home";
+      state.renderToken++; state.route = previous; state.selectedConversation = null;
+      history.replaceState(null, "", "#" + previous);
+      return render();
+    }
+    return navigate("home", { replaceStack: true });
+  }
+  function simplePage(title, body) {
+    const clean = ["Amis","Messages","Alertes","Tafaß","Menu","Rechercher","Pages","Groupes","Reels","Enregistrements","Para & Conf","Profil","Aide","Paiement","Historique d'activité"].includes(title) || (state.route === "settings" && !!state.settingsDetailAction);
+    const fbHub = ["Pages","Groupes"].includes(title) && String(body).includes("fb-hub");
+    const customSettingsHeader = title === "Para & Conf";
+    $("content").innerHTML = clean
+      ? `<section class="clean-page clean-page-shell ${fbHub?"fb-shell":""} ${customSettingsHeader?"settings-shell":""}">${fbHub || customSettingsHeader ? "" : `<div class="page-header clean-page-header"><div><h2>${esc(title)}</h2></div></div>`}${body}</section>`
+      : `<div class="card"><div class="page-header"><h2>${esc(title)}</h2></div>${body}</div>`;
+    decoratePageHeader(state.route);
+  }
+  function openModal(html) { $("modal").className = "modal"; $("modal").innerHTML = html; document.body.classList.add("modal-open"); }
+  function closeModal() { $("modal").className = "modal hidden"; $("modal").innerHTML = ""; document.body.classList.remove("modal-open"); }
+  // Confirmation premium interne : aucun confirm() natif ne doit exposer l'URL de l'application.
+  const premiumConfirmResolvers = new Map();
+  function premiumConfirm(title, message, confirmLabel="Confirmer", danger=false){
+    return new Promise(resolve=>{
+      const token=`pc_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      premiumConfirmResolvers.set(token,resolve);
+      openModal(`<div class="modal-box premium-confirm-modal-v2 ${danger?"danger":""}">
+        <button class="modal-close" data-action="premium-confirm-cancel" data-token="${esc(token)}">×</button>
+        <div class="premium-confirm-icon-v2">${danger?'!':'✓'}</div>
+        <span class="eyebrow">TAFAß · CONFIRMATION SÉCURISÉE</span>
+        <h3>${esc(title)}</h3>
+        <p>${esc(message)}</p>
+        <div class="premium-confirm-actions-v2">
+          <button type="button" class="secondary-action" data-action="premium-confirm-cancel" data-token="${esc(token)}">Annuler</button>
+          <button type="button" class="primary ${danger?'danger':''}" data-action="premium-confirm-ok" data-token="${esc(token)}">${esc(confirmLabel)}</button>
+        </div>
+      </div>`);
+    });
+  }
+  function resolvePremiumConfirm(token,value){
+    const fn=premiumConfirmResolvers.get(token);
+    if(!fn)return;
+    premiumConfirmResolvers.delete(token);
+    closeModal();
+    fn(!!value);
+  }
+
+  const premiumPromptResolvers = new Map();
+  function premiumPrompt(title,message,defaultValue="",submitLabel="Envoyer"){
+    return new Promise(resolve=>{
+      const token=`pp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      premiumPromptResolvers.set(token,resolve);
+      openModal(`<div class="modal-box premium-confirm-modal-v2 premium-prompt-v2">
+        <button class="modal-close" data-action="premium-prompt-cancel" data-token="${esc(token)}">×</button>
+        <div class="premium-confirm-icon-v2">✎</div>
+        <span class="eyebrow">TAFAß · FORMULAIRE SÉCURISÉ</span>
+        <h3>${esc(title)}</h3><p>${esc(message)}</p>
+        <textarea id="premiumPromptInput" class="premium-input" maxlength="800" placeholder="Votre réponse…">${esc(defaultValue)}</textarea>
+        <div class="premium-confirm-actions-v2"><button type="button" class="secondary-action" data-action="premium-prompt-cancel" data-token="${esc(token)}">Annuler</button><button type="button" class="primary" data-action="premium-prompt-ok" data-token="${esc(token)}">${esc(submitLabel)}</button></div>
+      </div>`);
+      setTimeout(()=>document.getElementById('premiumPromptInput')?.focus(),30);
+    });
+  }
+  function resolvePremiumPrompt(token,value){
+    const fn=premiumPromptResolvers.get(token);
+    if(!fn)return;
+    premiumPromptResolvers.delete(token);
+    closeModal();
+    fn(value);
+  }
+
+  function cleanOAuthCallbackUrl(){
+    try{
+      const u=new URL(window.location.href);
+      const oauthKeys=['code','access_token','refresh_token','expires_in','expires_at','token_type','type'];
+      const hasOAuth=oauthKeys.some(k=>u.searchParams.has(k)) || /(^|&)access_token=|(^|&)refresh_token=/.test(String(window.location.hash||''));
+      if(!hasOAuth)return;
+      history.replaceState(null,document.title,u.pathname + (u.searchParams.has('reset')?('?reset='+encodeURIComponent(u.searchParams.get('reset'))):'') );
+    }catch(_){ }
+  }
+
+  function ensurePageLoader() {
+    let el = document.getElementById("pageLoader");
+    if (!el) { el = document.createElement("div"); el.id = "pageLoader"; el.className = "page-loader"; el.innerHTML = '<span></span>'; document.body.appendChild(el); }
+    return el;
+  }
+  let pageLoading = false;
+  let pageLoadingToken = 0;
+  function beginPageLoading(token = 0) {
+    pageLoading = true;
+    pageLoadingToken = token;
+    ensurePageLoader().classList.add("active");
+    document.body.classList.add("page-loading");
+  }
+  function endPageLoading(token = 0) {
+    // A stale render must never unlock navigation while a newer render is active.
+    if (token && token !== pageLoadingToken) return;
+    const el = ensurePageLoader();
+    // Do not block taps while the tiny visual transition finishes.
+    pageLoading = false;
+    document.body.classList.remove("page-loading");
+    el.classList.add("done");
+    setTimeout(() => { el.classList.remove("active","done"); }, 90);
+  }
+
+
+  async function tafaV74IsAdmin(){
+    try{ if(state.__isAdmin===true)return true; const {data}=await sb.from('profiles').select('is_admin,admin_badge').eq('id',state.user?.id||'').maybeSingle(); const ok=data?.is_admin===true||data?.admin_badge===true; if(ok)state.__isAdmin=true; return !!ok; }catch(_){return false;}
+  }
+  async function tafaV74LoadPlatformWallet(){
+    if(!state.user?.id)return null;
+    const r=await sb.from('tafa_platform_wallets_v74').select('coins,earnings_mga,lifetime_earnings_mga,total_withdrawn_mga,referral_code,referral_uses').eq('user_id',state.user.id).maybeSingle();
+    return r.data||null;
+  }
+  async function tafaV74OpenAdminWithdrawal(){
+    const ok=await tafaV74IsAdmin(); if(!ok)return toast('Accès réservé à l’administration.');
+    const w=await tafaV74LoadPlatformWallet(); const available=Number(w?.earnings_mga||0);
+    if(available<1000)return toast('Solde disponible insuffisant : minimum 1 000 Ar.');
+    const methods=await sb.from('tafab_creator_payout_methods').select('id,provider,phone,account_name,bank_name,bank_account,status').eq('user_id',state.user.id).eq('status','active').in('provider',['mvola','orange_money','airtel_money']).order('is_default',{ascending:false});
+    const rows=(methods.data||[]).map(m=>`<option value="${esc(m.id)}">${esc(({mvola:'MVola',orange_money:'Orange Money',airtel_money:'Airtel Money',bank:'Banque'})[m.provider]||m.provider)} · ${esc(m.provider==='bank'?(m.bank_name||'Banque'):m.phone||'')}</option>`).join('');
+    openModal(`<div class="modal-box monet-modal tafa-v74-admin-withdraw"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß · ADMIN</span><h3>Retrait prioritaire</h3><p class="muted">Solde disponible : <b>${available.toLocaleString('fr-FR')} Ar</b>. Le retrait admin est disponible dès que le solde atteint 1 000 Ar.</p><label>Montant (Ar)<input id="v74AdminWithdrawAmount" type="number" min="1000" max="${available}" step="100" value="${Math.max(1000,Math.floor(available))}"></label><label>Moyen<select id="v74AdminWithdrawMethod" class="premium-input">${rows||'<option value="">Aucun moyen actif</option>'}</select></label><button class="primary big" data-action="v74-admin-withdraw">Retirer maintenant</button></div>`);
+  }
+  async function tafaV74SubmitAdminWithdrawal(){
+    const amount=Math.floor(Number($('v74AdminWithdrawAmount')?.value||0)), method=$('v74AdminWithdrawMethod')?.value||'';
+    if(amount<1000)return toast('Minimum : 1 000 Ar.'); if(!method)return toast('Ajoutez un moyen de retrait actif.');
+    const r=await sb.rpc('tafa_admin_request_platform_withdrawal_v74',{p_amount_mga:amount,p_payout_method_id:method});
+    if(r.error)return toast(r.error.message);
+    closeModal();
+    const payout=await sb.functions.invoke('tafa-payout',{body:{request_id:r.data,kind:'platform'}});
+    if(payout.error) return toast('Demande enregistrée, mais le service de paiement est indisponible. Le retrait reste visible dans l’historique.');
+    if(payout.data?.ok) toast(`Paiement envoyé · ${payout.data.reference||'référence reçue'}`);
+    else if(payout.data?.status==='processing') toast('Paiement transmis au prestataire. Statut : en traitement.');
+    else toast(payout.data?.error||'Demande enregistrée. Le paiement doit encore être traité.');
+    return creatorMonetisationPage();
+  }
+  async function tafaV74ShowAdminUsers(){
+    if(!(await tafaV74IsAdmin()))return toast('Accès réservé à l’administration.');
+    const r=await sb.rpc('tafa_admin_list_users',{p_limit:200,p_offset:0}); if(r.error)return toast(r.error.message);
+    const rows=(r.data||[]).map(u=>{
+      const nm=([u.first_name,u.last_name].filter(Boolean).join(' ')||u.username||u.email||'Compte');
+      const st=String(u.account_status||'active');
+      const label=st==='blocked'?'Bloqué':st==='restricted'?'Restreint':st==='deleted'?'Supprimé':'Actif';
+      const cls=st==='blocked'?'blocked':st==='restricted'?'pending':st==='deleted'?'rejected':'paid';
+      return `<div class="v75-admin-user-row"><div class="v75-user-identity">${avatarHTML(u,'avatar')}<div><b>${esc(nm)}</b><small>${u.username?`@${esc(u.username)}`:'Compte Tafaß'}</small></div></div><div class="v75-user-email">${esc(u.email||'—')}</div><div><span class="admin-status ${cls}">${label}</span></div><div><button class="ghost-action" data-action="admin-user-manage" data-id="${esc(u.id)}" data-status="${esc(st)}">Gérer</button></div></div>`;
+    }).join('')||'<div class="empty">Aucun compte.</div>';
+    openModal(`<div class="modal-box v74-admin-users-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß · COMPTES</span><h3>Tous les comptes utilisateurs</h3><div class="v74-admin-user-list">${rows}</div></div>`);
+  }
+
+  async function creatorMonetisationPage(){
+    const uid=state.user.id;
+    const [walletR,profileR,methodsR,withdrawR,ledgerR,papiR,platformR,referralR]=await Promise.all([
+      sb.from('tafab_wallets').select('coins,earnings_mga,pending_earnings_mga,lifetime_earnings_mga,total_withdrawn_mga,updated_at').eq('user_id',uid).maybeSingle(),
+      sb.from('tafab_creator_monetization').select('*').eq('user_id',uid).maybeSingle(),
+      sb.from('tafab_creator_payout_methods').select('id,provider,phone,account_name,is_default,status,created_at').eq('user_id',uid).order('is_default',{ascending:false}).order('created_at',{ascending:false}),
+      sb.from('tafab_withdrawal_requests').select('id,amount_mga,method,destination_hint,status,created_at,processed_at,admin_note,provider_reference,payout_attempts,last_payout_error').eq('user_id',uid).order('created_at',{ascending:false}).limit(30),
+      sb.from('tafab_creator_earnings').select('id,source_type,gross_mga,platform_fee_mga,net_mga,status,description,created_at').eq('creator_id',uid).order('created_at',{ascending:false}).limit(30),
+      sb.from('tafab_papi_payments').select('id,reference,amount_mga,coins,provider,payment_method,payment_status,created_at,paid_at').eq('user_id',uid).order('created_at',{ascending:false}).limit(20),
+      sb.from('tafa_platform_wallets_v74').select('coins,earnings_mga,pending_earnings_mga,lifetime_earnings_mga,total_withdrawn_mga,referral_code,referral_uses').eq('user_id',uid).maybeSingle(),
+      sb.from('tafa_referral_rewards_v88').select('id',{count:'exact',head:true}).eq('referrer_user_id',uid)
+    ]);
+    const w=walletR.data||{coins:0,earnings_mga:0,pending_earnings_mga:0,lifetime_earnings_mga:0,total_withdrawn_mga:0};
+    const isAdminAccount=await tafaV74IsAdmin();
+    const platformWithdrawR=isAdminAccount ? await sb.from('tafa_admin_withdrawals_v74').select('id,amount_mga,status,created_at,processed_at,admin_note,provider_reference,payout_attempts,last_payout_error,payout_method_id').eq('admin_user_id',uid).order('created_at',{ascending:false}).limit(30) : {data:[]};
+    const platformWithdrawals=platformWithdrawR.data||[];
+    const mp={...(profileR.data||{status:'not_requested',enabled:false,min_withdrawal_mga:1000,revenue_share_percent:70,coins_to_mga:10}),...(isAdminAccount?{status:'approved',enabled:true,revenue_share_percent:100}: {})};
+    const methods=methodsR.data||[], withdrawals=withdrawR.data||[], ledger=ledgerR.data||[], papiPayments=papiR.error?[]:(papiR.data||[]), platform=platformR.data||null;
+    const referralUses=referralR?.error ? Number(platform?.referral_uses||0) : Number(referralR?.count||0);
+    const statusLabel={not_requested:'Non activé',pending:'En cours de vérification',approved:'Monétisation active',suspended:'Suspendue'}[mp.status]||mp.status||'Non activé';
+    const providerLabel={mvola:'MVola',orange_money:'Orange Money',airtel_money:'Airtel Money',bank:'Banque'};
+    const available=Number(w.earnings_mga||0), pending=Number(w.pending_earnings_mga||0), lifetime=Number(w.lifetime_earnings_mga||0), withdrawn=Number(w.total_withdrawn_mga||0), coins=Number(w.coins||0);
+    const conversionCoins=Math.max(1,Number(mp.coins_to_mga||10));
+    const methodRows=methods.map(m=>`<div class="monet-row"><div><b>${esc(providerLabel[m.provider]||m.provider)}</b><small>${m.provider==='bank'?esc((m.bank_name||'Banque')+' · '+(m.bank_account||'')):esc(m.phone||'')} · ${esc(m.account_name||'')}</small></div><span class="monet-pill ${m.status==='active'?'ok':''}">${m.status==='active'?'Actif':'Désactivé'}</span></div>`).join('')||'<div class="empty">Aucun moyen de retrait enregistré.</div>';
+    const earningRows=ledger.map(x=>`<div class="monet-row"><div><b>${esc(x.description||x.source_type||'Revenu')}</b><small>${timeAgo(x.created_at)} · ${esc(x.status||'available')}</small></div><strong>+${Number(x.net_mga||0).toLocaleString('fr-FR')} Ar</strong></div>`).join('')||'<div class="empty">Aucun revenu enregistré pour le moment.</div>';
+    const papiRows=papiPayments.map(x=>{const st=x.payment_status==='SUCCESS'?'Payé':x.payment_status==='FAILED'?'Échec':'En attente'; return `<div class="monet-row papi-payment-row"><div><b>🟢 ${Number(x.coins||0).toLocaleString('fr-FR')} coins · ${Number(x.amount_mga||0).toLocaleString('fr-FR')} Ar</b><small>${esc(x.payment_method||x.provider||'Papi')} · ${timeAgo(x.created_at)}</small></div><span class="monet-pill ${x.payment_status==='SUCCESS'?'ok':x.payment_status==='FAILED'?'bad':''}">${st}</span></div>`;}).join('')||'<div class="empty">Aucun achat Papi.</div>';
+    const withdrawalRows=withdrawals.map(x=>{const st=x.status==='paid'?'Payé':x.status==='processing'?'En traitement':x.status==='failed'?'Échec':x.status==='approved'?'Validé':x.status==='rejected'?'Refusé':'En attente'; const cls=x.status==='paid'?'ok':(['rejected','failed'].includes(x.status)?'bad':''); const ref=x.provider_reference?` · Réf. ${esc(x.provider_reference)}`:''; const err=x.last_payout_error?` · ${esc(x.last_payout_error)}`:''; return `<div class="monet-row"><div><b>${Number(x.amount_mga||0).toLocaleString('fr-FR')} Ar · ${esc(providerLabel[x.method]||x.method||'Mobile Money')}</b><small>${esc(x.destination_hint||'')} · ${timeAgo(x.created_at)}${ref}${x.admin_note?' · '+esc(x.admin_note):''}${err}</small></div><span class="monet-pill ${cls}">${st}</span></div>`;}).join('')||'<div class="empty">Aucune demande de retrait.</div>';
+    const actions=isAdminAccount
+      ? ''
+      : mp.status==='approved'
+        ? `<button class="primary" data-action="request-withdrawal">💸 Retirer mes revenus</button><button class="secondary-action" data-action="add-payout-method">＋ Moyen de retrait</button>`
+        : mp.status==='pending'
+          ? `<button class="secondary-action" disabled>⏳ Vérification en cours</button>`
+          : `<button class="primary" data-action="request-monetization">🚀 Demander l’activation</button>`;
+    const platformWithdrawalRows=platformWithdrawals.map(x=>{const st=x.status==='paid'?'Payé':x.status==='processing'?'En traitement':x.status==='failed'?'Échec':x.status==='rejected'?'Refusé':'En attente'; const cls=x.status==='paid'?'ok':(['rejected','failed'].includes(x.status)?'bad':''); const ref=x.provider_reference?` · Réf. ${esc(x.provider_reference)}`:''; const err=x.last_payout_error?` · ${esc(x.last_payout_error)}`:''; const repair=(x.status==='pending'&&!x.provider_reference)?`<button class="ghost-action" data-action="repair-legacy-platform-withdrawal" data-id="${esc(x.id)}">Corriger l’ancien retrait</button>`:''; return `<div class="monet-row"><div><b>${Number(x.amount_mga||0).toLocaleString('fr-FR')} Ar · Retrait plateforme</b><small>${timeAgo(x.created_at)}${ref}${err}</small></div><span class="monet-pill ${cls}">${st}</span>${repair}</div>`;}).join('')||'<div class="empty">Aucun retrait plateforme.</div>';
+    const adminPlatform = isAdminAccount && platform ? `<section class="monet-panel tafa-v74-admin-wallet"><div class="monet-section-title"><div><span class="eyebrow">TAFAß · ADMIN</span><h3>Mon portefeuille plateforme</h3><small class="admin-section-note">Coins et revenus générés par l’activité globale, calculés côté serveur.</small></div><button class="primary" data-action="v74-admin-open-withdraw">💸 Retrait</button></div><div class="monet-kpis"><div><span>Coins</span><b>${Number(platform.coins||0).toLocaleString('fr-FR')} 🪙</b></div><div><span>Disponible</span><b>${Number(platform.earnings_mga||0).toLocaleString('fr-FR')} Ar</b></div><div><span>Total gagné</span><b>${Number(platform.lifetime_earnings_mga||0).toLocaleString('fr-FR')} Ar</b></div><div><span>Parrainage</span><b>${Number(platform.referral_uses||0).toLocaleString('fr-FR')}</b><small>${esc(platform.referral_code||'')}</small></div></div><div class="monet-info-grid"><div><b>En traitement</b><span>${Number(platform.pending_earnings_mga||0).toLocaleString('fr-FR')} Ar</span></div><div><b>Total retiré</b><span>${Number(platform.total_withdrawn_mga||0).toLocaleString('fr-FR')} Ar</span></div></div><div class="monet-section-title"><div><h3>Historique des retraits</h3><small class="admin-section-note">Statut et référence du prestataire lorsqu’elles sont disponibles.</small></div></div><div class="monet-list">${platformWithdrawalRows}</div></section>` : '';
+    const referralActive=isAdminAccount || (mp.status==='approved' && mp.enabled!==false);
+    const referralCard = platform ? `<section class="monet-panel tafa-referral-panel-v75"><div class="monet-section-title"><div><span class="eyebrow">TAFAß · PARRAINAGE</span><h3>Votre code de parrainage</h3><small class="admin-section-note">Le code existe pour tous les comptes. Il devient utilisable pour les récompenses lorsque la monétisation est activée. Il reste facultatif à l’inscription et ne bloque jamais la création d’un compte.</small></div><button class="primary" data-action="copy-referral-code" data-code="${esc(platform.referral_code||'')}">⧉ Copier</button></div><div class="v75-referral-code"><strong>${esc(platform.referral_code||'TAFASS-—')}</strong><span class="${referralActive?'referral-active':'referral-inactive'}">${referralActive?'✓ Code actif':'○ Activation de la monétisation requise'} · ${referralUses.toLocaleString('fr-FR')} utilisation${referralUses===1?'':'s'}</span></div></section>` : '';
+    const creatorMonetHtml=`<div class="monet-kpis"><div><span>Disponible</span><b>${available.toLocaleString('fr-FR')} Ar</b><small>Retirable maintenant</small></div><div><span>En attente</span><b>${pending.toLocaleString('fr-FR')} Ar</b><small>Retraits en cours</small></div><div><span>Total gagné</span><b>${lifetime.toLocaleString('fr-FR')} Ar</b><small>Depuis l’activation</small></div><div><span>Total retiré</span><b>${withdrawn.toLocaleString('fr-FR')} Ar</b><small>Paiements finalisés</small></div></div>
+      <section class="monet-panel monet-explainer-v2"><div class="monet-section-title"><div><span class="eyebrow">COMMENT ÇA MARCHE ?</span><h3>Monétisation Tafaß, de A à Z</h3></div></div><div class="monet-longtext-v2">
+        <p><b>1. Devenir créateur éligible.</b> Vous demandez l’accès au programme. L’administration vérifie le compte, l’activité, le respect des règles et les conditions de monétisation. L’activation est une autorisation de participer au programme, pas une promesse de revenu automatique.</p>
+        <p><b>2. Créer du contenu utile.</b> Les publications, vidéos, Reels et directs peuvent développer votre audience. Une audience réelle, active et engagée augmente les possibilités de revenus. Les vues artificielles, le spam, les manipulations ou les activités frauduleuses ne doivent pas être utilisés pour générer des gains.</p>
+        <p><b>3. Recevoir des cadeaux et du soutien.</b> Pendant un Live, les spectateurs peuvent utiliser leurs coins pour envoyer des cadeaux. Les coins reçus sont enregistrés côté serveur et convertis en revenu monétaire selon le taux affiché par Tafaß. Le solde créateur est crédité uniquement par les opérations validées par le système.</p>
+        <p><b>4. Conversion coins → argent.</b> Le taux actuel affiché est <strong>${conversionCoins.toLocaleString('fr-FR')} coins = 1 Ar brut</strong>. Après la part créateur de ${Number(mp.revenue_share_percent||70)} %, cela représente environ <strong>${(Number(mp.revenue_share_percent||70)/100).toLocaleString('fr-FR',{minimumFractionDigits:2,maximumFractionDigits:2})} Ar net</strong> pour ${conversionCoins.toLocaleString('fr-FR')} coins de valeur brute.</p>
+        <p><b>5. Revenus publicitaires.</b> Les publicités sponsorisées financées par des annonceurs constituent une autre source potentielle. Une campagne payée par un annonceur ne signifie pas automatiquement qu’un créateur reçoit de l’argent : seule la part explicitement attribuée au programme créateur, après validation et calcul serveur, peut alimenter son portefeuille.</p>
+        <p><b>6. Solde disponible et solde en attente.</b> Le montant <em>Disponible</em> peut être demandé en retrait. Le montant <em>En attente</em> est réservé pour un retrait déjà envoyé à l’administration et ne peut pas être retiré une deuxième fois.</p>
+        <p><b>7. Retrait.</b> Ajoutez un compte MVola, Orange Money ou Airtel Money à votre nom, choisissez le montant et envoyez la demande. Le montant est réservé immédiatement. L’administration vérifie la demande, effectue le paiement réel sur le compte Mobile Money indiqué, puis marque la demande comme <strong>Payé</strong>.</p>
+        <p><b>8. Sécurité.</b> Le portefeuille, les crédits de revenus, les réservations de retrait et les conversions importantes sont traités côté serveur. Le navigateur ne doit jamais pouvoir augmenter lui-même son solde.</p>
+      </div></section>
+      <section class="monet-panel"><div class="monet-panel-head"><div><span class="eyebrow">PROGRAMME CRÉATEUR</span><h3>${esc(statusLabel)}</h3><p>${mp.status==='approved'?'Votre compte est éligible aux revenus configurés par Tafaß.':'Demandez l’accès au programme. L’administration vérifie votre compte avant activation.'}</p></div>${actions}</div><div class="monet-info-grid"><div><b>Part créateur</b><span>${Number(mp.revenue_share_percent||70)} %</span></div><div><b>Seuil de retrait</b><span>${Number(mp.min_withdrawal_mga||1000).toLocaleString('fr-FR')} Ar</span></div><div><b>Conversion</b><span>🪙 ${conversionCoins.toLocaleString('fr-FR')} coins = 1 Ar brut</span></div></div></section>
+      <section class="monet-panel papi-coins-panel"><div class="monet-section-title"><div><span class="eyebrow">TAFAß × PAPI</span><h3>🪙 Vos coins</h3><small class="admin-section-note">${coins.toLocaleString('fr-FR')} coins actuellement disponibles pour soutenir les créateurs.</small></div><button class="primary" data-action="papi-buy-coins">＋ Acheter des coins</button></div><div class="monet-coin-callout-v2"><strong>${coins.toLocaleString('fr-FR')} 🪙</strong><span>Achat sécurisé via Papi. Le solde est crédité uniquement après la notification serveur confirmant le paiement.</span></div></section>
+      <section class="monet-panel"><div class="monet-section-title"><div><h3>Moyens de retrait</h3><small class="admin-section-note">MVola, Orange Money, Airtel Money ou Banque.</small></div><button class="ghost-action" data-action="add-payout-method">Ajouter</button></div><div class="monet-list">${methodRows}</div></section>
+      <section class="monet-panel"><div class="monet-section-title"><div><h3>Revenus récents</h3><small class="admin-section-note">Chaque revenu validé est inscrit dans votre registre.</small></div></div><div class="monet-list">${earningRows}</div></section>
+      <section class="monet-panel papi-history-panel"><div class="monet-section-title"><div><span class="eyebrow">PAIEMENTS SÉCURISÉS</span><h3>Achats via Papi</h3><small class="admin-section-note">Statut confirmé par le serveur Tafaß.</small></div></div><div class="monet-list">${papiRows}</div></section>
+      <section class="monet-panel"><div class="monet-section-title"><div><h3>Demandes de retrait</h3><small class="admin-section-note">En attente → En traitement → Payé, ou Échec/Refusé. Un retrait n’est marqué Payé qu’après confirmation du prestataire.</small></div></div><div class="monet-list">${withdrawalRows}</div></section>`;
+    const adminMonetHtml=`<section class="monet-panel tafa-admin-monetization-active"><div class="monet-panel-head"><div><span class="eyebrow">TAFAß · ADMIN</span><h3>Monétisation automatiquement active</h3><p>Le compte administrateur est activé automatiquement. Il ne passe pas par l’achat de coins : il reçoit les revenus plateforme et utilise uniquement le portefeuille administrateur et le retrait.</p></div></div><div class="monet-info-grid"><div><b>Statut</b><span>Actif automatiquement</span></div><div><b>Achat de coins</b><span>Non disponible pour Admin</span></div><div><b>Retrait</b><span>Portefeuille Admin</span></div></div></section>`;
+    simplePage('Monétisation',`<section class="monet-hero monet-hero-v2"><div><span class="eyebrow">TAFAß • CREATOR MONETIZATION</span><h2>${isAdminAccount?'Monétisation administrateur':'Transformez votre audience en revenus.'}</h2><p>${isAdminAccount?'Le compte administrateur bénéficie automatiquement de la monétisation plateforme.':'Créez, développez votre communauté, recevez des cadeaux et convertissez les revenus éligibles en argent retirable.'}</p></div><span class="monet-status ${mp.status==='approved'?'active':''}">● ${esc(statusLabel)}</span></section>
+      ${referralCard}${adminPlatform}${isAdminAccount?adminMonetHtml:creatorMonetHtml}`);
+  }
+
+  function openMonetizationRequest(){
+    openModal(`<div class="modal-box monet-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • CREATOR PROGRAM</span><h3>Activer la monétisation</h3><p class="muted">Votre demande sera vérifiée par l’administration. L’activation ne garantit pas un revenu : les revenus dépendent des sources monétisées et des règles Tafaß.</p><label>Présentation du compte<textarea id="monetReason" class="premium-input" maxlength="800" placeholder="Décrivez votre activité de créateur…"></textarea></label><button class="primary big" data-action="submit-monetization-request">Envoyer la demande</button></div>`);
+  }
+  async function submitMonetizationRequest(){
+    const reason=$('monetReason')?.value.trim()||'';
+    const r=await sb.rpc('tafab_request_creator_monetization',{p_reason:reason});
+    if(r.error)return toast(r.error.message);
+    closeModal(); toast('Demande de monétisation envoyée.'); return creatorMonetisationPage();
+  }
+  function openPapiCoinsPurchase(){
+    openModal(`<div class="modal-box monet-modal papi-buy-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß × PAPI</span><h3>Acheter des coins</h3><p class="muted">Choisissez un pack ou personnalisez le nombre de coins. Le tarif est fixe : <strong>20 coins = 1 Ar</strong>, soit <strong>0,05 Ar par coin</strong>. Le paiement est effectué sur la page sécurisée Papi.</p><div class="papi-pack-grid"><button class="papi-pack active" data-papi-coins="10000"><b>500 Ar</b><span>10 000 🪙</span></button><button class="papi-pack" data-papi-coins="50000"><b>2 500 Ar</b><span>50 000 🪙</span></button><button class="papi-pack" data-papi-coins="100000"><b>5 000 Ar</b><span>100 000 🪙</span></button><button class="papi-pack" data-papi-coins="250000"><b>12 500 Ar</b><span>250 000 🪙</span></button></div><div class="papi-custom-box"><div><b>Personnaliser votre achat</b><small>Entrez le nombre de coins souhaité. Le prix s'adapte automatiquement.</small></div><label>Nombre de coins<input id="papiCustomCoins" class="premium-input" type="number" min="1000" step="1000" inputmode="numeric" value="10000" placeholder="Ex. 30000"></label><div class="papi-custom-price"><span>Prix</span><strong id="papiCalculatedPrice">500 Ar</strong></div></div><label>Moyen de paiement<select id="papiProvider" class="premium-input"><option value="">Choisir sur Papi</option><option value="MVOLA">🟢 MVola</option><option value="ORANGE_MONEY">🟠 Orange Money</option><option value="AIRTEL_MONEY">🔴 Airtel Money</option></select></label><input id="papiAmount" type="hidden" value="500"><input id="papiCoins" type="hidden" value="10000"><button class="primary big" data-action="papi-create-payment">Continuer vers Papi</button><small class="papi-secure-foot">🔐 API key conservée uniquement dans Supabase Edge Functions. Le solde est crédité après confirmation serveur.</small></div>`);
+    const sync=coins=>{
+      const c=Math.max(1000,Math.floor(Number(coins||0)/1000)*1000);
+      const amount=Math.round(c/20);
+      const ci=$('papiCustomCoins'),ai=$('papiAmount'),coin=$('papiCoins'),price=$('papiCalculatedPrice');
+      if(ci)ci.value=String(c); if(ai)ai.value=String(amount); if(coin)coin.value=String(c); if(price)price.textContent=`${amount.toLocaleString('fr-FR')} Ar`;
+    };
+    document.querySelectorAll('.papi-pack').forEach(btn=>btn.addEventListener('click',()=>{document.querySelectorAll('.papi-pack').forEach(x=>x.classList.remove('active'));btn.classList.add('active');sync(btn.dataset.papiCoins||'10000');}));
+    $('papiCustomCoins')?.addEventListener('input',e=>{document.querySelectorAll('.papi-pack').forEach(x=>x.classList.remove('active'));sync(e.target.value);});
+    sync(10000);
+  }
+
+  async function createPapiCoinPayment(){
+    const coins=Math.floor(Number($('papiCoins')?.value||$('papiCustomCoins')?.value||0));
+    const amount=Math.round(Number($('papiAmount')?.value||0));
+    const provider=String($('papiProvider')?.value||'');
+    if(coins<1000 || coins%1000!==0 || amount!==Math.round(coins/20)) return toast('Nombre de coins invalide. Choisissez un multiple de 1 000.');
+    const {data,error}=await sb.functions.invoke('tafa-papi-payment',{body:{amount,coins,provider}});
+    if(error){
+      const msg=String(error.message||'');
+      return toast(/failed to fetch|fetch failed|network/i.test(msg)?'Impossible de joindre le paiement Papi. Vérifiez que l’Edge Function « tafa-papi-payment » est déployée.':msg);
+    }
+    if(!data?.ok||!data?.paymentLink)return toast(data?.error||'Papi n’a pas retourné de lien de paiement.');
+    closeModal();
+    toast('Redirection vers Papi…');
+    window.location.assign(data.paymentLink);
+  }
+
+  function openPayoutMethod(){
+    openModal(`<div class="modal-box monet-modal payout-premium-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • RETRAIT SÉCURISÉ</span><h3>Ajouter un moyen de retrait</h3><p class="muted">Choisissez où Tafaß doit envoyer votre paiement. Les coordonnées sont enregistrées côté serveur et utilisées uniquement pour les retraits.</p><label>Moyen de paiement<select id="payoutProvider" class="premium-input"><option value="mvola">🟢 MVola</option><option value="orange_money">🟠 Orange Money</option><option value="airtel_money">🔴 Airtel Money</option><option value="bank">🏦 Banque</option></select></label><div id="payoutMobileFields"><label>Numéro Mobile Money<input id="payoutPhone" class="premium-input" maxlength="30" inputmode="tel" placeholder="Ex. 034 00 000 00"></label><label>Nom du titulaire<input id="payoutName" class="premium-input" maxlength="120" placeholder="Nom associé au compte Mobile Money"></label></div><div id="payoutBankFields" style="display:none"><label>Nom de la banque<input id="payoutBankName" class="premium-input" maxlength="120" placeholder="Ex. BNI, BOA, BMOI..."></label><label>Numéro de compte / RIB<input id="payoutBankAccount" class="premium-input" maxlength="80" placeholder="RIB ou numéro de compte"></label><label>Nom du titulaire<input id="payoutBankHolder" class="premium-input" maxlength="120" placeholder="Nom exact du titulaire"></label></div><label class="check-row"><input id="payoutDefault" type="checkbox" checked> Utiliser comme moyen principal</label><button class="primary big" data-action="save-payout-method">Enregistrer</button></div>`);
+    const sel=$('payoutProvider');
+    const toggle=()=>{const bank=sel?.value==='bank'; const mf=$('payoutMobileFields'),bf=$('payoutBankFields'); if(mf)mf.style.display=bank?'none':'block'; if(bf)bf.style.display=bank?'block':'none';};
+    sel?.addEventListener('change',toggle); toggle();
+  }
+  async function savePayoutMethod(){
+    const provider=$('payoutProvider')?.value||'mvola', phone=$('payoutPhone')?.value.trim()||'', name=$('payoutName')?.value.trim()||'', bankName=$('payoutBankName')?.value.trim()||'', bankAccount=$('payoutBankAccount')?.value.trim()||'', bankHolder=$('payoutBankHolder')?.value.trim()||'', def=!!$('payoutDefault')?.checked;
+    if(provider==='bank'){
+      if(!bankName||bankAccount.replace(/\s/g,'').length<6||!bankHolder)return toast('Informations bancaires incomplètes.');
+    }else if(!phone||phone.replace(/\D/g,'').length<9)return toast('Numéro Mobile Money invalide.');
+    const r=await sb.rpc('tafab_save_payout_method_v67_3',{p_provider:provider,p_phone:phone,p_account_name:provider==='bank'?bankHolder:name,p_bank_name:bankName,p_bank_account:bankAccount,p_is_default:def});
+    if(r.error)return toast(r.error.message); closeModal(); toast('Moyen de retrait enregistré.'); return creatorMonetisationPage();
+  }
+  async function openWithdrawalRequest(){
+    openModal(`<div class="modal-box monet-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • RETRAIT</span><h3>Retirer vos revenus</h3><p class="muted">Minimum de retrait : <strong>1 000 Ar</strong>, soit <strong>10 000 coins</strong> de valeur brute selon le barème actuel. Le montant est réservé immédiatement. Le paiement est ensuite envoyé par le service de paiement configuré et l’historique affiche l’opérateur, le statut et la référence de transaction.</p><label>Montant (Ar)<input id="withdrawAmount" type="number" min="1000" step="100" inputmode="numeric" placeholder="Ex. 10000"><small class="monet-method-hint">Seuil : 1 000 Ar minimum. 10 000 coins = 1 000 Ar brut.</small></label><label>Moyen<select id="withdrawMethod" class="premium-input"><option value="">Sélectionnez un moyen</option></select></label><div id="withdrawMethodHint" class="monet-method-hint"></div><button class="primary big" data-action="submit-withdrawal">Demander le retrait</button></div>`);
+    const r=await sb.from('tafab_creator_payout_methods').select('id,provider,phone,account_name,bank_name,bank_account,status').eq('user_id',state.user.id).eq('status','active').order('is_default',{ascending:false});
+    const sel=$('withdrawMethod'); if(!sel)return;
+    (r.data||[]).forEach(m=>{const o=document.createElement('option');o.value=m.id;o.textContent=`${({mvola:'MVola',orange_money:'Orange Money',airtel_money:'Airtel Money',bank:'Banque'})[m.provider]||m.provider} · ${m.provider==='bank'?(m.bank_name||'Compte bancaire'):m.phone}`;o.dataset.provider=m.provider;o.dataset.phone=m.phone;o.dataset.bank=m.bank_name||'';sel.appendChild(o);});
+    sel.addEventListener('change',()=>{const o=sel.options[sel.selectedIndex];$('withdrawMethodHint').textContent=o?.dataset?.provider==='bank'?`Virement vers ${o.textContent}`:(o?.dataset?.phone?`Paiement vers ${o.textContent}`:'');});
+  }
+  async function submitWithdrawal(){
+    const amount=Math.floor(Number($('withdrawAmount')?.value||0)), methodId=$('withdrawMethod')?.value||'';
+    if(!Number.isFinite(amount)||amount<1000)return toast('Montant minimum : 1 000 Ar.');
+    if(!methodId)return toast('Sélectionnez un moyen de retrait.');
+    const r=await sb.rpc('tafab_request_creator_withdrawal',{p_amount_mga:amount,p_payout_method_id:methodId});
+    if(r.error)return toast(r.error.message); closeModal(); toast('Demande de retrait enregistrée.'); return creatorMonetisationPage();
+  }
+  function openCreatorPricing(){
+    openModal(`<div class="modal-box monet-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • SOUTIEN</span><h3>Abonnements & cadeaux</h3><p class="muted">Les abonnements et cadeaux sont des sources de revenus créateur. Leur règlement doit être financé par de vrais paiements enregistrés côté Tafaß.</p><div class="monet-info-card"><b>Important</b><span>Les vues seules ne créent pas automatiquement de l’argent. Les revenus publicitaires doivent provenir de campagnes réellement payées par les annonceurs.</span></div><button class="primary big" data-action="close-modal">Compris</button></div>`);
+  }
+
+  async function sendLiveGift(gift='heart',coins=10){
+    if(!liveSessionId || liveRole!=='viewer') return toast('Le cadeau est disponible pendant un direct.');
+    const r=await sb.from('live_sessions').select('user_id,status').eq('id',liveSessionId).maybeSingle();
+    if(r.error||!r.data||r.data.status!=='live')return toast('Ce direct est terminé.');
+    const rpc=await sb.rpc('tafab_send_live_gift',{p_live_session_id:liveSessionId,p_receiver_id:r.data.user_id,p_gift_type:gift,p_coins:coins});
+    if(rpc.error)return toast(rpc.error.message.includes('Insufficient')?'Coins insuffisants.':rpc.error.message);
+    toast(`Cadeau ${gift==='rose'?'🌹':gift==='star'?'⭐':'❤️'} envoyé !`);
+  }
+
+
+  // V26.3: use Supabase Functions SDK instead of a manual fetch.
+  // This keeps the project URL/auth handling centralized and avoids browser
+  // "Failed to fetch" errors caused by a manually assembled endpoint.
+  async function aiRequest(mode, prompt){
+    const { data: sessionData } = await sb.auth.getSession();
+    if(!sessionData?.session?.access_token) throw new Error("Connectez-vous pour utiliser Tafaß AI.");
+    const { data, error } = await sb.functions.invoke("tafass-ai", {
+      body: { mode, prompt, language: "fr" }
+    });
+    if(error){
+      const msg=String(error.message||"");
+      if(/failed to fetch|fetch failed|network/i.test(msg))
+        throw new Error("Impossible de joindre Tafaß AI. Vérifiez que l'Edge Function « tafass-ai » est bien déployée dans ce projet Supabase.");
+      throw new Error(msg||"Service AI indisponible.");
+    }
+    if(data?.error) throw new Error(String(data.error));
+    const text=String(data?.response||data?.text||data?.output||"").trim();
+    if(!text) throw new Error("La réponse AI est vide.");
+    return text;
+  }
+  async function aiWorkspacePage(){
+    const token=state.renderToken;
+    const h=await sb.from("tafab_ai_history").select("id,mode,prompt,response,created_at").eq("user_id",state.user.id).order("created_at",{ascending:false}).limit(12);
+    if(token!==state.renderToken||state.route!=="ai")return;
+    const rows=(h.data||[]).map(x=>`<div class="v25-ai-history"><div><b>${esc(x.mode)}</b><small>${timeAgo(x.created_at)}</small></div><p>${esc(x.prompt)}</p><details><summary>Voir la réponse</summary><div>${esc(x.response)}</div></details></div>`).join("")||`<div class="empty">Votre historique AI apparaîtra ici après une première utilisation.</div>`;
+    simplePage("Tafaß AI",`<div class="v25-ai-hero"><div><span class="eyebrow">TAFAß • AI WORKSPACE</span><h3>Un assistant pour créer plus vite.</h3><p>Rédaction, traduction, résumé et assistant général. La clé AI reste côté serveur : aucune clé secrète n’est stockée dans l’application.</p></div><span class="v25-ai-badge">✦ AI</span></div><section class="v25-ai-panel"><div class="v25-mode-tabs"><button class="active" data-action="ai-mode" data-mode="assistant">Assistant</button><button data-action="ai-mode" data-mode="write">Écrire</button><button data-action="ai-mode" data-mode="translate">Traduire</button><button data-action="ai-mode" data-mode="summarize">Résumer</button></div><textarea id="aiPrompt" class="premium-input v25-ai-input" maxlength="8000" placeholder="Posez votre question ou donnez votre texte…"></textarea><div class="v25-ai-bottom"><span id="aiModeHint" class="muted">Mode : Assistant</span><button class="primary big" data-action="run-ai">✦ Demander à Tafaß AI</button></div><div id="aiResponse" class="v25-ai-response hidden"></div></section><section class="v25-ai-panel"><div class="section-title"><div><h3>Historique récent</h3><small class="admin-section-note">Uniquement vos demandes.</small></div></div>${rows}</section>`);
+    window.__tafassAiMode="assistant";
+  }
+  async function runAi(){
+    const prompt=$("aiPrompt")?.value.trim(); if(!prompt)return toast("Écrivez une demande.");
+    const mode=window.__tafassAiMode||"assistant", box=$("aiResponse"), btn=document.querySelector('[data-action="run-ai"]');
+    setLoading(btn,true,"Traitement…");
+    try{ const text=await aiRequest(mode,prompt); if(box){box.classList.remove("hidden");box.innerHTML=`<div class="v25-ai-answer-head"><b>Réponse Tafaß AI</b><button class="ghost-action" data-action="copy-ai">Copier</button></div><div class="v25-ai-answer-text">${esc(text)}</div>`;box.dataset.copy=text;} await sb.from("tafab_ai_history").insert({user_id:state.user.id,mode,prompt,response:text}); }
+    catch(e){toast(e?.message||"Impossible de contacter Tafaß AI.");}
+    finally{setLoading(btn,false,"✦ Demander à Tafaß AI");}
+  }
+  async function musicHubPage(){
+    const token=state.renderToken;
+    const [tr,likes]=await Promise.all([sb.from("tafab_music_tracks").select("id,title,genre,mood,duration_seconds,audio_url,cover_url,play_count,artist_id").eq("is_published",true).order("created_at",{ascending:false}).limit(80),sb.from("tafab_music_likes").select("track_id").eq("user_id",state.user.id)]);
+    if(token!==state.renderToken||state.route!=="music")return;
+    const liked=new Set((likes.data||[]).map(x=>x.track_id));
+    const rows=(tr.data||[]).map(t=>`<article class="v25-track"><button class="v25-track-play" data-action="music-play-db" data-id="${esc(t.id)}">▶</button><div class="v25-track-cover">♫</div><div class="v25-track-main"><b>${esc(t.title)}</b><small>${esc(t.genre||"Tafaß Original")} · ${esc(t.mood||"Ambiance")}${t.play_count?` · ${Number(t.play_count).toLocaleString('fr-FR')} écoutes`:""}</small></div><button class="v25-track-like ${liked.has(t.id)?"active":""}" data-action="music-like" data-id="${esc(t.id)}">${liked.has(t.id)?"♥":"♡"}</button></article>`).join("")||`<div class="empty">Le catalogue Music 2.0 sera rempli lorsque des artistes ou créateurs publieront leurs pistes.</div>`;
+    simplePage("Tafaß Music",`<div class="v25-music-hero"><div><span class="eyebrow">TAFAß • MUSIC 2.0</span><h3>Écoutez, découvrez, créez vos playlists.</h3><p>Catalogue extensible pour artistes, albums, playlists et favoris. Les pistes sans fichier audio peuvent utiliser le moteur original généré de Tafaß.</p></div><button class="primary" data-action="music-create-playlist">＋ Nouvelle playlist</button></div><div class="v25-music-tools"><input id="musicSearch" class="premium-input" placeholder="Rechercher un titre, style ou ambiance…"><button class="secondary-action" data-action="publisher-music">♫ Music Lab</button></div><section class="v25-music-panel"><div class="section-title"><div><h3>Découvrir</h3><small class="admin-section-note">${(tr.data||[]).length} piste(s) du catalogue serveur</small></div></div><div id="musicTrackList" class="v25-track-list">${rows}</div></section>`);
+    $("musicSearch")?.addEventListener("input",e=>{const q=e.target.value.toLowerCase();document.querySelectorAll(".v25-track").forEach(x=>x.classList.toggle("hidden",q&&!x.textContent.toLowerCase().includes(q)));});
+  }
+  async function playDbMusic(id){
+    const t=(await sb.from("tafab_music_tracks").select("*").eq("id",id).maybeSingle()).data; if(!t)return toast("Piste introuvable.");
+    if(t.audio_url){ let a=window.__tafassMusicAudio; if(a){a.pause();a=null;} a=new Audio(t.audio_url); window.__tafassMusicAudio=a; a.play().catch(()=>toast("Lecture audio bloquée par le navigateur.")); }
+    else { const catalog=publisherMusicCatalog(); const fallback=catalog.find(x=>x.title.toLowerCase()===String(t.title).toLowerCase())||catalog[(Number(t.play_count)||0)%catalog.length]; playGeneratedMusic(fallback); }
+    sb.rpc("tafab_music_register_play",{p_track_id:id}).catch(()=>{}); toast(`Lecture : ${t.title}`);
+  }
+  async function toggleMusicLike(id){
+    const q=await sb.from("tafab_music_likes").select("track_id").eq("user_id",state.user.id).eq("track_id",id).maybeSingle();
+    const r=q.data?await sb.from("tafab_music_likes").delete().eq("user_id",state.user.id).eq("track_id",id):await sb.from("tafab_music_likes").insert({user_id:state.user.id,track_id:id});
+    if(r.error)return toast(r.error.message); return musicHubPage();
+  }
+  function openMusicPlaylist(){openModal(`<div class="modal-box v25-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • PLAYLIST</span><h3>Créer une playlist</h3><input id="playlistName" class="premium-input" maxlength="80" placeholder="Nom de la playlist"><textarea id="playlistDesc" class="premium-input" maxlength="300" placeholder="Description (optionnel)"></textarea><button class="primary big" data-action="save-music-playlist">Créer</button></div>`)}
+  async function saveMusicPlaylist(){const name=$("playlistName")?.value.trim();if(!name)return toast("Donnez un nom à la playlist.");const r=await sb.from("tafab_music_playlists").insert({user_id:state.user.id,name,description:$("playlistDesc")?.value.trim()||"",is_public:false});if(r.error)return toast(r.error.message);closeModal();toast("Playlist créée.");}
+
+  async function openBoostPost(postId){
+    const q=await sb.from('posts').select('id,user_id,content,media_url,media_type').eq('id',postId).maybeSingle();
+    const post=q.data;
+    if(q.error||!post)return toast('Publication introuvable.');
+    if(post.user_id!==state.user.id)return toast('Vous pouvez uniquement booster votre propre publication.');
+    const type=post.media_type==='reel'?'reel':String(post.media_type||'').startsWith('video')?'video':String(post.media_type||'').startsWith('image')?'photo':'post';
+    openModal(`<div class="modal-box boost-modal-premium"><button class="modal-close" data-action="close-modal">×</button><div class="boost-hero"><div class="boost-mark">✦</div><div><span class="eyebrow">TAFAß • BOOST</span><h3>Booster cette publication</h3><p>Transformez votre publication en contenu sponsorisé après paiement et validation administrative.</p></div></div><div class="boost-preview">${post.media_url?(type==='video'||type==='reel'?`<video src="${esc(post.media_url)}" controls playsinline></video>`:`<img src="${esc(post.media_url)}" alt="Publication">`):''}<div><b>${esc((post.content||'Publication Tafaß').slice(0,100))}</b><small>Type : ${esc(type.toUpperCase())}</small></div></div><div class="boost-section"><span class="boost-section-title">OBJECTIF</span><div class="boost-objective-grid"><button class="boost-choice active" data-boost-objective="awareness">👁️<b>Visibilité</b><small>Plus de portée</small></button><button class="boost-choice" data-boost-objective="engagement">❤️<b>Engagement</b><small>Réactions, commentaires</small></button><button class="boost-choice" data-boost-objective="traffic">🔗<b>Trafic</b><small>Plus de clics</small></button></div></div><div class="boost-section"><span class="boost-section-title">AUDIENCE</span><label>Zone ciblée<input id="boostLocation" class="premium-input" value="Madagascar" maxlength="120" placeholder="Madagascar ou une ville"></label><div class="grid2"><label>Âge minimum<input id="boostAgeMin" type="number" min="18" max="100" value="18"></label><label>Âge maximum<input id="boostAgeMax" type="number" min="18" max="100" value="65"></label></div><label>Genre<select id="boostGender" class="premium-input"><option value="all">Tout le monde</option><option value="male">Hommes</option><option value="female">Femmes</option></select></label><small class="boost-note">Le ciblage utilise uniquement les informations réellement disponibles dans les profils Tafaß. Aucun profil individuel n'est vendu.</small></div><div class="boost-section"><span class="boost-section-title">BUDGET & DURÉE</span><div class="grid2"><label>Budget / jour (Ar)<input id="boostDaily" type="number" min="0" step="1000" value="10000"></label><label>Budget total (Ar)<input id="boostTotal" type="number" min="1000" step="1000" value="70000"></label></div><div class="grid2"><label>Début<input id="boostStart" type="date" value="${new Date().toISOString().slice(0,10)}"></label><label>Fin<input id="boostEnd" type="date"></label></div></div><input type="hidden" id="boostPostId" value="${esc(post.id)}"><input type="hidden" id="boostAdType" value="${esc(type)}"><button class="primary big boost-submit" data-action="create-boost-post">Continuer vers le paiement →</button></div>`);
+    document.querySelectorAll('[data-boost-objective]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('[data-boost-objective]').forEach(x=>x.classList.remove('active'));b.classList.add('active');},{once:false}));
+  }
+  async function createBoostPost(){
+    const postId=$('boostPostId')?.value, adType=$('boostAdType')?.value||'post', objective=document.querySelector('[data-boost-objective].active')?.dataset.boostObjective||'awareness';
+    const min=Number($('boostAgeMin')?.value||18), max=Number($('boostAgeMax')?.value||65), daily=Math.max(0,Number($('boostDaily')?.value||0)), total=Math.max(0,Number($('boostTotal')?.value||0));
+    if(!postId)return toast('Publication invalide.'); if(min>max)return toast("La tranche d'âge est invalide."); if(total<1000)return toast('Budget total minimum : 1 000 Ar.'); if(daily>0&&daily>total)return toast('Le budget quotidien ne peut pas dépasser le budget total.');
+    const start=$('boostStart')?.value?new Date($('boostStart').value+'T00:00:00').toISOString():new Date().toISOString(); const endRaw=$('boostEnd')?.value; const end=endRaw?new Date(endRaw+'T23:59:59').toISOString():null;
+    if(end&&new Date(end)<=new Date(start))return toast('La date de fin doit être postérieure au début.');
+    const r=await sb.rpc('tafa_create_boost_campaign',{p_post_id:postId,p_ad_type:adType,p_objective:objective,p_name:`Boost ${adType} · Tafaß`,p_daily_budget_mga:daily,p_total_budget_mga:total,p_audience_location:$('boostLocation')?.value.trim()||'Madagascar',p_age_min:min,p_age_max:max,p_gender:$('boostGender')?.value||'all',p_starts_at:start,p_ends_at:end});
+    if(r.error)return toast(r.error.message); const id=r.data; closeModal(); return openBoostPayment(id,total);
+  }
+  async function openBoostPayment(campaignId,total){
+    openModal(`<div class="modal-box boost-modal-premium"><button class="modal-close" data-action="close-modal">×</button><div class="boost-hero"><div class="boost-mark">₿</div><div><span class="eyebrow">TAFAß • PAIEMENT PUBLICITAIRE</span><h3>Finaliser le paiement</h3><p>Le budget sera vérifié par l'administration avant diffusion de la campagne.</p></div></div><div class="boost-total-card"><small>BUDGET TOTAL</small><strong>${Number(total).toLocaleString('fr-FR')} Ar</strong><span>Prépayé · diffusion après validation</span></div><div class="payment-choice-grid"><button class="payment-method active" data-action="select-boost-payment" data-method="Airtel Money">🔴 Airtel Money</button><button class="payment-method" data-action="select-boost-payment" data-method="Yas Money">🟡 Yas Money</button></div><input type="hidden" id="boostPaymentMethod" value="Airtel Money"><label>Référence de transaction<input id="boostPaymentRef" class="premium-input" maxlength="160" placeholder="Référence exacte de votre paiement"></label><small class="boost-note">Effectuez le paiement sur le moyen de paiement officiel indiqué par Tafaß, puis saisissez sa référence exacte. L'activation est impossible tant que le paiement n'est pas vérifié.</small><button class="primary big" data-action="submit-boost-payment" data-id="${esc(campaignId)}" data-amount="${esc(total)}">Envoyer le paiement à vérifier</button></div>`);
+  }
+  async function submitBoostPayment(id,amount){
+    const ref=$('boostPaymentRef')?.value.trim()||'', method=$('boostPaymentMethod')?.value||'Airtel Money';
+    if(!ref)return toast('Ajoutez la référence exacte de la transaction.');
+    const r=await sb.rpc('tafa_submit_boost_payment',{p_campaign_id:id,p_method:method,p_amount_mga:Number(amount),p_reference:ref});
+    if(r.error)return toast(r.error.message); closeModal(); toast('Paiement envoyé. Votre campagne est en attente de vérification.'); return businessAdsPage();
+  }
+  async function openBoostPage(){
+    const q=await sb.from('pages').select('id,name,username,logo_url').eq('owner_id',state.user.id).order('created_at',{ascending:false});
+    const pages=q.data||[]; if(q.error)return toast(q.error.message); if(!pages.length)return toast('Créez d’abord une Page.');
+    openModal(`<div class="modal-box boost-modal-premium"><button class="modal-close" data-action="close-modal">×</button><div class="boost-hero"><div class="boost-mark">👥</div><div><span class="eyebrow">TAFAß • PAGE</span><h3>Promouvoir une Page</h3><p>Votre Page sera présentée comme sponsorisée pour gagner de nouveaux abonnés.</p></div></div><label>Page<select id="boostPageId" class="premium-input">${pages.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}</select></label><div class="boost-section"><span class="boost-section-title">OBJECTIF</span><div class="boost-objective-grid"><button class="boost-choice active"><span>👥</span><b>Plus d'abonnés</b><small>Développer la communauté</small></button></div></div><div class="boost-section"><span class="boost-section-title">AUDIENCE</span><label>Zone ciblée<input id="boostLocation" class="premium-input" value="Madagascar" maxlength="120"></label><div class="grid2"><label>Âge minimum<input id="boostAgeMin" type="number" min="18" max="100" value="18"></label><label>Âge maximum<input id="boostAgeMax" type="number" min="18" max="100" value="65"></label></div><label>Genre<select id="boostGender" class="premium-input"><option value="all">Tout le monde</option><option value="male">Hommes</option><option value="female">Femmes</option></select></label></div><div class="boost-section"><span class="boost-section-title">BUDGET</span><div class="grid2"><label>Budget / jour (Ar)<input id="boostDaily" type="number" min="0" step="1000" value="10000"></label><label>Budget total (Ar)<input id="boostTotal" type="number" min="1000" step="1000" value="70000"></label></div></div><button class="primary big" data-action="create-boost-page">Continuer vers le paiement →</button></div>`);
+  }
+  async function createBoostPage(){
+    const pageId=$('boostPageId')?.value, min=Number($('boostAgeMin')?.value||18),max=Number($('boostAgeMax')?.value||65),daily=Math.max(0,Number($('boostDaily')?.value||0)),total=Math.max(0,Number($('boostTotal')?.value||0));
+    if(!pageId)return toast('Page invalide.'); if(min>max)return toast("La tranche d'âge est invalide."); if(total<1000)return toast('Budget total minimum : 1 000 Ar.'); if(daily>total&&daily>0)return toast('Le budget quotidien ne peut pas dépasser le budget total.');
+    const r=await sb.rpc('tafa_create_boost_campaign',{p_page_id:pageId,p_ad_type:'page_followers',p_objective:'page_followers',p_name:'Promotion Page · Tafaß',p_daily_budget_mga:daily,p_total_budget_mga:total,p_audience_location:$('boostLocation')?.value.trim()||'Madagascar',p_age_min:min,p_age_max:max,p_gender:$('boostGender')?.value||'all',p_starts_at:new Date().toISOString()});
+    if(r.error)return toast(r.error.message); closeModal(); return openBoostPayment(r.data,total);
+  }
+  async function recordSponsoredEvent(id,type){ if(!id)return; try{await sb.rpc('tafab_register_ad_event',{p_campaign_id:id,p_event_type:type});}catch(_){} }
+  function sponsoredAdHTML(ad){
+    const isVideo=String(ad.media_type||'').includes('video');
+    const mediaUrl=ad.media_url||'';
+    const media=mediaUrl?(isVideo?`<button type="button" class="sponsored-media-button" data-action="sponsored-view" data-id="${esc(ad.campaign_id)}" data-media-url="${esc(mediaUrl)}" data-media-type="video" data-title="${esc(ad.title||'Publicité Tafaß')}" data-description="${esc(ad.description||'')}" data-page-id="${esc(ad.page_id||'')}" data-target="${esc(ad.target_url||'')}"><video class="sponsored-media" src="${esc(mediaUrl)}" muted playsinline preload="metadata"></video><span class="sponsored-media-overlay">▶ Voir la publicité</span></button>`:`<button type="button" class="sponsored-media-button" data-action="sponsored-view" data-id="${esc(ad.campaign_id)}" data-media-url="${esc(mediaUrl)}" data-media-type="image" data-title="${esc(ad.title||'Publicité Tafaß')}" data-description="${esc(ad.description||'')}" data-page-id="${esc(ad.page_id||'')}" data-target="${esc(ad.target_url||'')}"><img class="sponsored-media" src="${esc(mediaUrl)}" alt="Publicité sponsorisée" loading="lazy"><span class="sponsored-media-overlay">Voir la publicité</span></button>`):ad.page_logo_url?`<button type="button" class="sponsored-media-button" data-action="sponsored-view" data-id="${esc(ad.campaign_id)}" data-media-type="page" data-title="${esc(ad.title||ad.page_name||'Publicité Tafaß')}" data-description="${esc(ad.description||'')}" data-page-id="${esc(ad.page_id||'')}" data-target="${esc(ad.target_url||'')}"><img class="sponsored-media sponsored-page-logo" src="${esc(ad.page_logo_url)}" alt="${esc(ad.page_name||'Page')}"><span class="sponsored-media-overlay">Voir la publicité</span></button>`:'';
+    const cta=ad.ad_type==='page_followers'?'S’abonner':ad.objective==='traffic'?'En savoir plus':ad.ad_type==='reel'?'Voir le Reel':'Voir';
+    return `<article class="sponsored-card" data-sponsored-id="${esc(ad.campaign_id)}"><div class="sponsored-head"><div class="sponsored-brand"><span class="sponsored-dot">✦</span><div><b>${esc(ad.page_name||'Sponsor Tafaß')}</b><small>Publicité · Sponsorisé</small></div></div><span class="sponsored-label"><b>✦ BOOSTÉ</b><small>TAFAß ADS · SPONSORISÉ</small></span></div>${media}<div class="sponsored-copy"><h3>${esc(ad.title||'Publicité Tafaß')}</h3><p>${esc(ad.description||'')}</p><div class="sponsored-actions"><button class="secondary-action" data-action="sponsored-view" data-id="${esc(ad.campaign_id)}" data-media-url="${esc(mediaUrl)}" data-media-type="${esc(isVideo?'video':mediaUrl?'image':'page')}" data-title="${esc(ad.title||'Publicité Tafaß')}" data-description="${esc(ad.description||'')}" data-page-id="${esc(ad.page_id||'')}" data-target="${esc(ad.target_url||'')}">Voir</button><button class="primary sponsored-cta" data-action="sponsored-click" data-id="${esc(ad.campaign_id)}" data-page-id="${esc(ad.page_id||'')}" data-target="${esc(ad.target_url||'')}">${cta}</button></div></div></article>`;
+  }
+
+  function openSponsoredView(actionEl){
+    const id=actionEl?.dataset?.id||'', mediaUrl=actionEl?.dataset?.mediaUrl||'', mediaType=actionEl?.dataset?.mediaType||'image', title=actionEl?.dataset?.title||'Publicité Tafaß', description=actionEl?.dataset?.description||'', pageId=actionEl?.dataset?.pageId||'', target=actionEl?.dataset?.target||'';
+    if(!id)return toast('Publicité sponsorisée introuvable.');
+    recordSponsoredEvent(id,'impression');
+    const media=mediaUrl?(mediaType==='video'?`<video class="sponsored-viewer-media" src="${esc(mediaUrl)}" controls autoplay playsinline preload="metadata"></video>`:`<img class="sponsored-viewer-media" src="${esc(mediaUrl)}" alt="${esc(title)}">`):'';
+    openModal(`<div class="modal-box sponsored-viewer-modal"><button class="modal-close" data-action="close-modal">×</button><div class="sponsored-viewer-brand"><span>✦ BOOSTÉ</span><small>TAFAß ADS · SPONSORISÉ</small></div><h3>${esc(title)}</h3>${media}<p>${esc(description)}</p><div class="sponsored-viewer-actions">${pageId?`<button class="secondary-action" data-action="sponsored-open-page" data-page-id="${esc(pageId)}">Voir la Page</button>`:''}${target?`<button class="primary" data-action="sponsored-open-target" data-id="${esc(id)}" data-target="${esc(target)}">Visiter</button>`:''}</div></div>`);
+  }
+
+  function adStatusLabel(status){return ({draft:'Brouillon',payment_pending:'Paiement à vérifier',pending_review:'En attente de validation',active:'Sponsorisé',paused:'En pause',completed:'Terminée',rejected:'Refusée'}[status]||status||'Inconnu');}
+  function adMoney(v){return `${Number(v||0).toLocaleString('fr-FR')} Ar`;}
+  function adPct(v){return `${Number(v||0).toFixed(2)}%`;}
+  async function openBoostOwnerDashboard(id){
+    if(!id)return toast('Campagne invalide.');
+    const q=await sb.from('tafab_ad_campaigns').select('*').eq('id',id).eq('owner_id',state.user.id).maybeSingle();
+    if(q.error||!q.data)return toast('Campagne introuvable ou accès refusé.');
+    const c=q.data;
+    const [st,days,pay]=await Promise.all([
+      sb.rpc('tafab_ad_campaign_dashboard',{p_campaign_id:id}),
+      sb.rpc('tafab_ad_campaign_daily_stats',{p_campaign_id:id,p_days:14}),
+      sb.from('tafab_ad_payments').select('method,amount_mga,transaction_reference,status,created_at,verified_at').eq('campaign_id',id).order('created_at',{ascending:false}).limit(5)
+    ]);
+    const x=st.data?.[0]||{};
+    const daily=days.data||[];
+    const payment=pay.data?.[0];
+    const max=Math.max(1,...daily.map(d=>Number(d.impressions||0)));
+    const chart=daily.length?`<div class="ad-dashboard-chart">${daily.map(d=>{const h=Math.max(8,Math.round(Number(d.impressions||0)/max*100));return `<div class="ad-chart-col"><span>${Number(d.impressions||0).toLocaleString('fr-FR')}</span><i style="height:${h}%"></i><small>${esc(String(d.day||'').slice(5))}</small></div>`}).join('')}</div>`:`<div class="ad-dashboard-empty">Les statistiques quotidiennes apparaîtront dès les premières diffusions.</div>`;
+    const status=adStatusLabel(c.status);
+    const remaining=Math.max(0,Number(c.total_budget_mga||0)-Number(c.spent_amount_mga||0));
+    const paymentBlock=payment?`<div class="ad-dashboard-payment"><div><span>PAIEMENT</span><b>${adMoney(payment.amount_mga)}</b><small>${esc(payment.method||'')} · Réf. ${esc(payment.transaction_reference||'')}</small></div><em class="ad-payment-state ${esc(payment.status||'')}">${esc(payment.status==='verified'?'Vérifié':payment.status==='pending'?'En vérification':payment.status==='rejected'?'Refusé':'Annulé')}</em></div>`:`<div class="ad-dashboard-empty">Aucun paiement enregistré.</div>`;
+    openModal(`<div class="modal-box ad-owner-dashboard-modal"><button class="modal-close" data-action="close-modal">×</button><div class="ad-dashboard-hero"><div class="ad-dashboard-mark">✦</div><div class="grow"><span class="eyebrow">TAFAß ADS · MON TABLEAU DE BORD</span><h3>${esc(c.name||'Campagne sponsorisée')}</h3><p>${esc(c.audience_location||'Madagascar')} · ${esc(c.objective||'awareness')} · ${esc(status)}</p></div><span class="ad-live-pill ${c.status==='active'?'live':''}"><i></i>${esc(status)}</span></div><div class="ad-dashboard-kpis"><div><strong>${Number(x.impressions||0).toLocaleString('fr-FR')}</strong><span>Impressions</span></div><div><strong>${Number(x.unique_reach||0).toLocaleString('fr-FR')}</strong><span>Personnes atteintes</span></div><div><strong>${Number(x.clicks||0).toLocaleString('fr-FR')}</strong><span>Clics</span></div><div><strong>${adPct(x.ctr)}</strong><span>CTR</span></div><div><strong>${adMoney(c.spent_amount_mga)}</strong><span>Dépensé</span></div><div><strong>${adMoney(remaining)}</strong><span>Reste</span></div></div><section class="ad-dashboard-section"><div class="ad-dashboard-section-head"><div><span class="eyebrow">ÉVOLUTION</span><h4>14 derniers jours</h4></div><span class="ad-dashboard-mini">Impressions quotidiennes</span></div>${chart}</section><section class="ad-dashboard-section"><div class="ad-dashboard-section-head"><div><span class="eyebrow">CAMPAGNE</span><h4>Paramètres & diffusion</h4></div></div><div class="ad-dashboard-grid"><div><span>Objectif</span><b>${esc(c.objective||'awareness')}</b></div><div><span>Audience</span><b>${esc(c.audience_location||'Madagascar')}</b></div><div><span>Âge</span><b>${Number(c.audience_age_min||18)}–${Number(c.audience_age_max||100)} ans</b></div><div><span>Budget total</span><b>${adMoney(c.total_budget_mga)}</b></div><div><span>Budget / jour</span><b>${adMoney(c.daily_budget_mga)}</b></div><div><span>Statut</span><b>${esc(status)}</b></div></div></section><section class="ad-dashboard-section"><div class="ad-dashboard-section-head"><div><span class="eyebrow">TRANSACTION</span><h4>Dernier paiement</h4></div></div>${paymentBlock}</section><div class="ad-dashboard-actions">${c.status==='active'?`<button class="secondary-action" data-action="owner-pause-boost" data-id="${esc(c.id)}">⏸ Mettre en pause</button>`:''}<button class="primary" data-action="owner-refresh-boost-dashboard" data-id="${esc(c.id)}">↻ Actualiser</button></div><div class="ad-dashboard-footnote">✦ Votre publicité conserve la marque <b>TAFAß ADS · SPONSORISÉ</b> pendant toute sa diffusion. Les chiffres sont calculés à partir des événements enregistrés côté serveur.</div></div>`);
+  }
+  async function pauseOwnerBoost(id){
+    if(!id)return;
+    const r=await sb.rpc('tafab_owner_pause_boost_campaign',{p_campaign_id:id});
+    if(r.error)return toast(r.error.message);
+    toast('Campagne mise en pause.');
+    closeModal();
+    return businessAdsPage();
+  }
+
+  async function businessAdsPage(){
+    const uid=state.user.id, token=state.renderToken;
+    const [b,c]=await Promise.all([
+      sb.from('tafab_business_profiles').select('*').eq('owner_id',uid).maybeSingle(),
+      sb.from('tafab_ad_campaigns').select('*').eq('owner_id',uid).order('created_at',{ascending:false}).limit(50)
+    ]);
+    if(token!==state.renderToken||state.route!=='business')return;
+    const campaigns=c.data||[], stats={};
+    await Promise.all(campaigns.map(async x=>{const r=await sb.rpc('tafab_ad_campaign_dashboard',{p_campaign_id:x.id});stats[x.id]=r.data?.[0]||{impressions:0,unique_reach:0,clicks:0,ctr:0};}));
+    const active=campaigns.filter(x=>x.status==='active').length;
+    const totalImp=Object.values(stats).reduce((n,x)=>n+Number(x.impressions||0),0), totalClicks=Object.values(stats).reduce((n,x)=>n+Number(x.clicks||0),0), totalReach=Object.values(stats).reduce((n,x)=>n+Number(x.unique_reach||0),0), totalSpent=campaigns.reduce((n,x)=>n+Number(x.spent_amount_mga||0),0);
+    const rows=campaigns.map(x=>{const st=stats[x.id]||{};return `<article class="v26-campaign ad-campaign-owner-card"><div class="v26-campaign-top"><div><span class="eyebrow">${esc(x.ad_type||x.objective||'BOOST').toUpperCase()}</span><h3>${esc(x.name)}</h3><small class="admin-section-note">${esc(x.audience_location||'Madagascar')} · ${Number(x.daily_budget_mga||0).toLocaleString('fr-FR')} Ar/jour</small></div><span class="v26-status ${esc(x.status)}">${esc(adStatusLabel(x.status))}</span></div><div class="v26-metrics"><div><b>${Number(st.impressions||0).toLocaleString('fr-FR')}</b><small>Impressions</small></div><div><b>${Number(st.unique_reach||0).toLocaleString('fr-FR')}</b><small>Portée</small></div><div><b>${Number(st.clicks||0).toLocaleString('fr-FR')}</b><small>Clics</small></div></div><div class="ad-owner-spend-row"><span>Budget ${adMoney(x.total_budget_mga)}</span><strong>${adMoney(x.spent_amount_mga)} dépensé</strong></div><div class="v26-actions"><button class="ghost-action ad-dashboard-open" data-action="open-boost-dashboard" data-id="${esc(x.id)}">📊 Tableau de bord</button>${x.status==='active'?`<button class="ghost-action" data-action="owner-pause-boost" data-id="${esc(x.id)}">⏸ Pause</button>`:''}</div><div class="ad-sponsored-mark">✦ TAFAß ADS <span>SPONSORISÉ</span></div></article>`}).join('')||'<div class="empty">Aucune campagne. Créez votre première campagne.</div>';
+    const biz=b.data;
+    simplePage('Business & Publicité',`<div class="v26-hero"><div><span class="eyebrow">TAFAß • ADS MANAGER</span><h3>Votre centre de publicité.</h3><p>Chaque Boost possède maintenant son propre tableau de bord pour suivre la diffusion, la portée, les clics, le budget et l’évolution de la campagne.</p></div><div class="v26-hero-actions"><button class="secondary-action" data-action="boost-page">👥 Promouvoir une Page</button><button class="primary big" data-action="new-ad-campaign">＋ Nouvelle campagne</button></div></div><div class="v26-kpis ad-owner-kpis"><div><b>${active}</b><small>Campagnes actives</small></div><div><b>${totalReach.toLocaleString('fr-FR')}</b><small>Personnes atteintes</small></div><div><b>${totalImp.toLocaleString('fr-FR')}</b><small>Impressions</small></div><div><b>${totalClicks.toLocaleString('fr-FR')}</b><small>Clics</small></div><div><b>${adMoney(totalSpent)}</b><small>Budget dépensé</small></div><div><b>${totalImp?adPct(100*totalClicks/totalImp):'0.00%'}</b><small>CTR global</small></div></div><section class="v26-panel ad-owner-intro"><div class="ad-owner-intro-icon">✦</div><div><span class="eyebrow">SUIVI EN DIRECT</span><h3>Vos publicités, leurs performances.</h3><p>Ouvrez <b>Tableau de bord</b> sur une campagne pour consulter les statistiques détaillées et l’évolution jour par jour.</p></div></section><section class="v26-panel"><div class="section-title"><div><h3>Profil Business</h3><small class="admin-section-note">${biz?'Votre identité professionnelle':'Présentez votre activité sur Tafaß'}</small></div><button class="secondary-action" data-action="edit-business-profile">${biz?'Modifier':'Créer'}</button></div>${biz?`<div class="v26-business-card"><div class="v26-business-logo">🏢</div><div class="grow"><b>${esc(biz.business_name)}</b><small>${esc(biz.category||'Entreprise')} · ${esc(biz.location||'Madagascar')}</small><p>${esc(biz.description||'')}</p></div>${biz.verified?'<span class="verified-mini">✓ Vérifié</span>':''}</div>`:'<div class="empty">Créez un profil Business pour centraliser votre activité.</div>'}</section><section class="v26-panel"><div class="section-title"><div><h3>Mes campagnes</h3><small class="admin-section-note">${campaigns.length} campagne(s) · cliquez sur Tableau de bord pour les détails</small></div></div><div class="v26-campaign-grid">${rows}</div></section>`);
+  }
+  function openBusinessProfile(){const b=window.__tafassBusiness||{};openModal(`<div class="modal-box v26-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • BUSINESS</span><h3>Profil professionnel</h3><label>Nom de l'entreprise<input id="bizName" class="premium-input" maxlength="120" value="${esc(b.business_name||'')}" placeholder="Ex. Tafaß Studio"></label><label>Catégorie<input id="bizCat" class="premium-input" maxlength="80" value="${esc(b.category||'Entreprise')}"></label><label>Localisation<input id="bizLoc" class="premium-input" maxlength="120" value="${esc(b.location||'Madagascar')}"></label><label>Description<textarea id="bizDesc" class="premium-input" maxlength="1000">${esc(b.description||'')}</textarea></label><label>Site web<input id="bizWeb" class="premium-input" maxlength="300" value="${esc(b.website||'')}"></label><button class="primary big" data-action="save-business-profile">Enregistrer</button></div>`)}
+  async function saveBusinessProfile(){const name=$('bizName')?.value.trim();if(!name)return toast("Nom de l'entreprise requis.");const payload={owner_id:state.user.id,business_name:name,category:$('bizCat')?.value.trim()||'Entreprise',location:$('bizLoc')?.value.trim()||'',description:$('bizDesc')?.value.trim()||'',website:$('bizWeb')?.value.trim()||''};const r=await sb.from('tafab_business_profiles').upsert(payload,{onConflict:'owner_id'});if(r.error)return toast(r.error.message);closeModal();toast('Profil Business enregistré.');return businessAdsPage();}
+  function openAdCampaign(){openModal(`<div class="modal-box v26-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • PUBLICITÉ</span><h3>Nouvelle campagne</h3><label>Nom<input id="adName" class="premium-input" maxlength="120" placeholder="Ex. Lancement produit"></label><label>Titre de l'annonce<input id="adCreativeTitle" class="premium-input" maxlength="120" placeholder="Message publicitaire"></label><label>Description<textarea id="adCreativeDesc" class="premium-input" maxlength="500" placeholder="Présentez votre offre…"></textarea></label><label>Lien de destination<input id="adTargetUrl" class="premium-input" maxlength="500" placeholder="https://…"></label><label>Objectif<select id="adObjective" class="premium-input"><option value="awareness">Notoriété</option><option value="traffic">Trafic</option><option value="engagement">Engagement</option><option value="sales">Ventes</option></select></label><label>Zone ciblée<input id="adLocation" class="premium-input" maxlength="120" value="Madagascar"></label><div class="grid2"><label>Budget/jour (Ar)<input id="adDaily" type="number" min="0" step="100" value="0"></label><label>Budget total (Ar)<input id="adTotal" type="number" min="0" step="100" value="0"></label></div><div class="grid2"><label>Âge min<input id="adAgeMin" type="number" min="18" max="100" value="18"></label><label>Âge max<input id="adAgeMax" type="number" min="18" max="100" value="65"></label></div><label>Centres d'intérêt<input id="adInterests" class="premium-input" maxlength="300" placeholder="mode, musique, technologie"></label><button class="primary big" data-action="save-ad-campaign">Créer la campagne</button></div>`)}
+  async function saveAdCampaign(){const name=$('adName')?.value.trim();if(!name)return toast('Nom de campagne requis.');const min=Number($('adAgeMin')?.value||18),max=Number($('adAgeMax')?.value||65);if(min>max)return toast("L'âge minimum doit être inférieur ou égal à l'âge maximum.");const interests=($('adInterests')?.value||'').split(',').map(x=>x.trim()).filter(Boolean).slice(0,20);const r=await sb.from('tafab_ad_campaigns').insert({owner_id:state.user.id,name,creative_title:$('adCreativeTitle')?.value.trim()||name,creative_description:$('adCreativeDesc')?.value.trim()||'',target_url:$('adTargetUrl')?.value.trim()||'',objective:$('adObjective')?.value||'awareness',status:'draft',daily_budget_mga:Math.max(0,Number($('adDaily')?.value||0)),total_budget_mga:Math.max(0,Number($('adTotal')?.value||0)),audience_location:$('adLocation')?.value.trim()||'Madagascar',audience_age_min:min,audience_age_max:max,audience_interests:interests});if(r.error)return toast(r.error.message);closeModal();toast('Campagne créée en brouillon.');return businessAdsPage();}
+  async function toggleAdCampaign(id,status){const next=status==='active'?'paused':'active';const q=await sb.from('tafab_ad_campaigns').select('*').eq('id',id).eq('owner_id',state.user.id).maybeSingle();if(q.error||!q.data)return toast('Campagne introuvable.');if(next==='active' && !Number(q.data.daily_budget_mga||0) && !Number(q.data.total_budget_mga||0))return toast('Ajoutez un budget avant d’activer la campagne.');const r=await sb.from('tafab_ad_campaigns').update({status:next,updated_at:new Date().toISOString()}).eq('id',id).eq('owner_id',state.user.id);if(r.error)return toast(r.error.message);const adPayload={owner_id:state.user.id,campaign_id:id,title:q.data.creative_title||q.data.name,description:q.data.creative_description||'',target_url:q.data.target_url||'',image_url:q.data.image_url||null,status:next==='active'?'active':'paused',starts_at:q.data.starts_at||new Date().toISOString(),ends_at:q.data.ends_at||null};const ar=await sb.from('tafab_ads').upsert(adPayload,{onConflict:'campaign_id'});if(ar.error)console.warn('Ad creative sync:',ar.error.message);toast(next==='active'?'Campagne activée.':'Campagne mise en pause.');return businessAdsPage();}
+  async function deleteAdCampaign(id){if(!(await premiumConfirm('Supprimer la campagne','Cette campagne sera supprimée de votre espace publicitaire.','Supprimer',true)))return;const r=await sb.from('tafab_ad_campaigns').delete().eq('id',id).eq('owner_id',state.user.id);if(r.error)return toast(r.error.message);toast('Campagne supprimée.');return businessAdsPage();}
+
+  async function adminIsAllowed(){
+    // V31.2: supabaseReady() was not defined in this build. That made the
+    // admin check throw and silently hide Administration from the Menu.
+    // The Supabase client is created at app startup, so only the session and
+    // the server-side role RPC need to be checked here.
+    if(!state.user || !sb) return false;
+    try{
+      const r=await sb.rpc('tafa_is_admin',{p_user_id:state.user.id});
+      if(!r.error && (r.data === true || r.data === 'true')) return true;
+      // Fallback for databases where the admin helper RPC has not yet reached the schema cache.
+      const q=await sb.from('profiles').select('is_admin,admin_badge').eq('id',state.user.id).maybeSingle();
+      return !q.error && !!q.data && (q.data.is_admin===true || q.data.admin_badge===true);
+    }catch(_){
+      return false;
+    }
+  }
+
+  async function adminBadgeCount(){
+    if(!(state.__isAdmin===true || await adminIsAllowed())) return 0;
+    try{const r=await sb.rpc('tafa_admin_badge_count'); return Number(r.data||0);}catch(_){return 0;}
+  }
+
+  function adminMoney(v){ return `${Number(v||0).toLocaleString('fr-FR')} Ar`; }
+
+  function adminDashboardRefreshSoon(){
+    if(state.adminDashboardRefreshTimer || state.route!=="admin" || !state.__isAdmin) return;
+    state.adminDashboardRefreshTimer=setTimeout(async()=>{
+      state.adminDashboardRefreshTimer=null;
+      if(state.route!=="admin" || !state.__isAdmin || state.adminDashboardRefreshing) return;
+      state.adminDashboardRefreshing=true;
+      try{ await adminTotalPage(); }catch(e){ console.warn("Tafaß admin realtime:",e); }finally{ state.adminDashboardRefreshing=false; }
+    },500);
+  }
+
+  async function adminTotalPage(){
+    if(!(await adminIsAllowed())){toast('Accès réservé à l’administration.');return navigate('home',{replaceStack:true});}
+    state.__isAdmin=true;
+    const [dr,ur,wr,pr,rr,vr,ar,br,bc,crp,crm]=await Promise.all([
+      sb.rpc('tafa_admin_dashboard_snapshot',{p_days:30}),
+      sb.rpc('tafa_admin_list_users',{p_limit:80,p_offset:0}),
+      sb.rpc('tafa_admin_list_withdrawals',{p_limit:50}),
+      sb.rpc('tafa_admin_list_payments',{p_limit:50}),
+      sb.rpc('tafa_admin_list_reports',{p_limit:50}),
+      sb.rpc('tafa_admin_list_badge_requests',{p_limit:50}),
+      sb.rpc('tafa_admin_list_account_appeals',{p_limit:50}),
+      sb.rpc('tafa_admin_list_boost_payments',{p_limit:100}),
+      sb.rpc('tafa_admin_list_boost_campaigns',{p_limit:200}),
+      sb.rpc('tafa_admin_list_creator_payouts',{p_limit:100}),
+      sb.rpc('tafa_admin_list_creator_monetization',{p_limit:100})
+    ]);
+    if(dr.error) throw dr.error;
+    const snap=dr.data||{}, st=snap.overview||{}, daily=snap.daily||[], locations=snap.locations||[];
+    const users=ur.error?[]:(ur.data||[]), withdrawals=wr.error?[]:(wr.data||[]), payments=pr.error?[]:(pr.data||[]), reports=rr.error?[]:(rr.data||[]), verifications=vr.error?[]:(vr.data||[]), appeals=ar.error?[]:(ar.data||[]), boostPayments=br.error?[]:(br.data||[]), boostCampaigns=bc.error?[]:(bc.data||[]), creatorPayouts=crp.error?[]:(crp.data||[]), creatorMonetization=crm.error?[]:(crm.data||[]);
+    state.adminAppealsCache=appeals;
+
+    // Realtime admin dashboard: demandes de réactivation, comptes et contenu.
+    // Le websocket est la source principale ; le polling reste uniquement un
+    // filet de sécurité pour Android lorsque le navigateur suspend le socket.
+    if(!state.adminDashboardChannel && navigator.onLine){
+      const ch=sb.channel('tafass-admin-dashboard-live')
+        .on('postgres_changes',{event:'*',schema:'public',table:'profiles'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'tafa_account_appeals'},()=>adminDashboardRefreshSoon()).on('postgres_changes',{event:'*',schema:'public',table:'tafa_verification_requests'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'tafab_ad_payments'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'tafab_ad_campaigns'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'tafab_withdrawal_requests'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'tafab_creator_monetization'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'tafab_creator_earnings'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'posts'},()=>adminDashboardRefreshSoon())
+        .on('postgres_changes',{event:'*',schema:'public',table:'stories'},()=>adminDashboardRefreshSoon())
+        .subscribe(status=>{
+          if(status==='SUBSCRIBED') adminDashboardRefreshSoon();
+        });
+      state.adminDashboardChannel=ch;
+    }
+    if(state.adminDashboardTimer) clearInterval(state.adminDashboardTimer);
+    state.adminDashboardTimer=setInterval(()=>{ if(state.route==='admin' && state.__isAdmin && !state.adminDashboardRefreshing) adminDashboardRefreshSoon(); },15000);
+
+    const cards=[
+      ['👥','Comptes',Number(st.total_accounts||0).toLocaleString('fr-FR')],
+      ['🟢','Actifs',Number(st.active_accounts||0).toLocaleString('fr-FR')],
+      ['🆕','Nouveaux (30 j)',Number(st.new_accounts_30d||0).toLocaleString('fr-FR')],
+      ['⚡','Actifs récemment',Number(st.recent_active_accounts||0).toLocaleString('fr-FR')],
+      ['📝','Publications',Number(st.total_posts||0).toLocaleString('fr-FR')],
+      ['⭕','Stories',Number(st.total_stories||0).toLocaleString('fr-FR')],
+      ['🎬','Reels',Number(st.total_reels||0).toLocaleString('fr-FR')],
+      ['🎥','Vidéos',Number(st.total_videos||0).toLocaleString('fr-FR')],
+      ['👥','Groupes',Number(st.total_groups||0).toLocaleString('fr-FR')],
+      ['💬','Messages',Number(st.total_messages||0).toLocaleString('fr-FR')],
+      ['🚨','Alertes',Number(st.pending_total||0).toLocaleString('fr-FR')]
+    ];
+    const usersPreview=users.slice(0,8);
+    const rows=usersPreview.map(u=>{
+      const nm=([u.first_name,u.last_name].filter(Boolean).join(' ')||u.username||u.email||'Compte');
+      const st=String(u.account_status||'active');
+      const label=st==='blocked'?'Bloqué':st==='restricted'?'Restreint':st==='deleted'?'Supprimé':'Actif';
+      const cls=st==='blocked'?'blocked':st==='restricted'?'pending':st==='deleted'?'rejected':'paid';
+      return `<div class="admin-user-row"><div class="admin-user-main">${u.avatar_url?`<img src="${esc(u.avatar_url)}" alt="">`:'<div class="admin-user-avatar">👤</div>'}<div><b>${esc(nm)}</b><small>${esc(u.email||'—')} · ${u.username?`@${esc(u.username)}`:'Compte Tafaß'}</small></div></div><span class="admin-status ${cls}">${label}</span><button class="ghost-action" data-action="admin-user-manage" data-id="${esc(u.id)}" data-status="${esc(st)}">Gérer</button></div>`;
+    }).join('')||'<div class="empty">Aucun compte.</div>';
+    const withdrawalRows=withdrawals.map(x=>`<div class="admin-data-row"><div class="grow"><b>${esc(x.display_name||x.identity_name||x.reason||'Compte')}</b><small>${adminMoney(x.amount_mga)} · ${esc(x.method||'mobile_money')} · ${timeAgo(x.created_at)}</small></div><span class="admin-status ${esc(x.status||'pending')}">${esc(x.status||'pending')}</span>${x.status==='pending'?`<button class="ghost-action" data-action="admin-withdrawal-status" data-id="${esc(x.id)}" data-status="approved">Approuver</button><button class="ghost-action danger-history-action" data-action="admin-withdrawal-status" data-id="${esc(x.id)}" data-status="rejected">Refuser</button>`:''}</div>`).join('')||'<div class="empty">Aucun retrait.</div>';
+    const creatorPayoutRows=creatorPayouts.map(x=>{const st=x.status||'pending'; const cls=st==='paid'?'paid':(['rejected','failed'].includes(st)?'rejected':st==='processing'?'pending':'pending'); const action=['pending','approved','failed','processing'].includes(st)?`<button class="ghost-action" data-action="admin-creator-payout" data-id="${esc(x.id)}" data-status="paid">💸 ${st==='failed'?'Réessayer':'Payer réellement'}</button><button class="ghost-action danger-history-action" data-action="admin-creator-payout" data-id="${esc(x.id)}" data-status="rejected">Refuser</button>`:''; const ref=x.provider_reference?` · Réf. ${esc(x.provider_reference)}`:''; const err=x.last_payout_error?` · ${esc(x.last_payout_error)}`:''; return `<div class="admin-data-row monet-admin-row"><div class="grow"><b>💸 ${esc(x.display_name||x.identity_name||x.reason||'Compte')}</b><small>${adminMoney(x.amount_mga)} · ${esc(x.method||'mobile_money')} · ${esc(x.destination_hint||'')} · ${timeAgo(x.created_at)}${ref}${err}</small></div><span class="admin-status ${cls}">${esc(st)}</span>${action}</div>`;}).join('')||'<div class="empty">Aucun retrait créateur.</div>';
+    const creatorMonetRows=creatorMonetization.map(x=>`<div class="admin-data-row monet-admin-row"><div class="grow"><b>◎ ${esc(x.display_name||x.identity_name||x.reason||'Compte')}</b><small>${esc(x.status||'pending')} · ${Number(x.lifetime_earnings_mga||0).toLocaleString('fr-FR')} Ar gagnés · ${timeAgo(x.created_at)}</small></div><span class="admin-status ${x.status==='approved'?'paid':x.status==='suspended'?'rejected':'pending'}">${esc(x.status||'pending')}</span>${x.status==='pending'?`<button class="ghost-action" data-action="admin-creator-monetization" data-id="${esc(x.user_id)}" data-status="approved">✓ Activer</button><button class="ghost-action danger-history-action" data-action="admin-creator-monetization" data-id="${esc(x.user_id)}" data-status="rejected">Refuser</button>`:x.status==='approved'?`<button class="ghost-action danger-history-action" data-action="admin-creator-monetization" data-id="${esc(x.user_id)}" data-status="suspended">Suspendre</button>`:''}</div>`).join('')||'<div class="empty">Aucune demande de monétisation.</div>';
+    const paymentRows=payments.map(x=>`<div class="admin-data-row"><div class="grow"><b>${esc(x.display_name||x.identity_name||x.reason||'Compte')}</b><small>${adminMoney(x.amount)} · ${esc(x.method||'')} · ${timeAgo(x.created_at)}</small></div><span class="admin-status ${esc(x.status||'pending')}">${esc(x.status||'pending')}</span>${x.status==='pending'?`<button class="ghost-action" data-action="admin-payment-status" data-id="${esc(x.id)}" data-status="paid">Valider</button><button class="ghost-action danger-history-action" data-action="admin-payment-status" data-id="${esc(x.id)}" data-status="failed">Refuser</button>`:''}</div>`).join('')||'<div class="empty">Aucun paiement.</div>';
+    const boostPaymentRows=boostPayments.map(x=>`<div class="admin-data-row boost-admin-payment-row"><div class="grow"><b>✦ ${esc(x.campaign_name||'Campagne')}</b><small>${esc(x.display_name||x.identity_name||x.reason||'Compte')} · ${adminMoney(x.amount_mga)} · ${esc(x.method||'')} · Réf. ${esc(x.transaction_reference||'')} · ${timeAgo(x.created_at)}</small></div><span class="admin-status ${x.status==='verified'?'paid':x.status==='rejected'?'rejected':'pending'}">${x.status==='pending'?'Paiement à vérifier':x.status==='verified'?'Vérifié':'Refusé'}</span>${x.status==='pending'?`<button class="ghost-action" data-action="admin-boost-payment-status" data-id="${esc(x.id)}" data-status="verified">✓ Vérifier</button><button class="ghost-action danger-history-action" data-action="admin-boost-payment-status" data-id="${esc(x.id)}" data-status="rejected">Refuser</button>`:x.status==='verified'?`<button class="ghost-action" data-action="admin-boost-campaign-status" data-id="${esc(x.campaign_id)}" data-status="active">✓ Sponsoriser</button>`:''}</div>`).join('')||'<div class="empty">Aucun paiement publicitaire en attente.</div>';
+    const boostCampaignRows=boostCampaigns.map(x=>`<div class="admin-data-row boost-admin-campaign-row"><div class="grow"><b>✦ ${esc(x.name||'Campagne')}</b><small>${esc(x.owner_name||'Compte')} · ${esc(x.ad_type||x.objective||'BOOST')} · ${adminMoney(x.spent_amount_mga)} / ${adminMoney(x.total_budget_mga)} · ${esc(x.audience_location||'Madagascar')}</small></div><span class="admin-status ${x.status==='active'?'paid':x.status==='rejected'?'rejected':x.status==='paused'?'':'pending'}">${esc(adStatusLabel(x.status))}</span><button class="ghost-action" data-action="admin-boost-campaign-control" data-id="${esc(x.id)}" data-status="active">▶ Activer</button><button class="ghost-action" data-action="admin-boost-campaign-control" data-id="${esc(x.id)}" data-status="paused">⏸ Pause</button>${x.status!=='rejected'?`<button class="ghost-action danger-history-action" data-action="admin-boost-campaign-control" data-id="${esc(x.id)}" data-status="rejected">Refuser</button>`:''}</div>`).join('')||'<div class="empty">Aucune campagne publicitaire.</div>';
+    const reportRows=reports.map(x=>`<div class="admin-data-row tafa-v51-report-row" data-v51-report-id="${esc(x.id)}" data-v51-reason="${esc(x.reason||'Signalement')}" data-v51-status="${esc(x.status||'pending')}" data-v51-created="${esc(x.created_at||'')}"><div class="grow"><b>${esc(x.reporter_name||'Compte')} → ${esc(x.reported_name||'Compte')}</b><small>${esc(x.reason||'Signalement')} · ${timeAgo(x.created_at)}</small></div><span class="admin-status ${x.status==='resolved'?'paid':''}">${esc(x.status||'pending')}</span><button class="ghost-action" data-v51-report-open="1">Détails</button>${x.status==='pending'?`<button class="ghost-action" data-action="admin-report-status" data-id="${esc(x.id)}" data-status="resolved">Traiter</button>`:''}</div>`).join('')||'<div class="empty">Aucun signalement.</div>';
+    const appealRows=appeals.map(x=>`<article class="admin-appeal-card ${x.status==='pending'?'is-pending':''}" data-action="admin-open-appeal" data-id="${esc(x.id)}"><div class="admin-appeal-avatar">♻</div><div class="admin-appeal-main"><div class="admin-appeal-top"><div><b>${esc(x.display_name||x.identity_name||x.reason||'Compte')}</b><small>${esc(x.email||'')} · ${timeAgo(x.created_at)}</small></div><span class="admin-status ${x.status==='approved'?'paid':x.status==='rejected'?'rejected':'pending'}">${x.status==='pending'?'En attente':x.status==='approved'?'Approuvée':'Refusée'}</span></div><p>${esc(x.reason||'Demande de réactivation')}</p><div class="admin-appeal-footer"><small>${x.status==='pending'?'Examen administratif requis':'Traitée par l’administration'}</small>${x.status==='pending'?'<span class="admin-appeal-review">Ouvrir l’examen →</span>':''}</div></div></article>`).join('')||'<div class="empty">Aucune demande de réactivation.</div>';
+    const verificationRows=verifications.map(x=>{const ps=String(x.papi_payment?.payment_status||'').toUpperCase();const payLabel=ps==='SUCCESS'?` · Paiement Papi confirmé (${adminMoney(x.papi_payment?.amount_mga||25000)})`:ps==='PENDING'?' · Paiement Papi en attente':ps==='FAILED'?' · Paiement Papi échoué':' · Paiement non confirmé';const canApprove=x.status==='pending'&&ps==='SUCCESS';return `<div class="admin-data-row"><div class="grow"><b>${esc(x.display_name||x.identity_name||x.reason||'Compte')}</b><small>${esc(x.email||'')} · ${esc(x.reason||'Demande de vérification')}${payLabel} · ${timeAgo(x.created_at)}</small></div><span class="admin-status ${x.status==='approved'?'paid':x.status==='rejected'?'rejected':''}">${esc(x.status||'pending')}</span>${x.status==='pending'?`${canApprove?`<button class="ghost-action" data-action="admin-verification-status" data-id="${esc(x.id)}" data-status="approved">Approuver</button>`:`<button class="ghost-action" disabled title="Paiement Papi requis">Payer d’abord</button>`}<button class="ghost-action danger-history-action" data-action="admin-verification-status" data-id="${esc(x.id)}" data-status="rejected">Refuser</button>`:''}</div>`}).join('')||'<div class="empty">Aucune demande de vérification.</div>';
+
+    const maxDaily=Math.max(1,...daily.map(x=>Number(x.new_accounts||0)));
+    const trendRows=daily.map(x=>{const n=Number(x.new_accounts||0),w=Math.max(3,Math.round((n/maxDaily)*100));return `<div class="admin-trend-row"><span>${esc(x.day_label||x.day||'')}</span><div class="admin-trend-track"><i style="width:${w}%"></i></div><b>${n}</b></div>`}).join('');
+    const locationRows=locations.map(x=>`<div class="admin-location-row"><div><b>${esc(x.city||'Localisation inconnue')}</b><small>${esc(x.country||'Pays inconnu')}</small></div><strong>${Number(x.accounts||0).toLocaleString('fr-FR')}</strong></div>`).join('')||'<div class="empty">Aucune localisation disponible.</div>';
+    const growth=Number(st.previous_30d_accounts||0)>0 ? (((Number(st.new_accounts_30d||0)-Number(st.previous_30d_accounts||0))/Number(st.previous_30d_accounts||1))*100).toFixed(1) : (Number(st.new_accounts_30d||0)>0?'100.0':'0.0');
+    const growthSign=Number(growth)>0?'+':'';
+
+    return simplePage('Admin Total',`<section class="admin-total-page admin-dashboard-premium">
+      <div class="admin-total-hero admin-dashboard-hero"><div><span class="eyebrow">TAFAß · ADMINISTRATION TOTALE</span><h2>Tableau de bord</h2><p>Vue globale et temps réel de l’activité Tafaß, des comptes, du contenu et de la sécurité.</p></div><div class="admin-live-indicator"><span></span> EN DIRECT</div></div>
+      <div class="admin-dashboard-toolbar"><span>Dernière synchronisation : <b>${new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}</b></span><button class="ghost-action" data-action="admin-refresh">↻ Actualiser maintenant</button></div>
+      <nav class="tafa-v74-admin-tabs" aria-label="Administration"><button class="active" data-v74-admin-jump="Évolution des comptes">📈 Évolutions des comptes</button><button data-v74-admin-jump="Comptes utilisateurs">👥 Comptes d'utilisateurs</button><button data-v74-admin-jump="Monétisation">💰 Monétisations</button><button data-v74-admin-jump="Signalements">🚨 Signalements & Réactivations</button></nav>
+      <div class="admin-total-grid admin-dashboard-kpis v75-admin-section" data-v75-admin-section="evolution">${cards.map(c=>`<div class="admin-stat"><span>${c[0]}</span><b>${c[2]}</b><small>${esc(c[1])}</small></div>`).join('')}</div>
+      <div class="admin-dashboard-columns v75-admin-section" data-v75-admin-section="evolution">
+        <section class="admin-total-section"><div class="admin-section-head"><div class="admin-section-title"><h3>📈 Évolution des comptes</h3><small class="admin-section-note">Nouveaux comptes sur les 30 derniers jours · croissance ${growthSign}${growth}%</small></div></div><div class="admin-trend-chart">${trendRows||'<div class="empty">Pas encore de données d’évolution.</div>'}</div></section>
+        <section class="admin-total-section"><div class="admin-section-head"><div class="admin-section-title"><h3>📍 Où se trouvent les comptes</h3><small class="admin-section-note">Répartition agrégée par ville et pays, sans adresse précise.</small></div></div><div class="admin-location-list">${locationRows}</div></section>
+      </div>
+      <div class="admin-dashboard-columns v75-admin-section" data-v75-admin-section="evolution">
+        <section class="admin-total-section"><div class="admin-section-head"><div class="admin-section-title"><h3>📱 Santé de l’application</h3><small class="admin-section-note">Volume actuel des principaux espaces.</small></div></div><div class="admin-health-grid"><div><b>${Number(st.total_posts||0).toLocaleString('fr-FR')}</b><span>Publications</span></div><div><b>${Number(st.total_stories||0).toLocaleString('fr-FR')}</b><span>Stories</span></div><div><b>${Number(st.total_reels||0).toLocaleString('fr-FR')}</b><span>Reels</span></div><div><b>${Number(st.total_videos||0).toLocaleString('fr-FR')}</b><span>Vidéos</span></div><div><b>${Number(st.total_groups||0).toLocaleString('fr-FR')}</b><span>Groupes</span></div><div><b>${Number(st.total_pages||0).toLocaleString('fr-FR')}</b><span>Pages</span></div></div></section>
+        <section class="admin-total-section"><div class="admin-section-head"><div class="admin-section-title"><h3>🛡️ Sécurité</h3><small class="admin-section-note">Éléments nécessitant une intervention.</small></div></div><div class="admin-health-grid admin-security-grid"><div><b>${Number(st.blocked_accounts||0).toLocaleString('fr-FR')}</b><span>Comptes bloqués</span></div><div><b>${Number(st.pending_reports||0).toLocaleString('fr-FR')}</b><span>Signalements</span></div><div><b>${Number(st.pending_verifications||0).toLocaleString('fr-FR')}</b><span>Vérifications</span></div><div><b>${Number(st.pending_appeals||0).toLocaleString('fr-FR')}</b><span>Réactivations</span></div></div></section>
+      </div>
+      <div class="admin-total-section v75-admin-section" data-v75-admin-section="users"><div class="admin-section-head"><div class="admin-section-title"><h3>👥 Comptes utilisateurs</h3><small class="admin-section-note">4 comptes en haut + 4 en bas. Les autres sont accessibles avec « Voir plus ».</small></div><span class="admin-live-indicator"><span></span> EN DIRECT</span></div><div class="v75-admin-user-table"><div class="v75-admin-user-head"><span>Compte</span><span>E-mail</span><span>Statut</span><span>Action</span></div>${rows}</div>${users.length>8?'<button class="ghost-action v74-see-more" data-action="v74-admin-users-more">Voir plus</button>':''}</div>
+      <div class="admin-total-section v75-admin-section monet-admin-section" data-v75-admin-section="monetization"><div class="admin-section-head"><div class="admin-section-title"><h3>💰 Monétisation</h3><small class="admin-section-note">${adminMoney(st.total_creator_earnings_mga)} de revenus créateurs · ${Number(st.total_coins||0).toLocaleString('fr-FR')} coins.</small></div></div><div class="admin-subsection"><h4>Demandes d'activation</h4><div class="admin-data-list">${creatorMonetRows}</div></div><div class="admin-subsection"><h4>Retraits créateurs</h4><div class="admin-data-list">${creatorPayoutRows}</div></div></div>
+      <div class="admin-total-section v75-admin-section" data-v75-admin-section="monetization"><div class="admin-section-head"><div class="admin-section-title"><h3>💳 Paiements</h3><small class="admin-section-note">Validation administrative des paiements.</small></div></div><div class="admin-data-list">${paymentRows}</div></div>
+      <div class="admin-total-section v75-admin-section" data-v75-admin-section="monetization"><div class="admin-section-head"><div class="admin-section-title"><h3>✦ Publicités sponsorisées</h3><small class="admin-section-note">Paiements publicitaires à vérifier avant diffusion</small></div><span class="admin-live-indicator"><span></span> EN DIRECT</span></div><div class="admin-data-list">${boostPaymentRows}</div></div>
+      <div class="admin-total-section v75-admin-section" data-v75-admin-section="monetization"><div class="admin-section-head"><div class="admin-section-title"><h3>✦ Gestion globale des campagnes</h3><small class="admin-section-note">L’administration contrôle toutes les campagnes, leurs statuts et leur diffusion.</small></div><span class="admin-live-indicator"><span></span> EN DIRECT</span></div><div class="admin-data-list">${boostCampaignRows}</div></div>
+      <div class="admin-total-section v75-admin-section" data-v75-admin-section="reports"><div class="admin-section-head"><div class="admin-section-title"><h3>🚨 Signalements</h3><small class="admin-section-note">Modération et suivi des signalements.</small></div></div><div class="admin-data-list">${reportRows}</div></div>
+      <div class="admin-total-section v75-admin-section" data-v75-admin-section="reports"><div class="admin-section-head"><div class="admin-section-title"><h3>🔵 Vérifications</h3><small class="admin-section-note">Demandes de badge bleu.</small></div></div><div class="admin-data-list">${verificationRows}</div></div>
+      <div class="admin-total-section v75-admin-section" data-v75-admin-section="reports"><div class="admin-section-head"><div class="admin-section-title"><h3>♻️ Réactivations</h3><small class="admin-section-note">Demandes après suspension.</small></div></div><div class="admin-data-list">${appealRows}</div></div>
+    </section>`);
+    const adminRoot=document.querySelector('.admin-total-page');
+    if(adminRoot){
+      const secs=[...adminRoot.querySelectorAll('.admin-total-section')];
+      secs.forEach(sec=>{
+        if(sec.dataset.v75AdminSection) return;
+        const h=(sec.querySelector('h3')?.textContent||'').toLowerCase();
+        let group='evolution';
+        if(h.includes('comptes utilisateurs')) group='users';
+        else if(h.includes('monétisation')||h.includes('paiements')||h.includes('publicités')||h.includes('campagnes')) group='monetization';
+        else if(h.includes('signalements')||h.includes('vérifications')||h.includes('réactivations')) group='reports';
+        sec.dataset.v75AdminSection=group;
+      });
+      adminRoot.querySelectorAll('[data-v75-admin-section]').forEach(sec=>{sec.hidden=sec.dataset.v75AdminSection!=='evolution';});
+    }
+  }
+  async function adminManageUser(id,status){
+    if(!(await tafaV74IsAdmin())) return toast('Accès réservé à l’administration.');
+    if(String(id)===String(state.user?.id)) return toast('L’administrateur ne peut pas gérer son propre compte depuis cette interface.');
+    const current=String(status||'active');
+    const title=current==='blocked'?'Gérer le compte bloqué':current==='restricted'?'Gérer le compte restreint':'Gérer le compte';
+    openModal(`<div class="modal-box v78-admin-user-manage"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß · ADMINISTRATION</span><h3>${esc(title)}</h3><p class="muted">Choisissez une action administrative. La modification est appliquée côté serveur.</p><div class="menu-grid"><button class="menu-card" data-action="admin-user-status" data-id="${esc(id)}" data-status="active"><span class="menu-icon">✓</span><span><b>Activer</b><small>Rétablir l’accès normal au compte.</small></span></button><button class="menu-card" data-action="admin-user-status" data-id="${esc(id)}" data-status="restricted"><span class="menu-icon">⚠</span><span><b>Restreindre</b><small>Bloquer les fonctions sensibles sans supprimer le compte.</small></span></button><button class="menu-card" data-action="admin-user-status" data-id="${esc(id)}" data-status="blocked"><span class="menu-icon">⛔</span><span><b>Bloquer</b><small>Empêcher l’utilisation normale du compte.</small></span></button><button class="menu-card danger-card" data-action="admin-user-delete" data-id="${esc(id)}"><span class="menu-icon">⌫</span><span><b>Supprimer définitivement</b><small>Supprimer le compte et ses données lorsque les contraintes de la base le permettent.</small></span></button></div></div>`);
+  }
+  async function adminSetUserStatusV78(id,status){
+    if(!(await premiumConfirm(status==='blocked'?'Bloquer le compte':status==='restricted'?'Restreindre le compte':'Réactiver le compte',status==='blocked'?'Le compte sera bloqué.':status==='restricted'?'Les fonctions sensibles seront bloquées.':'Le compte retrouvera son accès normal.',status==='blocked'?'Bloquer':status==='restricted'?'Restreindre':'Réactiver',status!=='active'))) return;
+    const r=await sb.rpc('tafa_admin_manage_user_v78',{p_user_id:id,p_action:status});
+    if(r.error)return toast(r.error.message);
+    closeModal(); toast(status==='blocked'?'Compte bloqué.':status==='restricted'?'Compte restreint.':'Compte réactivé.'); return adminTotalPage();
+  }
+  async function adminDeleteUserV78(id){
+    const ok=await premiumConfirm('Supprimer définitivement le compte','Cette action supprime le compte d’authentification et les données liées si les contraintes de la base l’autorisent. Elle est irréversible.','Supprimer définitivement',true);
+    if(!ok)return;
+    const r=await sb.rpc('tafa_admin_manage_user_v78',{p_user_id:id,p_action:'deleted'});
+    if(r.error)return toast(r.error.message);
+    closeModal(); toast('Compte supprimé.'); return adminTotalPage();
+  }
+  async function adminToggleUser(id,status){
+    const next=status==='blocked'?'active':'blocked'; if(!(await premiumConfirm(next==='blocked'?'Bloquer le compte':'Réactiver le compte',next==='blocked'?'Le compte ne pourra plus utiliser normalement les fonctions protégées.':'Le compte sera à nouveau autorisé à utiliser l’application.',next==='blocked'?'Bloquer':'Réactiver',next==='blocked')))return;
+    const r=await sb.rpc('tafa_admin_set_account_status',{p_user_id:id,p_status:next}); if(r.error)return toast(r.error.message); toast(next==='blocked'?'Compte bloqué.':'Compte réactivé.'); return adminTotalPage();
+  }
+  async function adminSetWithdrawalStatus(id,status){
+    if(!(await premiumConfirm(status==='approved'?'Approuver le retrait':'Refuser le retrait',status==='approved'?'Le retrait sera marqué comme approuvé.':'La demande sera refusée.',status==='approved'?'Approuver':'Refuser',status!=='approved')))return;
+    const r=await sb.rpc('tafa_admin_set_withdrawal_status',{p_id:id,p_status:status}); if(r.error)return toast(r.error.message); toast('Retrait mis à jour.'); return adminTotalPage();
+  }
+  async function adminSetPaymentStatus(id,status){
+    if(!(await premiumConfirm(status==='paid'?'Valider le paiement':'Refuser le paiement',status==='paid'?'Confirmez que le paiement a bien été vérifié.':'Le paiement sera refusé.',status==='paid'?'Valider':'Refuser',status!=='paid')))return;
+    const r=await sb.rpc('tafa_admin_set_payment_status',{p_id:id,p_status:status}); if(r.error)return toast(r.error.message); toast('Paiement mis à jour.'); return adminTotalPage();
+  }
+  async function repairLegacyPlatformWithdrawal(id){
+    if(!(await tafaV74IsAdmin()))return toast('Accès réservé à l’administration.');
+    const ok=await premiumConfirm('Corriger cet ancien retrait','Ce retrait est encore en attente mais son ancien système l’a comptabilisé à tort dans « Total retiré ». Cette correction remet le montant en « En traitement » sans envoyer ni supprimer d’argent. Utilisez-la uniquement si ce retrait n’a jamais été payé.','Corriger',true);
+    if(!ok)return;
+    const r=await sb.rpc('tafa_reconcile_legacy_platform_withdrawal',{p_request_id:id,p_confirm:true});
+    if(r.error)return toast(r.error.message);
+    toast('Ancien retrait corrigé : le montant est maintenant en traitement.');
+    return creatorMonetisationPage();
+  }
+
+  async function adminSetCreatorPayout(id,status){
+    if(status==='rejected'){
+      const ok=await premiumConfirm('Refuser la demande de retrait','Le retrait sera refusé et le montant réservé sera automatiquement rendu au solde disponible.','Refuser',true); if(!ok)return;
+      const r=await sb.rpc('tafa_admin_process_creator_payout',{p_request_id:id,p_status:'rejected',p_admin_note:''});
+      if(r.error)return toast(r.error.message); toast('Retrait refusé et solde restitué.'); return adminTotalPage();
+    }
+    const ok=await premiumConfirm('Effectuer le paiement réel','Tafaß va appeler le service de paiement configuré pour envoyer le montant au bénéficiaire. La demande ne sera marquée Payé qu’après confirmation du prestataire.','Payer réellement',false); if(!ok)return;
+    const r=await sb.functions.invoke('tafa-payout',{body:{request_id:id}});
+    if(r.error)return toast(r.error.message||'Service de paiement indisponible.');
+    if(r.data?.ok){ toast(`Paiement envoyé · ${r.data.reference||'référence reçue'}`); return adminTotalPage(); }
+    return toast(r.data?.error||'Le paiement n’a pas été confirmé.');
+  }
+  async function adminSetCreatorMonetization(id,status){
+    const ok=await premiumConfirm(status==='approved'?'Activer la monétisation':'Modifier la monétisation',status==='approved'?'Le créateur pourra commencer à recevoir les revenus éligibles configurés par Tafaß.':status==='suspended'?'La monétisation sera suspendue et aucun nouveau revenu ne sera crédité.':'La demande sera refusée et le programme restera désactivé.',status==='approved'?'Activer':status==='suspended'?'Suspendre':'Refuser',status!=='approved'); if(!ok)return;
+    const r=await sb.rpc('tafa_admin_set_creator_monetization_status',{p_user_id:id,p_status:status});
+    if(r.error)return toast(r.error.message); toast('Statut de monétisation mis à jour.'); return adminTotalPage();
+  }
+
+  async function adminSetReportStatus(id,status){
+    const r=await sb.rpc('tafa_admin_set_report_status',{p_id:id,p_status:status}); if(r.error)return toast(r.error.message); toast('Signalement traité.'); return adminTotalPage();
+  }
+  // ============================================================
+  // TAFAß — VÉRIFICATION PREMIUM V2
+  // Parcours complet en 5 étapes + suivi temps réel.
+  // Utilise le schéma stable badge_requests / badge-proofs existant.
+  // ============================================================
+  async function loadVerificationRequests(){
+    if(!state.user) return [];
+    try{
+      const {data,error}=await sb.from('tafa_verification_requests').select('*').eq('user_id',state.user.id).order('created_at',{ascending:false}).limit(20);
+      if(error) throw error;
+      state.verificationRequests=(data||[]).map(r=>({...r,identity_name:r.identity_name||r.reason||'',category:r.category||r.badge_type||'Autre',proof_path:r.proof_path||r.document_url||'',payment_method:r.payment_method||'',payment_reference:r.payment_reference||''}));
+      return state.verificationRequests;
+    }catch(e){ console.warn('Tafaß vérification:',e?.message||e); return state.verificationRequests||[]; }
+  }
+  function verificationStatusLabel(status){ return ({pending:'En attente de validation',approved:'Badge bleu actif',rejected:'Demande refusée'}[String(status||'').toLowerCase()]||'Statut inconnu'); }
+  function verificationStatusClass(status){ return ({pending:'pending',approved:'approved',rejected:'rejected'}[String(status||'').toLowerCase()]||'pending'); }
+  function verificationTimeline(status){
+    const st=String(status||'pending').toLowerCase();
+    const active=st==='approved'?5:st==='rejected'?4:4;
+    const steps=[['01','Identité','Informations de base'],['02','Catégorie','Type de vérification'],['03','Justificatif','Document de preuve'],['04','Paiement','Référence de transaction'],['05','Validation','Contrôle administratif']];
+    return `<div class="verification-timeline-v2">${steps.map((x,i)=>{const n=i+1,done=st==='approved'||(st==='pending'&&n<5)||(st==='rejected'&&n<5);return `<div class="verification-timeline-step ${done?'done':''} ${n===active?'current':''}"><span>${done?'✓':x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`}).join('')}</div>`;
+  }
+  async function openVerificationRequest(){
+    if(isAdminProfile(state.profile)) return toast("L’administrateur possède automatiquement son badge rouge.");
+    await loadVerificationRequests();
+    const latest=(state.verificationRequests||[])[0];
+    if(latest?.status==='pending') return verificationPage(true);
+    if(latest?.status==='approved') return verificationPage(false);
+    let step=1;
+    const data={identity:displayName(state.profile||state.user)||'',category:'',method:'',ref:''};
+    let proofFile=null;
+    const titles=['Profil','Éligibilité','Justificatif','Paiement & envoi'];
+    const categories=['Personnalité publique','Créateur de contenu','Artiste','Entreprise','Marque','Média','Journaliste','Sportif','Institution','Organisation','Professionnel','Autre'];
+    const show=()=>{
+      let body='';
+      if(step===1) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">01</div><span class="verification-kicker">PROFIL OFFICIEL</span><h3>Confirmez votre identité publique</h3><p>Le nom fourni sera comparé aux éléments de votre dossier. Utilisez une identité réelle et cohérente.</p><label>Nom légal<input id="vIdentity" class="premium-input" maxlength="160" value="${esc(data.identity)}" placeholder="Nom complet"></label><div class="verification-readonly"><span>Nom d’utilisateur</span><b>@${esc(state.profile?.username||'—')}</b></div></div>`;
+      if(step===2) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">02</div><span class="verification-kicker">ÉLIGIBILITÉ</span><h3>Choisissez votre catégorie</h3><p>Sélectionnez le motif qui décrit le mieux votre présence publique. L’administration utilisera cette information pour examiner le dossier.</p><label>Catégorie<select id="vCategory" class="premium-input">${categories.map(x=>`<option ${x===data.category?'selected':''}>${x}</option>`).join('')}</select></label><div class="verification-note-v41">✓ Une demande complète est examinée manuellement avant toute activation du badge.</div></div>`;
+      if(step===3) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">03</div><span class="verification-kicker">JUSTIFICATIF</span><h3>Ajoutez une preuve vérifiable</h3><p>Importez une pièce pertinente au dossier. Elle reste réservée au processus de vérification.</p><label class="verification-upload-v41"><span>Choisir un document</span><input id="vProof" type="file" accept="image/*,.pdf"><small>${proofFile?`✓ ${esc(proofFile.name)}`:'Image ou PDF · 15 Mo maximum'}</small></label><div class="verification-note-v41">🔒 Le fichier est envoyé dans l’espace privé dédié aux vérifications.</div></div>`;
+      if(step===4) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">04</div><span class="verification-kicker">PAIEMENT SÉCURISÉ</span><h3>Finalisez votre demande</h3><p>Frais de vérification : <strong class="verification-price-v41">25 000 Ar / mois</strong>. Saisissez exactement la référence du paiement effectué.</p><div class="verification-payments-v41"><button type="button" class="${data.method==='Yas Money'?'active':''}" data-vmethod="Yas Money"><b>Yas Money</b><small>Paiement mobile</small></button><button type="button" class="${data.method==='Airtel Money'?'active':''}" data-vmethod="Airtel Money"><b>Airtel Money</b><small>Paiement mobile</small></button></div><label>Référence de transaction<input id="vRef" class="premium-input" maxlength="120" value="${esc(data.ref)}" placeholder="Référence exacte"></label><div class="verification-final-check">✓ En envoyant, vous confirmez que les informations sont exactes et acceptez le contrôle administratif.</div></div>`;
+      openModal(`<div class="modal-box verification-wizard-v41"><div class="verification-v41-head"><div><span class="eyebrow">TAFAß · BADGE OFFICIEL</span><h3>Demande de badge bleu</h3><small>Étape ${step} sur 4 · ${titles[step-1]}</small></div><button class="modal-close" data-action="close-modal">×</button></div><div class="verification-progress-v41">${titles.map((t,i)=>`<span class="${i+1<=step?'active':''}"><b>${i+1}</b><small>${t}</small></span>`).join('')}</div>${body}<div class="verification-wizard-actions-v41"><button type="button" class="ghost-action" id="verificationBack">${step===1?'Annuler':'Retour'}</button><button type="button" class="primary big" id="verificationNext">${step===4?'Envoyer le dossier':'Continuer'}</button></div></div>`);
+      document.querySelectorAll('[data-vmethod]').forEach(b=>b.addEventListener('click',()=>{
+        data.method=b.dataset.vmethod; document.querySelectorAll('[data-vmethod]').forEach(x=>x.classList.toggle('active',x===b));
+      }));
+      const back=$('verificationBack'), next=$('verificationNext');
+      if(back) back.onclick=()=>{if(step===1)closeModal();else{step--;show();}};
+      if(next) next.onclick=async()=>{
+        if(next.disabled)return;
+        if(step===1){data.identity=$('vIdentity')?.value.trim()||'';if(data.identity.length<2)return toast('Indiquez votre nom légal.');}
+        if(step===2){data.category=$('vCategory')?.value||'';if(!data.category)return toast('Choisissez une catégorie.');}
+        if(step===3){const f=$('vProof')?.files?.[0];if(f)proofFile=f;if(!proofFile)return toast('Ajoutez votre justificatif.');if(proofFile.size>15*1024*1024)return toast('Le justificatif dépasse 15 Mo.');}
+        if(step===4){
+          data.ref=$('vRef')?.value.trim()||'';
+          if(!data.method)return toast('Choisissez votre méthode de paiement.');
+          if(!data.ref)return toast('Ajoutez la référence exacte du paiement.');
+          next.disabled=true; next.textContent='Envoi en cours…';
+          try{await submitVerificationRequest(data,proofFile);closeModal();await loadVerificationRequests();render();toast('Demande envoyée ✓ · En attente de validation');}
+          catch(e){next.disabled=false;next.textContent='Envoyer le dossier';toast(e?.message||'Impossible d’envoyer la demande.');}
+          return;
+        }
+        step++; show();
+      };
+    };
+    show();
+  }
+  async function submitVerificationRequest(data,proofFile){
+    if(!state.user) throw new Error('Connexion requise.');
+    const {data:pending,error:checkError}=await sb.from('tafa_verification_requests').select('id,status').eq('user_id',state.user.id).eq('status','pending').limit(1).maybeSingle();
+    if(checkError) throw checkError;
+    if(pending) throw new Error('Une demande de vérification est déjà en attente.');
+    let proofPath='';
+    if(proofFile){const ext=(proofFile.name.split('.').pop()||'bin').toLowerCase().replace(/[^a-z0-9]/g,'')||'bin';proofPath=`${state.user.id}/${crypto.randomUUID()}.${ext}`;const up=await sb.storage.from('badge-proofs').upload(proofPath,proofFile,{upsert:false,contentType:proofFile.type||undefined});if(up.error)throw new Error('Justificatif : '+up.error.message);}
+    const ins=await sb.rpc('tafa_create_badge_request',{
+      p_category:String(data.category||'Autre'),
+      p_identity_name:String(data.identity||''),
+      p_proof_path:proofPath||'',
+      p_payment_method:String(data.method||''),
+      p_payment_reference:String(data.ref||'')
+    });
+    if(ins.error){if(proofPath)try{await sb.storage.from('badge-proofs').remove([proofPath]);}catch(_){}throw ins.error;}
+    try{if(typeof notify==='function' && String(state.user.id)!==String(OFFICIAL_SUPER_ADMIN_ID))await notify(OFFICIAL_SUPER_ADMIN_ID,'badge_request',`Nouvelle demande de badge bleu de ${displayName(state.profile||state.user)}.`);}catch(_){ }
+  }
+  async function verificationPage(){
+    const token=++state.verificationRenderToken;
+    await loadVerificationRequests();
+    if(token!==state.verificationRenderToken || state.route!=='verification')return;
+    const latest=(state.verificationRequests||[])[0];
+    const status=String(latest?.status||'none');
+    const statusLabel=latest?verificationStatusLabel(status):'Aucune demande';
+    const cls=latest?verificationStatusClass(status):'empty';
+    const action=latest?.status==='pending'?'Voir le suivi':latest?.status==='approved'?'Voir mon statut':'Commencer la vérification';
+    simplePage('Vérification',`<section class="verification-page-premium verification-page-v2"><div class="verification-hero verification-hero-v2"><div><span class="eyebrow">TAFAß · VÉRIFICATION OFFICIELLE</span><h3>Obtenez le badge bleu</h3><p>Un parcours sécurisé en 5 étapes : identité, catégorie, justificatif, paiement et validation administrative.</p></div><span class="verification-mark">✓</span></div>${latest?`<section class="verification-status-card verification-status-v2"><div><span class="eyebrow">SUIVI EN TEMPS RÉEL</span><h4>${esc(statusLabel)}</h4><p>${esc(latest.status==='approved'?'Votre badge est actif.':latest.status==='rejected'?'Votre demande n’a pas été approuvée. Vous pouvez soumettre une nouvelle demande.':'Votre dossier est complet et attend le contrôle de l’administration.')}</p><small>${latest.created_at?new Date(latest.created_at).toLocaleString('fr-FR'):'—'} · ${'25 000'} Ar</small></div><span class="verification-live-dot ${cls}">●</span></section>`:''}${verificationTimeline(status)}<section class="verification-form-card verification-action-card"><div class="section-title"><div><h3>${latest?.status==='pending'?'Dossier en cours':'Demander la vérification'}</h3><small class="admin-section-note">${latest?.status==='pending'?'Le statut se met à jour automatiquement dès qu’une décision est prise.':'La validation finale appartient exclusivement à l’administration.'}</small></div></div>${latest?.status==='pending'?`<div class="verification-lock-v2">🔒 <span>Une seule demande en attente est autorisée. Vous recevrez la décision directement dans Tafaß.</span></div>`:''}<button class="primary big wide" data-action="verification-start">${esc(action)}</button></section></section>`);
+  }
+  async function adminOpenAppeal(id){
+    const x=(state.adminAppealsCache||[]).find(a=>String(a.id)===String(id));
+    if(!x) return adminTotalPage();
+    const pending=x.status==='pending';
+    openModal(`<div class="modal-box admin-appeal-review-modal"><div class="admin-review-head"><div class="admin-review-icon">♻</div><div><span class="eyebrow">TAFAß · SÉCURITÉ</span><h3>Examen de réactivation</h3><small class="admin-section-note">${esc(x.email||'')} · ${timeAgo(x.created_at)}</small></div><button class="modal-close" data-action="close-modal">×</button></div><div class="admin-review-account"><div class="admin-review-avatar">${esc((x.display_name||'C').slice(0,1).toUpperCase())}</div><div><b>${esc(x.display_name||x.identity_name||x.reason||'Compte')}</b><small>Demande de réactivation du compte</small></div><span class="admin-status ${pending?'pending':x.status==='approved'?'paid':'rejected'}">${pending?'En attente':x.status==='approved'?'Approuvée':'Refusée'}</span></div><div class="admin-review-reason"><span>EXPLICATION DU MEMBRE</span><p>${esc(x.reason||'Aucune explication fournie.')}</p></div>${pending?'<div class="admin-review-warning">⚠️ Vérifiez les éléments concernés avant de valider. L’approbation réactive immédiatement le compte.</div><div class="admin-review-actions"><button class="admin-review-reject" data-action="admin-appeal-status" data-id="'+esc(x.id)+'" data-status="rejected">Refuser</button><button class="admin-review-approve" data-action="admin-appeal-status" data-id="'+esc(x.id)+'" data-status="approved">✓ Approuver & réactiver</button></div>':'<div class="admin-review-closed">Cette demande a déjà été traitée.</div>'}</div>`);
+  }
+  async function adminSetAppealStatus(id,status){
+    const btns=document.querySelectorAll('[data-action="admin-appeal-status"]');
+    btns.forEach(b=>{b.disabled=true;b.classList.add('is-processing');});
+    try{
+      if(!id) throw new Error('Demande de réactivation invalide.');
+      if(!['approved','rejected'].includes(String(status))) throw new Error('Statut de réactivation invalide.');
+      const r=await sb.rpc('tafa_admin_set_appeal_status',{p_id:id,p_status:status});
+      if(r.error) throw r.error;
+      closeModal();
+      toast(status==='approved'?'Compte réactivé. Le profil et les médias existants sont conservés.':'Demande refusée.');
+      return adminTotalPage();
+    }catch(e){
+      console.error('Tafaß réactivation:',e);
+      btns.forEach(b=>{b.disabled=false;b.classList.remove('is-processing');});
+      return toast(e?.message||'Impossible de traiter la demande de réactivation.');
+    }
+  }
+  function openBoostAdminConfirm(kind,id,status){
+    const payment=kind==='payment';
+    const positive=status==='verified'||status==='active';
+    const title=payment?(positive?'Vérifier le paiement':'Refuser le paiement'):(positive?'Approuver & sponsoriser':'Refuser la campagne');
+    const text=payment?(positive?'Le paiement sera marqué comme vérifié et la campagne passera à l’étape de validation.':'Le paiement publicitaire sera refusé.'):(positive?'La campagne sera activée et pourra être diffusée comme publicité sponsorisée.':'La campagne sera refusée et ne sera pas diffusée.');
+    const icon=positive?'✓':'!';
+    openModal(`<div class="modal-box boost-admin-confirm-modal"><div class="boost-admin-confirm-icon ${positive?'positive':'negative'}">${icon}</div><span class="eyebrow">TAFAß ADS · ADMINISTRATION</span><h3>${title}</h3><p>${text}</p><div class="boost-admin-confirm-actions"><button class="ghost-action" data-action="close-modal">Annuler</button><button class="boost-admin-confirm-primary ${positive?'positive':'negative'}" data-action="confirm-boost-admin" data-kind="${kind}" data-id="${esc(id)}" data-status="${esc(status)}">${positive?'✓ Confirmer':'Refuser'}</button></div></div>`);
+  }
+  async function confirmBoostAdminAction(kind,id,status){
+    if(!id)return toast('Action publicitaire invalide.');
+    const actionButton=document.querySelector('[data-action="confirm-boost-admin"]');
+    if(actionButton){actionButton.disabled=true;actionButton.textContent='Traitement…';}
+    const r=kind==='payment'
+      ? await sb.rpc('tafa_admin_review_boost_payment',{p_payment_id:id,p_status:status})
+      : await sb.rpc('tafa_admin_review_boost_campaign',{p_campaign_id:id,p_status:status});
+    if(r.error){if(actionButton){actionButton.disabled=false;actionButton.textContent=status==='active'||status==='verified'?'✓ Confirmer':'Refuser';}return toast(r.error.message);}
+    closeModal();
+    toast(kind==='payment'?(status==='verified'?'Paiement vérifié.':'Paiement publicitaire refusé.'):(status==='active'?'Campagne sponsorisée activée.':'Campagne refusée.'));
+    return adminTotalPage();
+  }
+  async function adminControlBoostCampaign(id,status){
+    if(!id)return toast('Campagne publicitaire invalide.');
+    const r=await sb.rpc('tafa_admin_control_boost_campaign',{p_campaign_id:id,p_status:status});
+    if(r.error)return toast(r.error.message);
+    toast(status==='active'?'Campagne sponsorisée activée.':status==='paused'?'Campagne mise en pause.':status==='rejected'?'Campagne refusée.':'Campagne terminée.');
+    return adminTotalPage();
+  }
+  async function adminSetBoostPaymentStatus(id,status){
+    if(!id)return toast('Paiement publicitaire invalide.');
+    return openBoostAdminConfirm('payment',id,status);
+  }
+  async function adminSetBoostCampaignStatus(id,status){
+    if(!id)return;
+    return openBoostAdminConfirm('campaign',id,status);
+  }
+  async function adminSetVerificationStatus(id,status){ if(!['approved','rejected'].includes(String(status)))return toast('Statut de vérification invalide.'); if(!(await premiumConfirm(status==='approved'?'Approuver la vérification':'Refuser la vérification',status==='approved'?'Le badge bleu sera activé après validation administrative.':'La demande sera refusée.',status==='approved'?'Approuver':'Refuser',status!=='approved')))return; const r=await sb.rpc('tafa_admin_set_verification_status',{p_id:id,p_status:status}); if(r.error)return toast(r.error.message); await loadVerificationRequests(); toast(status==='approved'?'Badge bleu activé.':'Demande refusée.'); if(state.route==='verification') await verificationPage(); return adminTotalPage(); }
+  async function openRestrictionAppeal(){
+    const r=await sb.from('tafa_account_appeals').select('status,created_at').eq('user_id',state.user.id).order('created_at',{ascending:false}).limit(3);
+    const history=r.data||[];
+    const pending=history.find(x=>x.status==='pending');
+    const rows=history.map(x=>`<div class="restriction-history-card status-${esc(x.status||'pending')}"><span class="restriction-history-dot">●</span><div><b>Demande ${esc(x.status==='approved'?'approuvée':x.status==='rejected'?'refusée':'en attente')}</b><small>${timeAgo(x.created_at)}</small></div></div>`).join('');
+    const form=pending
+      ? `<div class="restriction-pending-lock"><strong>Demande déjà en cours</strong><span>Une seule demande peut être en attente. Attendez la décision de l’administration.</span></div>`
+      : `<label class="restriction-reason-label">Votre explication<textarea id="appealReason" class="premium-input" maxlength="1000" placeholder="Expliquez votre demande…"></textarea></label><button class="primary big restriction-submit" data-action="submit-appeal">Envoyer la demande</button>`;
+    openModal(`<div class="modal-box restriction-modal premium-restriction-modal"><div class="restriction-modal-head"><div class="restriction-modal-icon">♻</div><div><span class="eyebrow">TAFAß · SÉCURITÉ</span><h3>Demander la réactivation</h3></div><button class="modal-close" data-action="close-modal">×</button></div><p class="muted">Expliquez votre situation. Votre demande sera transmise directement à l’administration pour examen.</p>${rows}${form}</div>`);
+  }
+  async function submitAppeal(){
+    if(state.__appealSubmitting) return;
+    state.__appealSubmitting=true;
+    const button=document.querySelector('[data-action="submit-appeal"]');
+    if(button){button.disabled=true;button.classList.add('is-processing');button.textContent='Envoi en cours…';}
+    try{
+      const existing=await sb.from('tafa_account_appeals').select('id,status').eq('user_id',state.user.id).eq('status','pending').limit(1);
+      if(existing.error) throw existing.error;
+      if(existing.data?.length){
+        return toast('Une demande de réactivation est déjà en attente.');
+      }
+      const reason=$("appealReason")?.value.trim()||"";
+      if(!reason) return toast("Expliquez votre demande.");
+      const r=await sb.rpc('tafa_submit_account_appeal',{p_reason:reason});
+      if(r.error){
+        if(/duplicate key|one_pending_per_user|unique constraint/i.test(String(r.error.message||''))) return toast('Une demande de réactivation est déjà en attente.');
+        throw r.error;
+      }
+      closeModal();
+      toast('Demande de réactivation envoyée à l’administration.');
+    }catch(e){
+      console.error('Tafaß demande réactivation:',e);
+      toast(e?.message||'Impossible d’envoyer la demande.');
+    }finally{
+      state.__appealSubmitting=false;
+      const b=document.querySelector('[data-action="submit-appeal"]');
+      if(b){b.disabled=false;b.classList.remove('is-processing');b.textContent='Envoyer la demande';}
+    }
+  }
+  async function render() {
+    if (!state.user) return;
+    // V98 SCROLL STABILITY: capture the route before any async/background work.
+    // A realtime/admin refresh must never reset the page currently being scrolled.
+    const renderRouteAtStart = state.route;
+    const preserveScroll = renderRouteAtStart === "menu";
+    const scrollYBeforeRender = preserveScroll ? (window.scrollY || document.documentElement.scrollTop || 0) : 0;
+    if(state.profile?.account_status==='restricted' || state.profile?.account_status==='blocked'){
+      const blocked=state.profile?.account_status==='blocked';
+      $("content").innerHTML=`<section class="restriction-screen ${blocked?'is-blocked':''}"><div class="restriction-top-glow"></div><div class="restriction-icon">⛔</div><span class="eyebrow">TAFAß · SÉCURITÉ</span><h2>${blocked?'Compte bloqué':'Compte restreint'}</h2><p>Une violation d’une identité ou d’un média protégé a été détectée. Les actions sensibles restent bloquées pendant la procédure de sécurité.</p><div class="restriction-live-status"><span></span> STATUT SURVEILLÉ EN DIRECT</div><div class="restriction-steps"><div class="done"><b>01</b><span>${blocked?'Blocage':'Suspension'}</span><small>Protection du réseau</small></div><div class="active"><b>02</b><span>Vérification</span><small>Éléments concernés</small></div><div><b>03</b><span>Explication</span><small>Votre demande</small></div><div><b>04</b><span>Examen</span><small>Contrôle administratif</small></div><div><b>05</b><span>Approbation</span><small>Validation finale</small></div></div><button class="primary big" data-action="open-restriction-appeal">Commencer la procédure de réactivation</button><button class="ghost-action" data-action="new-logout">Quitter le compte</button></section>`;
+      return;
+    }
+    /* V28.3.2 MENU SAFETY: never block the Menu on the admin RPC.
+       If Supabase is slow/unconfigured, the normal Menu must still open.
+       Admin access is checked in the background and the card is added only
+       after a positive server-side check. The Admin route itself remains gated. */
+    const requestedRoute=state.route;
+    if(requestedRoute==='admin'){
+      state.__isAdmin=await adminIsAllowed();
+    } else if(requestedRoute==='menu'){
+      const knownAdmin=state.__isAdmin===true;
+      state.__isAdmin=knownAdmin;
+      Promise.resolve().then(()=>adminIsAllowed()).then(ok=>{
+        if(state.route==='menu' && ok!==state.__isAdmin){
+          state.__isAdmin=ok;
+          render().catch(err=>console.warn('Tafaß menu admin refresh:',err));
+        }
+      }).catch(()=>{});
+    }
+
+    const token = ++state.renderToken;
+    const route = routes.includes(state.route) ? state.route : "home";
+    state.route = route;
+    beginPageLoading(token);
+    document.querySelectorAll("[data-route]").forEach(el => el.classList.toggle("active", el.dataset.route === route));
+    // Only reset scroll when the route actually changes. Never reset the Menu while it is open.
+    if (!preserveScroll && renderRouteAtStart !== state.route) {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    }
+    try {
+      if (route === "home") await (pageModeActive() ? renderPageFeed() : renderFeed());
+      else if (route === "friends") await friendsPage();
+      else if (route === "search") await searchPage("");
+      else if (route === "messages") await messagesPage();
+      else if (route === "notifications") await notificationsPage();
+      else if (route === "profile") await profilePage(state.profileTab);
+      else if (["reels","groups","saved"].includes(route)) await genericListPage(route);
+      else if (route === "events") await eventsPage();
+      else if (route === "studio") await creatorStudioPage();
+      else if (route === "creator") await creatorMonetisationPage();
+      else if (route === "ai") await aiWorkspacePage();
+      else if (route === "music") await musicHubPage();
+      else if (route === "business") await businessAdsPage();
+      else if (route === "admin") await adminTotalPage();
+      else if (route === "verification") await verificationPage();
+      else if (route === "menu") await menuPage();
+      else if (route === "tafab") await tafabPage();
+      else if (route === "settings") await settingsPage();
+      if (token !== state.renderToken || route !== state.route) return;
+      decoratePageHeader(route);
+      const contentRoot = $("content");
+      if (contentRoot) { contentRoot.classList.remove("v44-route-switching"); contentRoot.classList.add("v44-route-ready"); }
+      const pageRoot = contentRoot?.firstElementChild;
+      if (pageRoot) pageRoot.dataset.pageRoute = route;
+      document.querySelectorAll("[data-route]").forEach(el => el.classList.toggle("active", el.dataset.route === state.route));
+      updateBadges();
+      if (route === "menu" && preserveScroll && state.route === "menu") {
+        requestAnimationFrame(() => {
+          if (state.route === "menu") window.scrollTo({ top: scrollYBeforeRender, left: 0, behavior: "auto" });
+        });
+      }
+    } catch (err) {
+      console.error("Tafaß render:", err);
+      if (token === state.renderToken && state.route === route) {
+        $("content").innerHTML = `<section class="clean-page clean-page-shell error-page"><div class="page-header clean-page-header"><h2>${esc(route === "profile" ? "Profil" : route === "settings" ? "Para & Conf" : "Tafaß")}</h2></div><div class="empty-block"><b>Impossible d’afficher cette section.</b><small>${esc(err?.message || "Une erreur est survenue.")}</small><button class="primary big" data-route="home">Retour à l’accueil</button></div></section>`;
+      }
+    } finally {
+      endPageLoading(token);
+    }
+  }
+
+  const V44_ROUTE_META = {
+    home:["Actualités","Votre espace, vos contenus, votre communauté."], friends:["Amis","Retrouvez et gérez vos relations."], messages:["Messages","Vos conversations en temps réel."], notifications:["Notifications","Vos alertes importantes."], profile:["Profil","Votre espace personnel Tafaß."],  groups:["Groupes","Communautés et discussions."], reels:["Réels","Découvrez les contenus courts."], menu:["Menu","Tous vos outils Tafaß au même endroit."], settings:["Paramètres","Personnalisez votre expérience."], search:["Recherche","Trouvez rapidement ce que vous cherchez."], saved:["Enregistrements","Vos contenus sauvegardés."], tafab:["Tafaß","Services et fonctionnalités Tafaß."], events:["Évènements","Découvrez les évènements."], studio:["Studio","Créez et gérez vos contenus."], creator:["Créateur","Outils de création et de monétisation."], music:["Musique","Votre espace musical."], business:["Professionnel","Outils professionnels."], verification:["Badge officiel","Vérification du compte."], ai:["Assistant","Espace intelligent Tafaß."], admin:["Administration","Centre de gestion Tafaß."] };
+  function routeSkeleton(route){
+    const meta=V44_ROUTE_META[route]||["Tafaß","Chargement de votre espace…"];
+    return `<section class="v44-page-skeleton" aria-label="Chargement de ${esc(meta[0])}"><div class="v44-skel-head"><span class="v44-skel-icon"></span><div><i></i><b></b></div></div><div class="v44-skel-grid"><span></span><span></span><span></span></div><div class="v44-skel-line"></div><div class="v44-skel-line short"></div><small>${esc(meta[1])}</small><div class="v44-loading-points"><i></i><i></i><i></i></div></section>`;
+  }
+  function showRouteSkeleton(route){
+    const content=$("content");
+    if(!content) return;
+    content.classList.add("v44-route-switching");
+    content.innerHTML=routeSkeleton(route);
+    requestAnimationFrame(()=>content.classList.add("v44-route-ready"));
+  }
+
+  function navigate(route, options = {}) {
+    // V97: Pages are fully removed from the application UI and routing.
+    if (route === "pages") route = "notifications";
+    if (!routes.includes(route)) route = "home";
+    if (document.body.classList.contains("modal-open")) closeModal();
+    state.backOverride = null;
+    if (state.route === route && document.querySelector(`#content [data-page-route="${route}"]`)) {
+      if (pageLoading) return;
+      return;
+    }
+    if (!options.replaceStack && state.route !== route) {
+      const last = state.navStack[state.navStack.length - 1];
+      if (last !== route) state.navStack.push(route);
+    }
+    if (options.replaceStack) state.navStack = [route];
+    state.renderToken++;
+    state.route = route;
+    // V44: afficher immédiatement un skeleton premium; le rendu réseau peut continuer sans bloquer la navigation.
+    showRouteSkeleton(route);
+    // Entering a section consumes its NEW/unseen badge. Do this immediately
+    // so the counter disappears as soon as the section is opened.
+    markRouteBadgeSeen(route);
+    if (route === "profile") state.viewingProfileId = null;
+    if (route === "groups") state.groupsTab = "mine";
+    state.selectedConversation = route === "messages" ? state.selectedConversation : null;
+    history.replaceState(null, "", "#" + route);
+    render().catch(err => {
+      if (state.route === route) console.error("Tafaß navigation:", err);
+    });
+  }
+
+  function syncThemeButton() {
+    const btn = $("themeBtn");
+    if (!btn) return;
+    btn.innerHTML = state.theme === "dark"
+      ? '<svg class="action-svg" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.5A8 8 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z"/></svg>'
+      : '<svg class="action-svg" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
+    btn.setAttribute("aria-label", state.theme === "dark" ? "Activer le mode clair" : "Activer le mode sombre");
+  }
+
+  async function toggleTheme() {
+    // Deliberately disabled: Tafaß is dark-only in this stable build.
+    state.theme = "dark";
+    document.body.classList.remove("light");
+    syncThemeButton();
+    if (state.user) await sb.from("user_settings").upsert({user_id:state.user.id,theme:"dark"},{onConflict:"user_id"});
+  }
+
+  async function newLogout(){
+    if(state.loggingOut)return;
+    stopTimeLimitGuard();
+    state.loggingOut=true;
+    showAppTransition("logout");
+    try{
+      document.body.classList.add("app-logging-out");
+      if(state.channel){try{await sb.removeChannel(state.channel);}catch(_){} state.channel=null;}
+      if(state.liveFeedChannel){try{await sb.removeChannel(state.liveFeedChannel);}catch(_){} state.liveFeedChannel=null;}
+      if(state.conversationChannel){try{await sb.removeChannel(state.conversationChannel);}catch(_){} state.conversationChannel=null;}
+      if(state.presenceChannel){try{await sb.removeChannel(state.presenceChannel);}catch(_){} state.presenceChannel=null;}
+      if(presenceHeartbeatTimer){clearInterval(presenceHeartbeatTimer);presenceHeartbeatTimer=null;}
+      if(state.adminDashboardChannel){try{await sb.removeChannel(state.adminDashboardChannel);}catch(_){} state.adminDashboardChannel=null;}
+      if(state.adminDashboardTimer){clearInterval(state.adminDashboardTimer);state.adminDashboardTimer=null;}
+      if(state.adminDashboardRefreshTimer){clearTimeout(state.adminDashboardRefreshTimer);state.adminDashboardRefreshTimer=null;}
+      if(realtimeRuntime.retryTimer){clearTimeout(realtimeRuntime.retryTimer);realtimeRuntime.retryTimer=null;}
+      if(notificationSound.pollTimer){clearInterval(notificationSound.pollTimer);notificationSound.pollTimer=null;}
+      notificationSound.lastNotificationId=null; notificationSound.lastMessageId=null; notificationSound.lastNotificationCreatedAt=null; notificationSound.lastMessageCreatedAt=null; notificationSound.initialized=false;
+      await removeTafaPushSubscription();
+      const {error}=await sb.auth.signOut();
+      if(error)throw error;
+      state.user=null; state.profile=null; state.posts=[]; state.friends=[]; state.stories=[];
+      state.selectedConversation=null; state.viewingProfileId=null; state.activePage=null; state.entityBackRoute=null;
+      state.navStack=["home"]; state.route="home"; state.composerOpen=false; state.composerLocation="";
+      document.body.classList.remove("page-mode-active","modal-open");
+      closeModal();
+      $("app")?.classList.add("hidden");
+      showLogin();
+      window.scrollTo({top:0,left:0,behavior:"instant"});
+    }catch(e){
+      toast(e?.message||"Impossible de se déconnecter. Réessayez.");
+    }finally{
+      state.loggingOut=false;
+      document.body.classList.remove("app-logging-out");
+      hideAppTransition();
+    }
+  }
+  async function setupRealtime() {
+    if (!state.user || !navigator.onLine) return;
+    startNotificationSoundFallback();
+    if(presenceHeartbeatTimer) clearInterval(presenceHeartbeatTimer);
+    const touchPresence=()=>sb.rpc("tafa_touch_presence").then(({error})=>{if(error)console.warn("Tafaß presence heartbeat:",error.message);});
+    touchPresence();
+    presenceHeartbeatTimer=setInterval(touchPresence,45000);
+    // Global Presence channel: ephemeral online state, never persisted to SQL.
+    if(state.presenceChannel){ try{ await sb.removeChannel(state.presenceChannel); }catch(_){} state.presenceChannel=null; }
+    const presence=sb.channel("tafass-presence-global", { config:{ presence:{ key:state.user.id } } });
+    state.presenceChannel=presence;
+    presence.on("presence", {event:"sync"}, ()=>{
+      const ps=presence.presenceState(); window.tafaOnlineIds=new Set(Object.keys(ps).map(String));
+      window.dispatchEvent(new CustomEvent("tafass:presence-sync"));
+    });
+    presence.on("presence", {event:"join"}, ({key})=>{
+      window.tafaOnlineIds=window.tafaOnlineIds||new Set(); window.tafaOnlineIds.add(String(key));
+      window.dispatchEvent(new CustomEvent("tafass:presence-change", {detail:{key,online:true}}));
+    });
+    presence.on("presence", {event:"leave"}, ({key})=>{
+      window.tafaOnlineIds=window.tafaOnlineIds||new Set(); window.tafaOnlineIds.delete(String(key));
+      window.dispatchEvent(new CustomEvent("tafass:presence-change", {detail:{key,online:false}}));
+    });
+    presence.subscribe(async status=>{
+      if(status==="SUBSCRIBED"){ try{ await presence.track({user_id:state.user.id, online_at:new Date().toISOString()}); }catch(_){} }
+    });
+    if (state.channel) {
+      try { await sb.removeChannel(state.channel); } catch (_) {}
+      state.channel = null;
+    }
+    if (realtimeRuntime.retryTimer) { clearTimeout(realtimeRuntime.retryTimer); realtimeRuntime.retryTimer=null; }
+
+    const channel = sb.channel(`tafa-live-ui:${state.user.id}`, { config:{ broadcast:{ self:false } } });
+    const refresh = {
+      profiles: async payload => {
+        const rec=payload?.new||payload?.record||payload;
+        const isMe=!rec?.id || rec.id===state.user.id;
+        if(isMe){
+          const before=state.profile?.account_status;
+          await loadProfile();
+          const after=state.profile?.account_status;
+          if(before!==after && (after==='active'||after==='restricted'||after==='blocked')) {
+            if(state.route!=='admin') await render();
+          }
+        }
+        if (state.route==="search") searchPage($("searchInput")?.value||"");
+        if (state.viewingProfileId && state.route==="profile") openUserProfile(state.viewingProfileId);
+      },
+      tafa_verification_requests: async payload => {
+        const rec=payload?.new||payload?.record||payload;
+        if(!rec?.user_id || String(rec.user_id)!==String(state.user.id)) return;
+        await loadVerificationRequests();
+        if(state.route==='verification') await verificationPage();
+        if(rec.status==='approved') toast('✓ Votre badge bleu est maintenant actif.');
+        if(rec.status==='rejected') toast('La demande de vérification a été refusée.');
+      },
+      tafa_message_themes: async payload => {
+        const rec=payload?.new||payload?.record||payload;
+        if(rec?.user_id && String(rec.user_id)!==String(state.user.id)) return;
+        if(state.route==='messages' && state.selectedConversation && (!rec?.conversation_id || String(rec.conversation_id)===String(state.selectedConversation))) {
+          await openConversation(state.selectedConversation);
+        }
+      },
+      tafa_account_appeals: async payload => {
+        const rec=payload?.new||payload?.record||payload;
+        if(rec?.user_id===state.user.id && state.profile?.account_status!=='active' && state.route!=='admin') {
+          if(state.route!=='home' && state.route!=='profile') return;
+        }
+        if(state.route==='admin') adminDashboardRefreshSoon();
+        if(rec?.user_id===state.user.id && state.route!=='admin') {
+          const before=state.profile?.account_status;
+          await loadProfile();
+          if(before!==state.profile?.account_status) await render();
+        }
+      },
+      posts: async () => { await loadPosts(); if (["home","profile","reels","saved"].includes(state.route)) render(); },
+      comments: async () => { await loadPosts(); if (["home","profile"].includes(state.route)) render(); },
+      comment_likes: () => { if (["home","profile"].includes(state.route)) render(); },
+      comment_reactions: () => { if (["home","profile"].includes(state.route)) render(); },
+      post_reactions: async () => { await loadPosts(); if (["home","profile"].includes(state.route)) render(); },
+      post_shares: async () => { await loadPosts(); if (["home","profile"].includes(state.route)) render(); },
+      notifications: payload => {
+        const rec=payload?.new || payload?.record || payload;
+        if(rec?.user_id && String(rec.user_id)!==String(state.user.id)) return;
+        const isNew=String(payload?.eventType||payload?.event||'').toUpperCase()==='INSERT' || !!payload?.new;
+        const incoming=rec?.user_id && String(rec.user_id)===String(state.user.id) && String(rec.actor_id||'')!==String(state.user.id) && rec?.is_read===false;
+        if(isNew && incoming){
+          const t=String(rec.type||'').toLowerCase();
+          playNotificationSound(/call|appel/.test(t)?'call':/friend|follow|request/.test(t)?'friend':'notification');
+          notificationSound.lastNotificationId=rec.id?String(rec.id):notificationSound.lastNotificationId;
+          notificationSound.lastNotificationCreatedAt=rec.created_at||notificationSound.lastNotificationCreatedAt;
+          const title=rec.title || "Nouvelle notification";
+          if(state.route!=="notifications") toast(title);
+          else setTimeout(()=>notificationsPage(),0);
+        }
+        updateBadges();
+        if (state.route==="notifications") setTimeout(()=>notificationsPage(),0);
+      },
+      messages: payload => {
+        const rec=payload?.new || payload?.record || payload;
+        const isNew=String(payload?.eventType||payload?.event||'').toUpperCase()==='INSERT' || !!payload?.new;
+        if(isNew && rec?.sender_id && String(rec.sender_id)!==String(state.user.id) && rec?.is_read!==true){
+          playNotificationSound('message');
+        }
+        updateBadges();
+        if (state.route==="messages") state.selectedConversation ? openConversation(state.selectedConversation) : messagesPage();
+      },
+      friend_requests: payload => {
+        const rec=payload?.new || payload?.record || payload;
+        const isNew=String(payload?.eventType||payload?.event||'').toUpperCase()==='INSERT' || !!payload?.new;
+        if(isNew && rec?.receiver_id && String(rec.receiver_id)===String(state.user.id) && String(rec.sender_id||'')!==String(state.user.id) && String(rec.status||'pending')==='pending') playNotificationSound('friend');
+        updateBadges(); if (state.route==="friends") friendsPage(); if (state.viewingProfileId && state.route==="profile") openUserProfile(state.viewingProfileId);
+      },
+      friendships: payload => {
+        const rec=payload?.new || payload?.record || payload;
+        const isNew=String(payload?.eventType||payload?.event||'').toUpperCase()==='INSERT' || !!payload?.new;
+        if(isNew && rec && String(rec.user_id||'')!==String(state.user.id) && String(rec.friend_id||'')===String(state.user.id)) playNotificationSound('friend');
+        if (state.route==="friends") friendsPage(); if (state.viewingProfileId && state.route==="profile") openUserProfile(state.viewingProfileId);
+      },
+      follows: () => { if (state.route==="profile") state.viewingProfileId ? openUserProfile(state.viewingProfileId) : profilePage(state.profileTab); },
+      groups: () => { if (state.route==="groups") genericListPage("groups"); },
+      group_members: () => { if (state.route==="groups") genericListPage("groups"); },
+      pages: () => { if (state.route==="pages") genericListPage("pages"); },
+      page_followers: () => { if (state.route==="pages") genericListPage("pages"); const id=document.querySelector('.page-detail')?.dataset.pageId; if(id) openPageDetail(id); },
+      saved_posts: () => { if (state.route==="saved") genericListPage("saved"); },
+      user_settings: () => { if (state.route==="settings") settingsPage(); },
+      audience_settings: () => { if (state.route==="settings" && state.settingsDetailAction) openAdvancedSetting(state.settingsDetailAction); },
+      family_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="family-center") openAdvancedSetting("family-center"); },
+      reaction_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="reaction-settings") openAdvancedSetting("reaction-settings"); },
+      accessibility_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="accessibility-settings") openAdvancedSetting("accessibility-settings"); },
+      media_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="media-settings") openAdvancedSetting("media-settings"); },
+      time_management_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="time-management") openAdvancedSetting("time-management"); },
+      effects_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="effects-settings") openAdvancedSetting("effects-settings"); },
+      profile_identification_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="profile-identification") openAdvancedSetting("profile-identification"); },
+      online_status_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="online-status") openAdvancedSetting("online-status"); },
+      location_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="location-settings") openAdvancedSetting("location-settings"); },
+      professional_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="professional-mode") openAdvancedSetting("professional-mode"); },
+      connected_apps: () => { if (state.route==="settings" && state.settingsDetailAction==="apps-web") openAdvancedSetting("apps-web"); },
+      professional_integrations: () => { if (state.route==="settings" && state.settingsDetailAction==="professional-integrations") openAdvancedSetting("professional-integrations"); },
+      story_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="story-privacy") openAdvancedSetting("story-privacy"); },
+      publication_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="post-privacy") openAdvancedSetting("post-privacy"); },
+      public_content_settings: () => { if (state.route==="settings" && state.settingsDetailAction==="followers-public") openAdvancedSetting("followers-public"); },
+      search_history: () => { if (state.route==="search") searchPage($("searchInput")?.value||""); },
+      activity_history: () => {
+        // V98: activity updates must not rebuild the Menu while it is being scrolled.
+        // The Menu contains navigation cards, not live activity data.
+      },
+      blocked_profiles: () => { if (state.viewingProfileId && state.route==="profile") openUserProfile(state.viewingProfileId); },
+      profile_reports: () => {},
+      payment_transactions: () => { if (state.route==="settings") servicePage("payment"); },
+      stories: () => { if (state.route==="home") render(); },
+      story_views: () => { if (state.route==="home") render(); },
+      reels: () => { if (state.route==="reels") render(); },
+      calls: () => { if (state.route==="messages" && state.selectedConversation) openConversation(state.selectedConversation); },
+      call_participants: () => { if (state.route==="messages" && state.selectedConversation) openConversation(state.selectedConversation); },
+      media_assets: () => {},
+      page_members: () => { if (state.businessSuiteOpen) pageBusinessSuite(); if (state.route==="pages") genericListPage("pages"); const id=document.querySelector('.page-detail')?.dataset.pageId; if(id) openPageDetail(id); },
+      page_posts: () => { if (state.businessSuiteOpen) pageBusinessSuite(); const id=document.querySelector('.page-detail')?.dataset.pageId; if(id) openPageDetail(id); },
+      page_post_reactions: () => { const id=document.querySelector('.page-detail')?.dataset.pageId; if(id) openPageDetail(id); },
+      page_post_comments: () => { const id=document.querySelector('.page-detail')?.dataset.pageId; if(id) openPageDetail(id); },
+      page_post_shares: () => { const id=document.querySelector('.page-detail')?.dataset.pageId; if(id) openPageDetail(id); },
+      page_messages: () => { updateBadges(); if (state.businessSuiteOpen) pageBusinessSuite(); const id=document.querySelector('.page-detail')?.dataset.pageId; if(id && document.querySelector('.page-inbox-modal')) pageInbox(id); },
+      group_posts: () => { const id=document.querySelector('.group-detail')?.querySelector('[data-action="group-publish"]')?.dataset.id; if(id) document.querySelector(`[data-action="group-open"][data-id="${id}"]`)?.click(); },
+      group_post_reactions: () => {
+        const root=document.querySelector('.group-detail'); const id=root?.querySelector('[data-action="group-publish"]')?.dataset.id;
+        if(id && state.route==="groups") openGroupDetail(id);
+      },
+      group_post_comments: () => {
+        const root=document.querySelector('.group-detail'); const id=root?.querySelector('[data-action="group-publish"]')?.dataset.id;
+        if(id && state.route==="groups") openGroupDetail(id);
+      },
+      group_messages: () => {
+        updateBadges();
+        const modal=document.querySelector('.group-chat-modal');
+        const id=modal?.querySelector('[data-action="send-group-chat"]')?.dataset.id;
+        if(id) groupChat(id);
+      },
+      conversations: () => { if (state.route==="messages") state.selectedConversation ? openConversation(state.selectedConversation) : messagesPage(); },
+      tafab_conversation_aliases: () => { if (state.route==="messages" && state.selectedConversation) openConversation(state.selectedConversation); else if(state.route==="messages") messagesPage(); },
+      conversation_members: () => { if (state.route==="messages") messagesPage(); },
+      tafab_listings: () => { if (state.route==="tafab") servicePage("marketplace"); },
+      tafab_listing_messages: () => { if (state.route==="tafab") servicePage("marketplace"); },
+      tafab_ads: () => {},
+      tafab_events: () => { if (state.route==="events") eventsPage(); },
+      tafab_event_attendees: () => { if (state.route==="events") eventsPage(); },
+      tafab_creator_drafts: () => { if (state.route==="studio") creatorStudioPage(); },
+      tafab_live_gifts: () => { if (state.route==="creator") creatorMonetisationPage(); },
+      tafab_creator_subscriptions: () => { if (state.route==="creator") creatorMonetisationPage(); },
+      tafab_wallets: () => { if (state.route==="creator") creatorMonetisationPage(); },
+      tafab_withdrawal_requests: () => { if (state.route==="creator") creatorMonetisationPage(); },
+      tafab_creator_monetization: () => { if (state.route==="creator") creatorMonetisationPage(); },
+      tafab_creator_earnings: () => { if (state.route==="creator") creatorMonetisationPage(); },
+      tafab_creator_payout_methods: () => { if (state.route==="creator") creatorMonetisationPage(); },
+      tafab_music_tracks: () => { if (state.route==="music") musicHubPage(); },
+      tafab_music_likes: () => { if (state.route==="music") musicHubPage(); },
+      tafab_music_playlists: () => { if (state.route==="music") musicHubPage(); },
+      tafab_business_profiles: () => { if (state.route==="business") businessAdsPage(); },
+      tafab_ad_campaigns: () => { if (state.route==="business") businessAdsPage(); },
+      tafab_ad_events: () => { if (state.route==="business") businessAdsPage(); },
+      tafa_profile_wall_posts: () => { if(state.route==="profile" && state.viewingProfileId) openUserProfile(state.viewingProfileId); },
+      tafa_profile_wall_settings: () => { if(state.route==="profile" && state.viewingProfileId) openUserProfile(state.viewingProfileId); }
+    };
+
+    Object.keys(refresh).forEach(table => {
+      const change = { event:"*", schema:"public", table };
+      if(table === "notifications") change.filter = `user_id=eq.${state.user.id}`;
+      channel.on("postgres_changes", change, payload => {
+        try { refresh[table](payload); } catch (e) { console.warn("Tafaß realtime refresh error:", table, e); }
+      });
+    });
+
+    state.channel = channel;
+    channel.subscribe(status => {
+      realtimeRuntime.lastStatus=status;
+      if (status === "SUBSCRIBED") {
+        realtimeRuntime.retryCount=0; realtimeRuntime.reconnecting=false; networkBanner("");
+        updateBadges();
+        console.info("Tafaß Realtime: connecté");
+        startNotificationSoundFallback();
+      }
+      if (["CHANNEL_ERROR","TIMED_OUT","CLOSED"].includes(status)) {
+        console.warn("Tafaß Realtime:", status);
+        scheduleRealtimeReconnect();
+      }
+    });
+  }
+
+  async function profileIsComplete() {
+    if (!state.user) return false;
+    await loadProfile();
+    const p = state.profile || {};
+    return Boolean(
+      String(state.user.email || p.email || '').trim() &&
+      String(p.first_name || '').trim() &&
+      String(p.last_name || '').trim() &&
+      p.birth &&
+      String(p.gender || '').trim() &&
+      String(p.phone || '').trim() &&
+      String(p.country || '').trim() &&
+      String(p.city_current || '').trim() &&
+      String(p.city_origin || '').trim()
+    );
+  }
+
+  function showOAuthOnboarding() {
+    state.detectedCountry = detectCountry();
+    const p = state.profile || {};
+    // OAuth onboarding is a dedicated locked auth view, never a modal.
+    // This prevents the old form from remaining underneath and appearing duplicated.
+    closeModal();
+    document.querySelectorAll('#oauthOnboardingView, .onboarding-modal-v23, .onboarding-modal-v24').forEach(el => el.remove());
+    ["loginView","signupView","forgotPasswordView","resetPasswordView"].forEach(id => $(id)?.classList.add("hidden"));
+    const shell = document.querySelector(".auth-shell");
+    if (!shell) return;
+    let view = $("oauthOnboardingView");
+    if (!view) {
+      view = document.createElement("div");
+      view.id = "oauthOnboardingView";
+      view.className = "auth-view oauth-onboarding-view-v24";
+      shell.appendChild(view);
+    }
+    view.innerHTML = `<button type="button" class="page-back auth-onboarding-back" data-action="auth-onboarding-back"><span aria-hidden="true">‹</span><small>Connexion</small></button><div class="oauth-onboarding-head-v24">
+      <span class="eyebrow">TAFAß • PREMIÈRE CONNEXION</span>
+      <h1>Complétez votre compte</h1>
+      <p class="muted">Votre connexion Google est réussie. Complétez les informations obligatoires pour déverrouiller Tafaß.</p>
+    </div>
+    <div class="onboarding-grid-v24">
+      <label>Prénom<input id="onFirst" value="${esc(p.first_name||state.user?.user_metadata?.first_name||'')}" autocomplete="given-name" required></label>
+      <label>Nom<input id="onLast" value="${esc(p.last_name||state.user?.user_metadata?.last_name||'')}" autocomplete="family-name" required></label>
+      <label>Date de naissance<input id="onBirth" type="date" value="${esc(p.birth||'')}" required></label>
+      <label>Genre<select id="onGender" required><option value="">Choisir</option><option value="Homme" ${p.gender==='Homme'?'selected':''}>Homme</option><option value="Femme" ${p.gender==='Femme'?'selected':''}>Femme</option><option value="Autre" ${p.gender==='Autre'?'selected':''}>Autre</option></select></label>
+      <label class="wide">E-mail<input value="${esc(state.user?.email||p.email||'')}" type="email" readonly disabled></label>
+      <label>Téléphone<div class="phone-row phone-row-auto-v3"><span class="phone-prefix-v3">${esc(phoneMeta().code)}</span><input id="onPhone" value="${esc(normalizePhone(p.phone||"",phoneMeta()))}" type="tel" inputmode="numeric" maxlength="${phoneMeta().digits}" autocomplete="tel-national" placeholder="${phoneMeta().placeholder}" required></div><small class="phone-auto-note-v3">Pays détecté automatiquement : ${esc(phoneMeta().name)}. Entrez uniquement le numéro national.</small></label>
+      <label>Pays actuel<input id="onCountry" value="${esc(phoneMeta().name)}" readonly disabled required></label>
+      <label>Ville actuelle<input id="onCityCurrent" list="onMgCities" value="${esc(p.city_current||'')}" placeholder="Rechercher une ville…" autocomplete="off" required></label>
+      <label>Ville d’origine / Province<input id="onCityOrigin" list="onMgProvinces" value="${esc(p.city_origin||'')}" placeholder="Rechercher une province…" autocomplete="off" required></label>
+      ${cityListHTML('onMgCities',MG_CITIES)}${cityListHTML('onMgProvinces',MG_PROVINCES)}
+    </div>
+    <button class="primary big onboarding-submit-v24" data-action="complete-onboarding">Déverrouiller Tafaß</button>
+    <p class="onboarding-lock-note-v24">🔒 Cette étape est obligatoire. L’application reste verrouillée tant que les informations ne sont pas validées.</p>`;
+    view.classList.remove("hidden");
+    $("auth")?.classList.remove("hidden");
+    shell.scrollTop = 0;
+  }
+
+  async function completeOnboarding() {
+    const first=$('onFirst')?.value.trim()||'', last=$('onLast')?.value.trim()||'', birth=$('onBirth')?.value||'', gender=$('onGender')?.value||'', phone=normalizePhone($('onPhone')?.value||'',phoneMeta()), country=phoneMeta().name, current=$('onCityCurrent')?.value.trim()||'', origin=$('onCityOrigin')?.value.trim()||'';
+    if(!first||!last||!birth||!gender||!phone||!country||!current||!origin) return toast('Remplissez toutes les informations obligatoires.');
+    if(!phoneMeta().test.test(phone)) return toast(`Numéro invalide pour ${phoneMeta().name}. Entrez uniquement les chiffres sans ${phoneMeta().code}.`);
+    if(!validCity(current)) return toast('Sélectionnez une ville actuelle réelle dans la liste.');
+    if(!validProvince(origin)) return toast('Sélectionnez une province réelle de Madagascar dans la liste.');
+    const d=new Date(birth+'T00:00:00'), now=new Date();
+    const age=now.getFullYear()-d.getFullYear()-((now.getMonth()<d.getMonth()||(now.getMonth()===d.getMonth()&&now.getDate()<d.getDate()))?1:0);
+    if(age<18) return toast('Vous devez avoir au moins 18 ans.');
+    const btn=document.querySelector('[data-action="complete-onboarding"]'); setLoading(btn,true,'Déverrouiller Tafaß');
+    const row={id:state.user.id,first_name:first,last_name:last,email:state.user.email||'',birth,gender,phone,phone_code:phoneMeta().code,country,city_current:current,city_origin:origin,location:current,updated_at:new Date().toISOString()};
+    try {
+      const savePromise=(async()=>{
+        const u=await sb.from('profiles').update(row).eq('id',state.user.id);
+        if(!u.error && (u.data || u.count !== 0)) return u;
+        const i=await sb.from('profiles').insert(row);
+        return i;
+      })();
+      const result=await Promise.race([
+        savePromise,
+        new Promise(resolve=>setTimeout(()=>resolve({error:{message:'Supabase ne répond pas. Vérifiez votre connexion puis réessayez.'}}),10000))
+      ]);
+      if(result?.error){ setLoading(btn,false,'Déverrouiller Tafaß'); return toast('Impossible d’enregistrer le profil : '+result.error.message); }
+      await loadProfile();
+      const complete=Boolean(state.profile&&String(state.user.email||state.profile.email||'').trim()&&String(state.profile.first_name||'').trim()&&String(state.profile.last_name||'').trim()&&state.profile.birth&&String(state.profile.gender||'').trim()&&String(state.profile.phone||'').trim()&&String(state.profile.country||'').trim()&&String(state.profile.city_current||'').trim()&&String(state.profile.city_origin||'').trim());
+      if(!complete){ setLoading(btn,false,'Déverrouiller Tafaß'); return toast('Le profil n’a pas été enregistré complètement. Réessayez.'); }
+      $('oauthOnboardingView')?.remove(); $('auth')?.classList.add('hidden'); $('app')?.classList.remove('hidden'); state.entering=false;
+      await loadPosts(); await setupRealtime(); ensureLiveFeedRealtime(); setupTafaPushNotifications({requestPermission:false}); await render(); toast('Compte complété. Bienvenue sur Tafaß.');
+    } catch(e){ setLoading(btn,false,'Déverrouiller Tafaß'); toast(e?.message||'Impossible de valider le compte.'); }
+  }
+
+  // ============================================================
+  // TAFAß — TEMPS D'UTILISATION / BIEN-ÊTRE NUMÉRIQUE
+  // Compte le temps réellement passé au premier plan. Les administrateurs
+  // officiels sont exemptés. Le compteur survit à un simple rechargement
+  // de la page pendant la même session, puis est effacé à la déconnexion.
+  // ============================================================
+  const TIME_LIMIT_KEY = "tafass_usage_limit_v40";
+  function accountAgeYears(){
+    const b=state.profile?.birth || state.profile?.birth_date || state.user?.user_metadata?.birth || state.user?.user_metadata?.birth_date;
+    if(!b)return null;
+    const d=new Date(String(b).slice(0,10)+"T00:00:00");
+    if(Number.isNaN(d.getTime()))return null;
+    const now=new Date(); let age=now.getFullYear()-d.getFullYear();
+    const md=now.getMonth()-d.getMonth();
+    if(md<0 || (md===0 && now.getDate()<d.getDate())) age--;
+    return age;
+  }
+  function timeLimitPolicy(){
+    const age=accountAgeYears();
+    const minor=age!==null && age<18;
+    const first=minor?15:30;
+    const second=minor?30:60;
+    const final=minor?45:90;
+    return {minor,age,warningMinutes:first,secondWarningMinutes:second,logoutMinutes:final,policyId:minor?'under18':'adult'};
+  }
+  function isOfficialAdmin(){ return isAdminProfile(state.profile)||state.profile?.is_admin===true||state.profile?.admin_badge===true; }
+  function readUsageRuntime(){
+    try{
+      const raw=sessionStorage.getItem(TIME_LIMIT_KEY); if(!raw)return {activeSeconds:0};
+      const x=JSON.parse(raw); return {activeSeconds:Math.max(0,Number(x.activeSeconds)||0)};
+    }catch{return {activeSeconds:0};}
+  }
+  function writeUsageRuntime(){
+    if(!state.timeLimitRuntime)return;
+    try{sessionStorage.setItem(TIME_LIMIT_KEY,JSON.stringify({activeSeconds:Math.floor(state.timeLimitRuntime.activeSeconds||0)}));}catch{}
+  }
+  function removeUsageRuntime(){try{sessionStorage.removeItem(TIME_LIMIT_KEY);}catch{}}
+  function closeTimeLimitOverlay(){
+    const o=state.timeLimitOverlay; if(o)o.remove(); state.timeLimitOverlay=null; document.body.classList.remove('time-limit-locked');
+  }
+  function showTimeLimitOverlay(mode='warning',minutesUsed=0){
+    closeTimeLimitOverlay();
+    const policy=timeLimitPolicy(), limit=policy.logoutMinutes, next=policy.warningMinutes, second=policy.secondWarningMinutes;
+    const used=Math.floor(minutesUsed);
+    const remaining=Math.max(0,limit-used);
+    const final=mode==='final';
+    const title=final?'Temps maximal atteint':'Petit rappel Tafaß';
+    const copy=mode==='intro'
+      ? `${policy.minor?'Votre compte est identifié comme ayant moins de 18 ans.':'Votre compte est identifié comme ayant 18 ans ou plus.'} Tafaß adapte automatiquement la gestion du temps à cette tranche d’âge. Le compteur mesure uniquement le temps réellement passé au premier plan : il s’arrête lorsque l’application passe en arrière-plan. Premier rappel à ${policy.warningMinutes} min, deuxième avertissement à ${second} min, puis déconnexion automatique à ${limit} min.`
+      : final
+      ? `Votre temps d’utilisation autorisé pour cette session est arrivé à ${limit} minutes. Pour préserver un usage équilibré, Tafaß va fermer cette session et vous déconnecter.`
+      : `${policy.minor?'Votre compte a moins de 18 ans.':'Votre compte a 18 ans ou plus.'} Vous utilisez Tafaß depuis ${used} minute${used>1?'s':''}. ${used < second ? `Le prochain palier est ${second} minutes.` : `La limite finale est ${limit} minutes.`} Prenez une pause si vous êtes resté longtemps connecté.`;
+    const o=document.createElement('div'); o.className='time-limit-overlay'; o.innerHTML=`<div class="time-limit-card" role="dialog" aria-modal="true" aria-labelledby="timeLimitTitle">
+      <div class="time-limit-brand"><span class="time-limit-logo">T</span><div><b>Tafaß</b><small>Gestion du temps</small></div><span class="time-limit-status">${final?'FIN DE SESSION':mode==='intro'?'INFORMATION':'RAPPEL'}</span></div>
+      <div class="time-limit-icon">${final?'⏱':'◷'}</div>
+      <span class="eyebrow">TAFAß · BIEN-ÊTRE NUMÉRIQUE</span>
+      <h2 id="timeLimitTitle">${title}</h2>
+      <p>${copy}</p>
+      <div class="time-limit-progress"><span style="width:${Math.min(100,Math.round((used/limit)*100))}%"></span></div>
+      <div class="time-limit-stats"><div><b>${used} min</b><small>Utilisées</small></div><div><b>${limit} min</b><small>Limite</small></div><div><b>${remaining} min</b><small>Restantes</small></div></div>
+      <div class="time-limit-rules"><div><b>${policy.minor?'15 min':'30 min'}</b><span>Premier rappel</span></div><div><b>${second} min</b><span>Deuxième rappel</span></div><div><b>${limit} min</b><span>Déconnexion automatique</span></div></div>
+      <div class="time-limit-actions">${final?`<button class="primary big" data-time-limit-logout>Se déconnecter</button>`:mode==='intro'?`<button class="primary big" data-time-limit-continue>J’ai compris, entrer dans Tafaß</button>`:`<button class="ghost-action big" data-time-limit-logout>Se déconnecter maintenant</button><button class="primary big" data-time-limit-continue>Annuler et continuer</button>`}</div>
+      <small class="time-limit-footnote">Vous pouvez quitter Tafaß à tout moment. La déconnexion arrête le compteur de cette session.</small>
+    </div>`;
+    document.body.appendChild(o); state.timeLimitOverlay=o; document.body.classList.add('time-limit-locked');
+    o.querySelector('[data-time-limit-continue]')?.addEventListener('click',()=>closeTimeLimitOverlay());
+    o.querySelector('[data-time-limit-logout]')?.addEventListener('click',()=>{closeTimeLimitOverlay();newLogout();});
+    if(final) setTimeout(()=>{ if(state.timeLimitOverlay===o && state.user){ closeTimeLimitOverlay(); newLogout(); } },1800);
+  }
+  async function startTimeLimitGuard(){
+    if(!state.user || isOfficialAdmin())return;
+    if(state.timeLimitTimer)clearInterval(state.timeLimitTimer);
+    const policy=timeLimitPolicy();
+    let saved=readUsageRuntime();
+    try{
+      const raw=sessionStorage.getItem(TIME_LIMIT_KEY+'_policy');
+      if(raw!==policy.policyId){
+        sessionStorage.setItem(TIME_LIMIT_KEY+'_policy',policy.policyId);
+        saved={activeSeconds:0};
+        sessionStorage.removeItem(TIME_LIMIT_KEY);
+      }
+    }catch{}
+    const firstSec=policy.warningMinutes*60, secondSec=policy.secondWarningMinutes*60, endSec=policy.logoutMinutes*60;
+    state.timeLimitRuntime={activeSeconds:saved.activeSeconds||0,lastWarning:(saved.activeSeconds||0)>=endSec?3:(saved.activeSeconds||0)>=secondSec?2:(saved.activeSeconds||0)>=firstSec?1:0,policy};
+    const usedMin=state.timeLimitRuntime.activeSeconds/60;
+    // Explain the rules before the first usable screen, once per session.
+    if(!sessionStorage.getItem(TIME_LIMIT_KEY+'_intro')){
+      try{sessionStorage.setItem(TIME_LIMIT_KEY+'_intro','1');}catch{}
+      showTimeLimitOverlay('intro',usedMin);
+    }
+    state.timeLimitTimer=setInterval(()=>{
+      if(!state.user || isOfficialAdmin())return;
+      if(document.visibilityState!=='visible')return;
+      state.timeLimitRuntime.activeSeconds+=1;
+      const sec=state.timeLimitRuntime.activeSeconds, mins=sec/60;
+      const first=policy.warningMinutes*60, second=policy.secondWarningMinutes*60, end=policy.logoutMinutes*60;
+      if(sec>=end){clearInterval(state.timeLimitTimer);state.timeLimitTimer=null;writeUsageRuntime();showTimeLimitOverlay('final',mins);return;}
+      if(sec>=second && state.timeLimitRuntime.lastWarning<2){state.timeLimitRuntime.lastWarning=2;writeUsageRuntime();showTimeLimitOverlay('warning',mins);return;}
+      if(sec>=first && state.timeLimitRuntime.lastWarning<1){state.timeLimitRuntime.lastWarning=1;writeUsageRuntime();showTimeLimitOverlay('warning',mins);return;}
+      if(sec%15===0)writeUsageRuntime();
+    },1000);
+  }
+  function stopTimeLimitGuard(){if(state.timeLimitTimer){clearInterval(state.timeLimitTimer);state.timeLimitTimer=null;}closeTimeLimitOverlay();removeUsageRuntime();}
+  function timeLimitSettingsHTML(){
+    const p=timeLimitPolicy();
+    return `<section class="time-limit-settings-v40"><div class="time-limit-settings-hero"><div class="time-limit-settings-logo">T</div><div><span class="eyebrow">TAFAß · GESTION DU TEMPS</span><h3>Limites d’utilisation</h3><p>Ces rappels sont conçus pour encourager des pauses régulières et éviter une utilisation trop prolongée.</p></div></div><div class="time-limit-policy-grid"><div><b>${p.minor?'15':'30'} min</b><span>Premier rappel</span></div><div><b>${p.minor?'30':'60'} min</b><span>Deuxième rappel</span></div><div><b>${p.logoutMinutes} min</b><span>Déconnexion automatique</span></div></div><div class="settings-section-block time-limit-info-list"><div><b>À chaque rappel</b><small>Un écran Tafaß apparaît au-dessus de l’application, où que vous soyez. Vous pouvez continuer ou vous déconnecter.</small></div><div><b>Si vous continuez</b><small>Le compteur reprend et le prochain rappel arrive au palier suivant.</small></div><div><b>À la limite finale</b><small>Tafaß ferme automatiquement la session. Vous devrez vous reconnecter pour utiliser à nouveau le compte.</small></div><div><b>Administrateur officiel</b><small>Le compte administrateur officiel n’est pas soumis à cette limite.</small></div></div><button class="ghost-action big" data-action="time-limit-intro">Voir l’explication complète</button></section>`;
+  }
+
+  function showAppTransition(kind){
+    const id="tafass-app-transition";
+    let el=document.getElementById(id);
+    if(!el){
+      el=document.createElement("div"); el.id=id; el.className="tafass-app-transition";
+      el.innerHTML='<div class="tafass-transition-card"><img src="assets/tafass-logo-premium.svg" alt="Tafaß"><div class="tafass-transition-spinner" aria-hidden="true"></div><b data-transition-label>Ouverture…</b></div>';
+      document.body.appendChild(el);
+    }
+    el.dataset.kind=kind||"enter";
+    const label=el.querySelector("[data-transition-label]");
+    if(label) label.textContent=kind==="logout"?"Déconnexion…":"Ouverture…";
+    requestAnimationFrame(()=>el.classList.add("active"));
+    return el;
+  }
+  function hideAppTransition(){
+    const el=document.getElementById("tafass-app-transition");
+    if(!el)return;
+    el.classList.remove("active");
+    setTimeout(()=>el.remove(),180);
+  }
+
+  async function enterApp() {
+    if (state.entering || !state.user) return;
+    state.entering = true;
+    showAppTransition("enter");
+    // Never hide an already authenticated app during token refresh/background re-entry.
+    // The auth screen is shown only when there is genuinely no session.
+    const appWasVisible = !$("app")?.classList.contains("hidden");
+    if (!appWasVisible) $("app")?.classList.add("hidden");
+    document.body.classList.remove("modal-open");
+    document.body.classList.toggle("light", state.theme === "light");
+    syncThemeButton();
+    try{
+      await loadProfile();
+      // A valid Supabase session must be enough to open the app.
+      // Do not lock existing password accounts behind optional profile fields.
+      // OAuth users with no profile at all still receive the onboarding screen.
+      if (!state.profile?.id) {
+        showOAuthOnboarding();
+        return;
+      }
+      if (!splashFinished) finishSplash();
+      await splashReady;
+      $("auth").classList.add("hidden"); $("app").classList.remove("hidden");
+      await loadPosts(); await setupRealtime(); ensureLiveFeedRealtime();
+      // Refresh an already-granted subscription silently. If permission has
+      // never been decided, show one clear activation screen immediately
+      // after login so users do not have to search through Settings.
+      await setupTafaPushNotifications({requestPermission:false});
+      await render();
+      await startTimeLimitGuard();
+      hideAppTransition();
+      if(Notification.permission==="default") setTimeout(showLoginPushPrompt,220);
+    }finally{
+      state.entering = false;
+      if(!state.user) hideAppTransition();
+    }
+  }
+  async function signInWithProvider(provider) {
+    const allowed = ["google"];
+    // Supabase must have automatic identity linking enabled. When a verified
+    // Google e-mail already belongs to a confirmed account, Supabase
+    // then reuses that account instead of creating a second profile.
+
+    if (!allowed.includes(provider)) return;
+    const btn = document.querySelector(`[data-oauth="${provider}"]`);
+    if (btn) { btn.disabled = true; btn.classList.add("loading"); }
+    try {
+      const redirectTo = `${window.location.origin}${window.location.pathname}`;
+      const { error } = await sb.auth.signInWithOAuth({
+        provider,
+        options: { redirectTo, queryParams: { access_type: "offline", prompt: "select_account" } }
+      });
+      if (error) throw error;
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.classList.remove("loading"); }
+      const msg = String(e?.message || e || "Connexion impossible.");
+      if ($("authMsg")) $("authMsg").textContent = msg.includes("provider") || msg.includes("not enabled")
+        ? `La connexion Google n’est pas encore activée dans Supabase.`
+        : msg;
+    }
+  }
+
+  function syncAuthBack() {
+    const b = document.querySelector("[data-auth-back]");
+    const loginVisible = !$("loginView")?.classList.contains("hidden");
+    if (b) b.classList.toggle("hidden", loginVisible);
+  }
+  function showLogin() { ["signupView","forgotPasswordView","resetPasswordView"].forEach(id => $(id)?.classList.add("hidden")); $("loginView").classList.remove("hidden"); $("auth").classList.remove("hidden"); syncAuthBack(); }
+  state.detectedCountry = detectCountry();
+  let signupStep = 1;
+  function setSignupStep(step) {
+    signupStep = Math.max(1, Math.min(5, Number(step) || 1));
+    document.querySelectorAll("[data-signup-step]").forEach(el => el.classList.toggle("active", Number(el.dataset.signupStep) === signupStep));
+    document.querySelectorAll(".auth-step-indicator span").forEach((el, i) => el.classList.toggle("active", i < signupStep));
+    const subtitles = {1:"Commençons par votre identité",2:"Ajoutez vos coordonnées",3:"Sécurisez votre compte",4:"Complétez votre profil",5:"Une dernière confirmation avant de créer votre compte"};
+    if ($("signupStepSubtitle")) $("signupStepSubtitle").textContent = subtitles[signupStep];
+    $("signupView")?.scrollIntoView({block:"start",behavior:"smooth"});
+    const shell = document.querySelector(".auth-shell"); if (shell) shell.scrollTop = 0;
+  }
+  function validateSignupStep(step) {
+    if (step === 1) {
+      const first=$("firstName").value.trim(), last=$("lastName").value.trim();
+      if(first.length < 2 || last.length < 2){ toast("Indiquez votre prénom et votre nom."); return false; }
+    }
+    if (step === 2) {
+      const email=$("signupEmail").value.trim();
+      if(!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ toast("Entrez une adresse e-mail valide."); return false; }
+    }
+    if (step === 3) {
+      const password=$("signupPassword").value, confirm=$("signupPasswordConfirm").value;
+      if(password.length < 8){ toast("Le mot de passe doit contenir au moins 8 caractères."); return false; }
+      if(password !== confirm){ toast("Les deux mots de passe ne correspondent pas."); return false; }
+    }
+    if (step === 4 && $("birth")?.value) {
+      const d=new Date($("birth").value+"T00:00:00");
+      const now=new Date(); const age=now.getFullYear()-d.getFullYear()-((now.getMonth()<d.getMonth() || (now.getMonth()===d.getMonth() && now.getDate()<d.getDate()))?1:0);
+      if(age<18){ toast("Vous devez avoir au moins 18 ans pour créer un compte."); return false; }
+    }
+    return true;
+  }
+  function showSignup() {
+    ["loginView","forgotPasswordView","resetPasswordView"].forEach(id => $(id)?.classList.add("hidden"));
+    $("signupView").classList.remove("hidden"); $("auth").classList.remove("hidden");
+    syncAuthBack(); setSignupStep(1);
+    $("signupMsg").textContent="";
+    $("firstName")?.focus();
+  }
+  function showForgotPassword() {
+    ["loginView","signupView","resetPasswordView"].forEach(id => $(id)?.classList.add("hidden"));
+    $("forgotPasswordView")?.classList.remove("hidden");
+    $("auth")?.classList.remove("hidden"); syncAuthBack();
+    if ($("forgotEmail") && $("loginEmail")?.value.includes("@")) $("forgotEmail").value = $("loginEmail").value.trim();
+    $("forgotEmail")?.focus();
+  }
+  function showResetPassword(message="") {
+    ["loginView","signupView","forgotPasswordView"].forEach(id => $(id)?.classList.add("hidden"));
+    $("resetPasswordView")?.classList.remove("hidden");
+    $("auth")?.classList.remove("hidden"); syncAuthBack();
+    if ($("resetMsg")) $("resetMsg").textContent = message;
+  }
+  function resetRedirectUrl() {
+    return `${window.location.origin}${window.location.pathname}?reset=1`;
+  }
+  async function sendPasswordReset(e) {
+    if (e) e.preventDefault();
+    const email = $("forgotEmail")?.value.trim() || "";
+    if (!email || !email.includes("@")) {
+      if ($("forgotMsg")) $("forgotMsg").textContent = "Entrez une adresse e-mail valide.";
+      $("forgotEmail")?.focus();
+      return;
+    }
+    const btn=$("forgotPasswordSubmit");
+    if(btn){ btn.disabled=true; btn.textContent="Envoi en cours…"; }
+    if ($("forgotMsg")) $("forgotMsg").textContent="";
+    const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: resetRedirectUrl() });
+    if(btn){ btn.disabled=false; btn.textContent="Envoyer le lien de récupération"; }
+    if(error) { if ($("forgotMsg")) $("forgotMsg").textContent = error.message; return; }
+    if($("forgotMsg")) $("forgotMsg").textContent="Lien envoyé. Vérifiez votre boîte e-mail et vos spams, puis ouvrez le lien Tafaß pour définir votre nouveau mot de passe.";
+  }
+  async function saveResetPassword(e) {
+    e.preventDefault();
+    const password=$("resetPassword")?.value || "", confirm=$("resetPasswordConfirm")?.value || "";
+    if(password.length < 6) return toast("Le mot de passe doit contenir au moins 6 caractères.");
+    if(password !== confirm) return toast("Les deux mots de passe ne correspondent pas.");
+    const btn=$("resetPasswordSubmit");
+    if(btn){ btn.disabled=true; btn.textContent="Enregistrement…"; }
+    const { error } = await sb.auth.updateUser({ password });
+    if(error){ if(btn){btn.disabled=false;btn.textContent="Enregistrer le nouveau mot de passe";} return toast(error.message); }
+    if($("resetMsg")) $("resetMsg").textContent="Mot de passe modifié avec succès. Ouverture de votre compte…";
+    toast("Mot de passe modifié avec succès.");
+    $("resetPassword").value=""; $("resetPasswordConfirm").value="";
+    // La session de récupération reste valide : aucune reconnexion manuelle n'est nécessaire.
+    history.replaceState(null, "", window.location.pathname);
+    $("auth")?.classList.add("hidden");
+    $("app")?.classList.remove("hidden");
+    state.user = (await sb.auth.getUser()).data.user || state.user;
+    await enterApp();
+  }
+
+  async function pagePostMenu(postId,pageId){
+    const [{data:post,error:postErr},{data:page,error:pageErr}]=await Promise.all([
+      sb.from('page_posts').select('*').eq('id',postId).maybeSingle(),
+      sb.from('pages').select('id,name,owner_id').eq('id',pageId).maybeSingle()
+    ]);
+    if(postErr||!post)return toast(postErr?.message||'Publication introuvable.');
+    if(pageErr||!page)return toast(pageErr?.message||'Page introuvable.');
+    const canManage=String(page.owner_id)===String(state.user.id);
+    const canEdit=canManage;
+    const canDelete=canManage;
+    const link=`${location.origin}${location.pathname}#/pages/${pageId}?post=${encodeURIComponent(postId)}`;
+    openModal(`<div class="modal-box page-post-options-modal p91-post-menu">
+      <div class="p91-sheet-handle"></div>
+      <div class="p91-post-menu-head">
+        <div class="p91-menu-icon">•••</div>
+        <div><span class="eyebrow">TAFAß · PUBLICATION</span><h3>Options de la publication</h3><p>${esc(page.name)}</p></div>
+      </div>
+      <div class="page-post-options-list">
+        <button class="page-post-option" data-action="copy-page-post-link" data-link="${esc(link)}"><span>↗</span><div><b>Copier le lien</b><small>Conserver ou partager le lien exact</small></div></button>
+        <button class="page-post-option" data-action="page-post-share" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>⌁</span><div><b>Partager</b><small>Partager cette publication sur Tafaß</small></div></button>
+        ${canEdit?`<button class="page-post-option" data-action="edit-page-post" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>✎</span><div><b>Modifier</b><small>Modifier le contenu de la publication</small></div></button>`:''}
+        ${canDelete?`<button class="page-post-option danger" data-action="delete-page-post" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>⌫</span><div><b>Supprimer</b><small>Supprimer définitivement cette publication</small></div></button>`:''}
+        ${!canEdit?`<button class="page-post-option" data-action="page-post-report" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>⚑</span><div><b>Signaler la publication</b><small>Signaler un contenu qui ne respecte pas les règles</small></div></button>`:''}
+      </div>
+      <button class="p91-menu-cancel" data-action="close-modal">Annuler</button>
+    </div>`);
+  }
+
+  async function editPagePost(postId,pageId){
+    const {data:post,error}=await sb.from('page_posts').select('id,content,user_id').eq('id',postId).maybeSingle();
+    if(error||!post)return toast(error?.message||'Publication introuvable.');
+    const pg=(await sb.from('pages').select('owner_id').eq('id',pageId).maybeSingle()).data;
+    if(!pg || String(pg.owner_id)!==String(state.user.id))return toast('Accès refusé : seul le propriétaire peut modifier une publication de la Page.');
+    openModal(`<div class="modal-box page-post-edit-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß · MODIFICATION</span><h3>Modifier la publication</h3><textarea id="pagePostEditText" class="premium-input" maxlength="5000" placeholder="Votre publication…">${esc(post.content||'')}</textarea><div class="page-post-edit-actions"><button class="secondary" data-action="close-modal">Annuler</button><button class="primary" data-action="save-page-post-edit" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}">Enregistrer</button></div></div>`);
+    setTimeout(()=>$('pagePostEditText')?.focus(),50);
+  }
+
+  async function pagePostReaction(postId, pageId){
+    const {data:mine,error:readErr}=await sb.from('page_post_reactions').select('id').eq('page_post_id',postId).eq('user_id',state.user.id).maybeSingle();
+    if(readErr)return toast(readErr.message);
+    const r=mine?await sb.from('page_post_reactions').delete().eq('id',mine.id):await sb.from('page_post_reactions').insert({page_post_id:postId,user_id:state.user.id,reaction_type:'like'});
+    if(r.error)return toast(r.error.message);
+    return openPageDetail(pageId);
+  }
+  async function pagePostComment(postId,pageId){
+    openModal(`<div class="modal-box interaction-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • COMMENTAIRE</span><h3>Commenter la publication</h3><textarea id="pageCommentInput" class="premium-input" maxlength="2000" placeholder="Écrivez votre commentaire…"></textarea><button class="primary big" data-action="page-send-comment" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}">Publier le commentaire</button></div>`);
+    setTimeout(()=>$('pageCommentInput')?.focus(),50);
+  }
+  async function pagePostShare(postId,pageId){
+    const {error}=await sb.from('page_post_shares').insert({page_post_id:postId,user_id:state.user.id,share_message:''});
+    if(error)return toast(error.message);
+    toast('Publication partagée.');
+    return openPageDetail(pageId);
+  }
+  async function groupPostReaction(postId,groupId){
+    const {data:mine,error:readErr}=await sb.from('group_post_reactions').select('id').eq('group_post_id',postId).eq('user_id',state.user.id).maybeSingle();
+    if(readErr)return toast(readErr.message);
+    const r=mine?await sb.from('group_post_reactions').delete().eq('id',mine.id):await sb.from('group_post_reactions').insert({group_post_id:postId,user_id:state.user.id,reaction_type:'like'});
+    if(r.error)return toast(r.error.message);
+    return reopenGroupDetail(groupId);
+  }
+  async function groupPostComment(postId,groupId){
+    openModal(`<div class="modal-box interaction-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • GROUPE</span><h3>Commenter la publication</h3><textarea id="groupCommentInput" class="premium-input" maxlength="2000" placeholder="Écrivez votre commentaire…"></textarea><button class="primary big" data-action="group-send-comment" data-id="${esc(postId)}" data-entity-id="${esc(groupId)}">Publier le commentaire</button></div>`);
+    setTimeout(()=>$('groupCommentInput')?.focus(),50);
+  }
+  async function groupPostShare(postId,groupId){
+    const {data:original,error:readErr}=await sb.from('group_posts').select('*').eq('id',postId).maybeSingle();
+    if(readErr||!original)return toast(readErr?.message||'Publication introuvable.');
+    const {data:owner}=await sb.from('profiles').select('first_name,last_name,username').eq('id',original.user_id).maybeSingle();
+    const {data:group}=await sb.from('groups').select('name').eq('id',groupId).maybeSingle();
+    const {error}=await sb.from('group_post_shares').insert({group_post_id:postId,user_id:state.user.id,share_message:''});
+    if(error)return toast(error.message);
+    const clone={group_id:groupId,user_id:state.user.id,content:original.content||'',media_url:original.media_url||null,media_type:original.media_type||null,visibility:original.visibility||'public',shared_from_group_post_id:original.id,shared_from_user_id:original.user_id,shared_from_user_name:nameOf(owner||{}),shared_from_group_name:group?.name||'Groupe Tafaß'};
+    const cr=await sb.from('group_posts').insert(clone);
+    if(cr.error)return toast('Partage enregistré, mais la publication n’a pas pu être republiée dans le groupe : '+cr.error.message);
+    toast('✓ Publication partagée dans le groupe.');
+    return reopenGroupDetail(groupId);
+  }
+  async function reopenGroupDetail(id){
+    const listBtn=document.querySelector(`[data-action="group-open"][data-id="${CSS.escape(id)}"]`);
+    if(listBtn){ listBtn.click(); return; }
+    return toast('Actualisez les Groupes pour rouvrir cette communauté.');
+  }
+  async function openPageDetail(id){
+    const {data:x,error:xerr}=await fetchPageById(id);
+    if(xerr) return toast(xerr.message);
+    if(!x) return toast('Page introuvable.');
+    const [follow,followers,owner,members,posts]=await Promise.all([
+      sb.from('page_followers').select('page_id,user_id').eq('page_id',id).eq('user_id',state.user.id).maybeSingle(),
+      sb.from('page_followers').select('page_id',{count:'exact',head:true}).eq('page_id',id),
+      sb.from('profiles').select('first_name,last_name,username,avatar_url,email,phone,country,city_current,bio').eq('id',x.owner_id).maybeSingle(),
+      sb.from('page_members').select('user_id,role,profiles(first_name,last_name,username,avatar_url)').eq('page_id',id).order('created_at',{ascending:true}),
+      sb.from('page_posts').select('*,page_post_reactions(id,user_id,reaction_type),page_post_comments(id,user_id,content,created_at,profiles(first_name,last_name,username,avatar_url)),page_post_shares(id,user_id)').eq('page_id',id).order('created_at',{ascending:false}).limit(30)
+    ]);
+    if(posts.error) return toast(posts.error.message);
+    const ownerMe=x.owner_id===state.user.id;
+    const nameHistoryR=await sb.from('activity_history').select('description,created_at').eq('user_id',x.owner_id).eq('entity_type','page').eq('entity_id',id).eq('action_type','page_name_changed').order('created_at',{ascending:false}).limit(10);
+    const nameHistory=nameHistoryR.data||[];
+    const previousName=nameHistory[0]?.description ? (String(nameHistory[0].description).match(/Ancien nom\s*:\s*(.*?)\s*→/)||[])[1] : '';
+    const myRole=(members.data||[]).find(m=>m.user_id===state.user.id)?.role || null;
+    const canManage=ownerMe || ['owner','admin'].includes(myRole);
+    const canPublish=ownerMe || ['owner','admin'].includes(myRole);
+    const followerCount=followers.count||0;
+    const postCount=posts.data?.length||0;
+    const avatar=entityAvatarHTML(x,'page','page-detail-avatar');
+    const postRows=(posts.data||[]).map(p=>{
+      const reactions=p.page_post_reactions||[], comments=p.page_post_comments||[], shares=p.page_post_shares||[];
+      const mine=reactions.some(r=>r.user_id===state.user.id);
+      const commentPreview=comments.slice(-3).map(c=>`<div class="page-comment-row">${avatarHTML(c.profiles||{},'avatar page-comment-avatar')}<div><b>${esc(nameOf(c.profiles||{}))}</b><span>${esc(c.content||'')}</span><small>${timeAgo(c.created_at)}</small></div></div>`).join('');
+      return `<article class="page-post-card" data-page-post="${esc(p.id)}">
+        <header class="page-post-head"><div class="page-post-author">${entityAvatarHTML(x,'page','page-post-avatar')}<div><b>${esc(x.name)}</b><small>${timeAgo(p.created_at)} · Page</small></div></div>${(p.user_id===state.user.id||canManage)?`<button class="page-icon-btn" data-action="page-post-more" data-id="${esc(p.id)}" data-entity-id="${esc(id)}" aria-label="Options de la publication">⋯</button>`:''}</header>
+        ${p.content?`<div class="page-post-text">${esc(p.content)}</div>`:''}
+        ${p.media_url?(String(p.media_type||'').startsWith('video')?`<video class="page-post-media" src="${esc(p.media_url)}" controls playsinline preload="metadata"></video>`:`<img class="page-post-media" src="${esc(p.media_url)}" alt="Publication ${esc(x.name)}" loading="lazy">`):''}
+        <div class="page-post-stats"><span>${reactions.length} réaction${reactions.length===1?'':'s'}</span><span>${comments.length} commentaire${comments.length===1?'':'s'}</span><span>${shares.length} partage${shares.length===1?'':'s'}</span></div>
+        <div class="page-post-actions"><button class="${mine?'active':''}" data-action="page-post-like" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">${mine?'♥':'♡'} J’aime</button><button data-action="page-post-comment" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">💬 Commenter</button><button data-action="share-page-post" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">↗ Partager</button></div>
+        ${commentPreview?`<div class="page-comments-preview">${commentPreview}</div>`:''}
+      </article>`;
+    }).join('') || `<div class="page-empty-state"><div class="page-empty-icon">✦</div><b>Aucune publication pour le moment</b><span>Les nouvelles publications de la Page apparaîtront ici instantanément.</span></div>`;
+    const team=(members.data||[]).map(m=>`<div class="page-team-row">${avatarHTML(m.profiles||{},'avatar page-team-avatar')}<div class="grow"><b>${esc(nameOf(m.profiles||{}))}</b><small>${esc(m.role||'editor')}</small></div>${canManage&&m.user_id!==state.user.id?`<button class="page-team-role" data-action="page-member-menu" data-id="${esc(m.user_id)}" data-entity-id="${esc(id)}">⋯</button>`:''}</div>`).join('') || '<div class="muted">Aucun gestionnaire supplémentaire.</div>';
+    const ownerName=owner.data?nameOf(owner.data):'';
+    const about=`<div class="page-info-grid"><div><small>Catégorie</small><b>${esc(x.category||'Autre')}</b></div><div><small>Créée le</small><b>${new Date(x.created_at).toLocaleDateString('fr-FR')}</b></div><div><small>Responsable</small><b>${esc(ownerName||'Membre Tafaß')}</b></div><div><small>Adresse</small><b>${esc(x.address||owner.data?.city_current||'Non renseignée')}</b></div>${previousName?`<div class="wide page-old-name-detail"><small>Ancien nom</small><b>${esc(previousName)}</b><em>Nom précédent enregistré le ${new Date(nameHistory[0].created_at).toLocaleDateString('fr-FR')}</em></div>`:''}${x.contact_email?`<div><small>E-mail</small><b>${esc(x.contact_email)}</b></div>`:''}${x.contact_phone?`<div><small>Téléphone</small><b>${esc(x.contact_phone)}</b></div>`:''}${x.website_url?`<div class="wide"><small>Site web</small><b>${esc(x.website_url)}</b></div>`:''}</div>`;
+    setupTafaV80Realtime('page',id);
+    openModal(`<div class="modal-box page-premium-modal page-detail fb-style-detail" data-page-id="${esc(id)}">
+      <button class="entity-back-btn" data-action="close-entity" data-route-back="${esc(state.entityBackRoute || "pages")}" aria-label="Retour aux Pages"><span>‹</span><small>Pages</small></button>
+      <div class="page-cover" ${x.cover_url?`style="background-image:url('${esc(x.cover_url)}')"`:''}><div class="page-cover-overlay"></div><div class="page-live-badge">● PAGE</div></div>
+      <div class="page-profile-head page-profile-head-v2"><div class="page-avatar-wrap">${avatar}<span class="page-verified">✓</span></div></div>
+      <div class="page-profile-copy-v2"><h2>${esc(x.name)}</h2>${x.deletion_status==='pending_deletion'?`<div class="tfa-v80-deletion-alert">⚠ Suppression prévue le ${new Date(x.deletion_scheduled_at).toLocaleDateString('fr-FR')} · récupérable pendant 15 jours</div>`:""}${x.username?`<div class="page-handle">@${esc(x.username)}</div>`:''}<p>${esc(x.bio||'Présentez votre activité, votre communauté et vos actualités.')}</p><div class="page-follow-line"><span><b>${followerCount}</b> abonnés</span><span><b>${postCount}</b> publications</span></div></div>
+      <div class="page-top-actions page-primary-actions">${ownerMe?`<button class="page-action primary" data-action="page-switch" data-id="${esc(id)}">⇄ Basculer</button><button class="page-action secondary" data-action="edit-page" data-id="${esc(id)}">⚙ Gérer</button><button class="page-action secondary" data-action="page-share" data-id="${esc(id)}">↗ Partager</button>`:`<button class="page-action ${follow.data?'secondary':'primary'}" data-action="toggle-page-follow" data-id="${esc(id)}">${follow.data?'✓ Suivie':'＋ Suivre'}</button><button class="page-action secondary" data-action="page-contact" data-id="${esc(id)}">💬 Messages</button><button class="page-action secondary" data-action="page-share" data-id="${esc(id)}">↗ Partager</button>`}</div>
+      <nav class="page-tabs page-tabs-distinct"><button class="active" data-action="page-tab" data-tab="posts" data-id="${esc(id)}">Publications</button><button data-action="page-tab" data-tab="about" data-id="${esc(id)}">À propos</button><button data-action="page-tab" data-tab="team" data-id="${esc(id)}">Communauté</button></nav>
+      ${canPublish?`<section class="page-composer"><div class="page-composer-title"><span>✦</span><div><b>Publier en tant que ${esc(x.name)}</b><small>${myRole==='editor'?'Éditeur':'Gestionnaire'}</small></div></div><textarea id="pagePostText" maxlength="5000" placeholder="Partagez une actualité avec vos abonnés…"></textarea><div class="page-composer-bottom"><label class="page-media-btn">＋ Média<input id="pagePostMedia" type="file" accept="image/*,video/*" hidden></label><span id="pagePostMediaName">Aucun fichier</span><button class="page-publish-btn" data-action="page-publish" data-id="${esc(id)}">Publier</button></div></section>`:''}
+      <section class="page-tab-panel page-live-section" data-tab="posts"><div class="page-section-title"><div><span>ACTUALITÉ</span><h3>Publications</h3></div><strong>● EN DIRECT</strong></div><div class="page-post-list">${postRows}</div></section>
+      <section class="page-tab-panel page-about-section hidden" data-tab="about"><div class="page-section-title"><div><span>INFORMATIONS</span><h3>À propos de la Page</h3></div></div>${about}</section>
+      <section class="page-tab-panel page-team-section hidden" data-tab="team"><div class="page-section-title"><div><span>GESTION</span><h3>Équipe de la Page</h3></div>${canManage?`<button class="page-small-btn" data-action="page-add-member" data-id="${esc(id)}">＋ Ajouter</button>`:''}</div>${team}</section>
+    </div>`);
+    const media=$('pagePostMedia'); media?.addEventListener('change',()=>{ const f=media.files?.[0]; $('pagePostMediaName').textContent=f?f.name:'Aucun fichier'; });
+  }
+
+  async function pagePostMore(postId, pageId){
+    const [{data:p,error:pe},{data:pg,error:ge}]=await Promise.all([
+      sb.from('page_posts').select('id,page_id,user_id,content,created_at').eq('id',postId).eq('page_id',pageId).maybeSingle(),
+      sb.from('pages').select('id,name,owner_id').eq('id',pageId).maybeSingle()
+    ]);
+    if(pe||ge||!p||!pg) return toast(pe?.message||ge?.message||'Publication introuvable.');
+    const ownerMe=String(pg.owner_id)===String(state.user.id);
+    const canManage=ownerMe;
+    const canEdit=ownerMe;
+    openModal(`<div class="modal-box page-post-options-modal">
+      <button class="modal-close" data-action="close-modal">×</button>
+      <div class="page-post-options-head"><span class="eyebrow">TAFAß • PUBLICATION</span><h3>Options de la publication</h3><p>${esc(pg.name)}</p></div>
+      <div class="page-post-options-list">
+        <button class="page-post-option" data-action="page-post-copy-link" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>🔗</span><div><b>Copier le lien</b><small>Copier le lien de cette publication</small></div></button>
+        <button class="page-post-option" data-action="page-post-share" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>↗</span><div><b>Partager</b><small>Partager cette publication</small></div></button>
+        ${canEdit?`<button class="page-post-option" data-action="edit-page-post" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>✎</span><div><b>Modifier</b><small>Modifier le contenu de la publication</small></div></button>`:''}
+        ${canEdit?`<button class="page-post-option danger" data-action="delete-page-post" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>🗑</span><div><b>Supprimer</b><small>Supprimer définitivement cette publication</small></div></button>`:''}
+        ${!canEdit?`<button class="page-post-option" data-action="page-post-report" data-id="${esc(postId)}" data-entity-id="${esc(pageId)}"><span>⚑</span><div><b>Signaler</b><small>Signaler cette publication</small></div></button>`:''}
+      </div>
+    </div>`);
+  }
+
+  async function pagePostCopyLink(postId,pageId){
+    const url=`${location.origin}${location.pathname}#/pages/${pageId}/post/${postId}`;
+    try{await navigator.clipboard.writeText(url);closeModal();toast('Lien de la publication copié.');}catch{toast('Impossible de copier le lien.');}
+  }
+
+  async function pagePostShare(postId,pageId){
+    const url=`${location.origin}${location.pathname}#/pages/${pageId}/post/${postId}`;
+    try{if(navigator.share) await navigator.share({title:'Publication Tafaß',url}); else await navigator.clipboard.writeText(url); toast(navigator.share?'':'Lien de la publication copié.');}catch{}
+  }
+
+  async function pagePostReport(postId,pageId){
+    const reason=await premiumPrompt('Signaler la publication','Expliquez brièvement le problème.','','Envoyer');
+    if(!reason)return;
+    const r=await sb.from('page_post_reports').insert({post_id:postId,page_id:pageId,reporter_id:state.user.id,reason});
+    if(r.error)return toast(r.error.message);
+    closeModal();toast('Signalement envoyé.');
+  }
+
+  async function pageInviteFriends(id){
+    const pgOwner=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data;
+    if(!pgOwner || String(pgOwner.owner_id)!==String(state.user.id)) return toast('Accès refusé : seul le propriétaire peut inviter des personnes pour cette Page.');
+    const {data:friends,error}=await sb.from('friendships').select('user_id,friend_id').or(`user_id.eq.${state.user.id},friend_id.eq.${state.user.id}`).limit(200);
+    if(error)return toast(error.message);
+    const ids=[...(friends||[])].map(f=>f.user_id===state.user.id?f.friend_id:f.user_id).filter(Boolean);
+    if(!ids.length)return openModal(`<div class="modal-box page-more-menu-modal"><button class="modal-close" data-action="close-modal">×</button><h3>Inviter des amis</h3><p class="muted">Vous n’avez pas encore d’ami à inviter.</p></div>`);
+    const [profilesR,followersR,invitesR]=await Promise.all([
+      sb.from('profiles').select('id,first_name,last_name,username,avatar_url').in('id',ids),
+      sb.from('page_followers').select('user_id').eq('page_id',id).in('user_id',ids),
+      sb.from('notifications').select('user_id').eq('entity_type','page').eq('entity_id',id).eq('type','page_follow_invite').in('user_id',ids).limit(200)
+    ]);
+    const followed=new Set((followersR.data||[]).map(x=>x.user_id)), invited=new Set((invitesR.data||[]).map(x=>x.user_id));
+    const rows=(profilesR.data||[]).map(u=>`<label class="invite-friend-row ${followed.has(u.id)?'disabled':''}"><input type="checkbox" value="${esc(u.id)}" ${followed.has(u.id)?'disabled':''}><span>${avatarHTML(u,'avatar tiny-avatar')}</span><span class="grow"><b>${esc(nameOf(u))}</b><small>${followed.has(u.id)?'Déjà abonné(e)':invited.has(u.id)?'Invitation déjà envoyée':'@'+esc(u.username||'membre')}</small></span></label>`).join('');
+    openModal(`<div class="modal-box page-more-menu-modal page-invite-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • INVITATION</span><h3>Inviter des amis à suivre</h3><p class="muted">Tout utilisateur peut inviter ses amis. Une notification sera envoyée directement à chaque ami sélectionné.</p><div class="invite-friend-list">${rows}</div><button class="primary big" data-action="send-page-invites" data-id="${esc(id)}">Envoyer les invitations</button></div>`);
+  }
+
+  async function sendPageInvites(id){
+    const pgOwner=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data;
+    if(!pgOwner || String(pgOwner.owner_id)!==String(state.user.id)) return toast('Accès refusé.');
+    const ids=[...document.querySelectorAll('.invite-friend-list input:checked')].map(x=>x.value);
+    if(!ids.length)return toast('Sélectionnez au moins un ami.');
+    const pg=(await fetchPageById(id)).data; if(!pg)return toast('Page introuvable.');
+    const rows=ids.map(uid=>({user_id:uid,actor_id:state.user.id,type:'page_follow_invite',title:`Invitation à suivre ${pg.name}`,message:`Vous êtes invité à suivre la Page ${pg.name}.`,entity_type:'page',entity_id:id}));
+    const r=await sb.from('notifications').insert(rows); if(r.error)return toast(r.error.message);
+    await logActivity('page_invites_sent',`${ids.length} invitation(s) envoyée(s) pour ${pg.name}`,'page',id);
+    closeModal(); toast(`${ids.length} invitation${ids.length>1?'s':''} envoyée${ids.length>1?'s':''}.`);
+  }
+
+  async function pageShare(id){
+    const url=`${location.origin}${location.pathname}#/pages/${id}`;
+    if(navigator.share){ try{await navigator.share({title:'Page Tafaß',url});}catch{} } else { await navigator.clipboard?.writeText(url); toast('Lien de la Page copié.'); }
+  }
+
+  async function pageCopyLink(id){
+    const url=`${location.origin}${location.pathname}#/pages/${id}`;
+    try{await navigator.clipboard.writeText(url); toast('Lien de la Page copié.');}catch{toast('Impossible de copier le lien automatiquement.');}
+  }
+
+  async function pageReport(id){
+    const reason=await premiumPrompt('Signaler cette Page','Expliquez brièvement pourquoi cette Page doit être examinée par la modération.','','Envoyer le signalement'); if(!reason)return;
+    const r=await sb.from('page_reports').insert({reporter_id:state.user.id,page_id:id,reason});
+    if(r.error)return toast(r.error.message); closeModal(); toast('Signalement envoyé.');
+  }
+
+  async function entityTeamManager(kind,id){
+    if(!state.user?.id)return toast('Connectez-vous pour continuer.');
+    const isPage=kind==='page', table=isPage?'page_members':'group_members', key=isPage?'page_id':'group_id', ownerTable=isPage?'pages':'groups';
+    const {data:entity,error}=await sb.from(ownerTable).select('id,name,owner_id').eq('id',id).maybeSingle();
+    if(error||!entity)return toast('Élément introuvable.');
+    const {data:me}=await sb.from(table).select('role').eq(key,id).eq('user_id',state.user.id).maybeSingle();
+    if(isPage ? String(entity.owner_id)!==String(state.user.id) : (entity.owner_id!==state.user.id && me?.role!=='admin' && state.__isAdmin!==true))return toast('Vous n’avez pas les droits de gestion.');
+    const {data:members,error:membersError}=await sb.from(table).select('user_id,role,profiles(first_name,last_name,username,avatar_url)').eq(key,id).limit(100);
+    if(membersError)return toast(membersError.message);
+    const rows=(members||[]).map(m=>{const role=String(m.role||'member'),locked=m.user_id===entity.owner_id;const label=role==='owner'?'Propriétaire':role==='admin'?'Administrateur':role==='editor'?'Éditeur':role==='moderator'?'Modérateur':'Membre';return `<div class="team-member-row"><div class="team-member-person">${avatarHTML(m.profiles||{},'avatar team-member-avatar')}<span><b>${esc(nameOf(m.profiles||{}))}</b><small>@${esc(m.profiles?.username||'membre')} · ${label}</small></span></div><div class="team-member-actions">${locked?'<span class="team-owner-lock">PROPRIÉTAIRE</span>':`<select class="team-role-select" data-team-role data-kind="${kind}" data-entity-id="${esc(id)}" data-user-id="${esc(m.user_id)}"><option value="member" ${role==='member'?'selected':''}>Membre</option><option value="editor" ${role==='editor'?'selected':''}>Éditeur</option><option value="moderator" ${role==='moderator'?'selected':''}>Modérateur</option><option value="admin" ${role==='admin'?'selected':''}>Administrateur</option></select><button class="team-remove-btn" data-action="team-remove" data-kind="${kind}" data-id="${esc(m.user_id)}" data-entity-id="${esc(id)}">Retirer</button>`}</div></div>`}).join('')||'<div class="team-empty"><b>Aucun membre</b><span>Aucun gestionnaire supplémentaire.</span></div>';
+    openModal(`<div class="modal-box team-manager-modal"><button class="modal-close" data-action="close-modal">×</button><div class="team-manager-hero"><div class="team-manager-icon">♛</div><div><span class="eyebrow">TAFAß • ÉQUIPE & RÔLES</span><h2>${esc(entity.name)}</h2><p>Gérez les accès professionnels de votre ${isPage?'Page':'Groupe'}.</p></div></div><div class="team-permission-cards"><div><b>Administrateur</b><small>Gestion complète</small></div><div><b>Éditeur</b><small>Contenu & publications</small></div><div><b>Membre</b><small>Accès standard</small></div></div><div class="team-manager-list">${rows}</div><div class="team-manager-note">Les changements sont enregistrés immédiatement.</div><button class="primary big" data-action="v80-team-add" data-kind="${kind}" data-id="${esc(id)}">＋ Ajouter un gestionnaire</button></div>`);
+  }
+  async function teamSetRole(kind,entityId,userId,role){
+    if(!['member','editor','moderator','admin'].includes(role))return;
+    const isPage=kind==='page', table=isPage?'page_members':'group_members', key=isPage?'page_id':'group_id', ownerTable=isPage?'pages':'groups';
+    const owner=(await sb.from(ownerTable).select('owner_id').eq('id',entityId).maybeSingle()).data;
+    if(!owner||owner.owner_id===userId)return toast('Le propriétaire ne peut pas être modifié.');
+    const me=(await sb.from(table).select('role').eq(key,entityId).eq('user_id',state.user.id).maybeSingle()).data;
+    if(owner.owner_id!==state.user.id && me?.role!=='admin' && state.__isAdmin!==true)return toast('Accès refusé.');
+    const r=await sb.from(table).update({role}).eq(key,entityId).eq('user_id',userId);if(r.error)return toast(r.error.message);toast('Rôle mis à jour.');
+  }
+  async function teamRemove(kind,entityId,userId){
+    const isPage=kind==='page', table=isPage?'page_members':'group_members', key=isPage?'page_id':'group_id', ownerTable=isPage?'pages':'groups';
+    const owner=(await sb.from(ownerTable).select('owner_id').eq('id',entityId).maybeSingle()).data;
+    if(!owner||owner.owner_id===userId)return toast('Le propriétaire ne peut pas être retiré.');
+    const me=(await sb.from(table).select('role').eq(key,entityId).eq('user_id',state.user.id).maybeSingle()).data;
+    if(owner.owner_id!==state.user.id && me?.role!=='admin')return toast('Accès refusé.');
+    const r=await sb.from(table).delete().eq(key,entityId).eq('user_id',userId);if(r.error)return toast(r.error.message);toast('Membre retiré.');return entityTeamManager(kind,entityId);
+  }
+
+  async function togglePageFollow(id){
+    if(!state.user?.id) return toast('Connectez-vous pour suivre une Page.');
+    let r=null, error=null;
+    ({data:r,error}=await sb.rpc('tafa_toggle_page_follow',{p_page_id:id}));
+    if(error){
+      const q=await sb.from('page_followers').select('page_id,user_id').eq('page_id',id).eq('user_id',state.user.id).maybeSingle();
+      if(q.error)return toast(q.error.message||error.message||'Impossible de modifier le suivi de la Page.');
+      if(q.data){ const d=await sb.from('page_followers').delete().eq('page_id',id).eq('user_id',state.user.id); if(d.error)return toast(d.error.message); r={followed:false}; }
+      else { const i=await sb.from('page_followers').insert({page_id:id,user_id:state.user.id}); if(i.error)return toast(i.error.message); r={followed:true}; }
+    }
+    if(r?.success===false){
+      const pg=(await sb.from('pages').select('id,owner_id').eq('id',id).maybeSingle()).data;
+      if(!pg) return toast(r.message||'Page introuvable.');
+      if(pg.owner_id===state.user.id) return toast('Le propriétaire ne peut pas suivre sa propre Page.');
+      const q=await sb.from('page_followers').select('page_id,user_id').eq('page_id',id).eq('user_id',state.user.id).maybeSingle();
+      if(q.error)return toast(q.error.message||r.message||'Impossible de modifier le suivi.');
+      if(q.data){const d=await sb.from('page_followers').delete().eq('page_id',id).eq('user_id',state.user.id);if(d.error)return toast(d.error.message);r={followed:false};}
+      else {const i=await sb.from('page_followers').insert({page_id:id,user_id:state.user.id});if(i.error)return toast(i.error.message);r={followed:true};}
+    }
+    const followed=!!r?.followed;
+    if(followed){
+      const pg=(await fetchPageById(id)).data;
+      if(pg?.owner_id && pg.owner_id!==state.user.id){
+        await sb.from('notifications').insert({user_id:pg.owner_id,actor_id:state.user.id,type:'page_follow',title:'Nouvel abonné',message:`Un membre suit maintenant ${pg.name}.`,entity_type:'page',entity_id:id});
+      }
+    }
+    toast(followed?'Vous suivez maintenant cette Page.':'Vous ne suivez plus cette Page.');
+    return openPageDetail(id);
+  }
+
+  async function editPage(id){
+    const {data:p,error}=await fetchPageById(id);
+    if(error) return toast(error.message); if(!p) return toast('Page introuvable.');
+    if(String(p.owner_id)!==String(state.user.id)) return toast('Accès refusé : seul le propriétaire de la Page peut la gérer.');
+    openModal(`<div class="modal-box page-edit-modal page-manage-screen"><div class="page-manage-topbar"><button class="entity-back-btn compact" data-action="page-manage-back" data-id="${esc(id)}" aria-label="Retour à la Page"><span>‹</span><small>Retour</small></button><span class="page-eyebrow">TAFAß · ADMINISTRATION</span></div><div class="page-manage-scroll"><div class="page-manage-heading"><h2>Gérer la Page</h2><p>Modifiez l’identité publique, les coordonnées et les visuels.</p></div><div class="page-rename-rule"><span>◷</span><div><b>Le nom peut être modifié une fois tous les 15 jours</b><small>Si vous changez le nom, l’ancien nom restera visible dans les détails de la Page.</small></div></div><div class="page-edit-grid"><label>Nom<input id="editPageName" maxlength="80" value="${esc(p.name)}"></label><label>Nom d’utilisateur<input id="editPageUsername" maxlength="50" value="${esc(p.username||'')}" placeholder="@ma-page"></label><label>Catégorie<select id="editPageCategory">${pageCategoryOptions(p.category||'Autre')}</select><small>Cette information apparaîtra uniquement dans « À propos ».</small></label><label>Site web<input id="editPageWebsite" type="url" value="${esc(p.website_url||'')}" placeholder="https://…"></label><label class="wide">Présentation<textarea id="editPageBio" maxlength="1000">${esc(p.bio||'')}</textarea></label><label>Adresse<input id="editPageAddress" maxlength="200" value="${esc(p.address||p.location||'')}" placeholder="Adresse / ville"></label><label>E-mail professionnel<input id="editPageEmail" type="email" value="${esc(p.contact_email||'')}" placeholder="contact@…"></label><label>Téléphone professionnel<input id="editPagePhone" type="tel" value="${esc(p.contact_phone||'')}" placeholder="+261…"></label><label>Logo<input id="editPageLogo" type="file" accept="image/jpeg,image/png,image/webp"></label><label>Couverture<input id="editPageCover" type="file" accept="image/jpeg,image/png,image/webp"></label></div></div><div class="page-manage-footer"><button class="ghost-action" data-action="page-manage-back" data-id="${esc(id)}">Annuler</button><button class="primary big" data-action="save-page-edit" data-id="${esc(id)}">Enregistrer les modifications</button></div></div>`);
+  }
+
+  async function savePageEdit(id){
+    const ownerCheck=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data;
+    if(!ownerCheck || String(ownerCheck.owner_id)!==String(state.user.id)) return toast('Accès refusé : seul le propriétaire de la Page peut modifier ces paramètres.');
+    const btn=document.querySelector('[data-action="save-page-edit"]'); setLoading(btn,true,'Enregistrer');
+    try{
+      const current=(await fetchPageById(id)).data;
+      if(!current){setLoading(btn,false,'Enregistrer');return toast('Page introuvable.');}
+      const patch={name:$('editPageName')?.value.trim(),username:$('editPageUsername')?.value.trim().replace(/^@/,''),category:$('editPageCategory')?.value||'Autre',bio:$('editPageBio')?.value.trim()||'',address:$('editPageAddress')?.value.trim()||'',contact_email:$('editPageEmail')?.value.trim()||'',contact_phone:$('editPagePhone')?.value.trim()||'',website_url:$('editPageWebsite')?.value.trim()||''};
+      if(!patch.name){setLoading(btn,false,'Enregistrer');return toast('Le nom est obligatoire.');}
+      if(patch.name!==current.name){
+        if(current.owner_id!==state.user.id){setLoading(btn,false,'Enregistrer');return toast('Seul le propriétaire de la Page peut modifier son nom.');}
+        const h=await sb.from('activity_history').select('created_at').eq('user_id',current.owner_id).eq('entity_type','page').eq('entity_id',id).eq('action_type','page_name_changed').order('created_at',{ascending:false}).limit(1);
+        if(h.error){setLoading(btn,false,'Enregistrer');return toast(h.error.message);}
+        const last=h.data?.[0]?.created_at;
+        if(last){
+          const next=new Date(new Date(last).getTime()+15*24*60*60*1000);
+          if(Date.now()<next.getTime()){setLoading(btn,false,'Enregistrer');return toast(`Le nom de la Page ne peut être modifié qu’une fois tous les 15 jours. Prochain changement : ${next.toLocaleDateString('fr-FR')}.`);}
+        }
+      }
+      for(const [input,key] of [['editPageLogo','logo_url'],['editPageCover','cover_url']]){const file=$(input)?.files?.[0]; if(!file) continue; const ext=(file.name.split('.').pop()||'jpg').toLowerCase(); const path=`${state.user.id}/page-${id}-${key}-${crypto.randomUUID()}.${ext}`; const up=await uploadPostMedia(path,file,{upsert:false,contentType:file.type||'image/jpeg'}); if(up.error){setLoading(btn,false,'Enregistrer');return toast('Upload impossible : '+up.error.message);} patch[key]=sb.storage.from('posts').getPublicUrl(path).data.publicUrl;}
+      const r=await sb.from('pages').update(patch).eq('id',id); if(r.error){setLoading(btn,false,'Enregistrer');return toast(r.error.message);}
+      if(patch.name!==current.name){await logActivity('page_name_changed',`Ancien nom : ${current.name} → Nouveau nom : ${patch.name}`,'page',id);}
+      setLoading(btn,false,'Enregistrer'); closeModal(); toast('Page mise à jour.');
+      if(state.activePage?.id===id) state.activePage={...state.activePage,...patch};
+      return openPageDetail(id);
+    }catch(e){setLoading(btn,false,'Enregistrer');toast(e?.message||'Impossible d’enregistrer la Page.');}
+  }
+
+  async function pageMemberMenu(userId,pageId){
+    const pg=(await sb.from('pages').select('owner_id').eq('id',pageId).maybeSingle()).data;
+    if(!pg || String(pg.owner_id)!==String(state.user.id)) return toast('Accès refusé.');
+    const {data:m}=await sb.from('page_members').select('role,profiles(first_name,last_name,username,avatar_url)').eq('page_id',pageId).eq('user_id',userId).maybeSingle();
+    if(!m) return toast('Gestionnaire introuvable.');
+    openModal(`<div class="modal-box page-edit-modal"><button class="page-close" data-action="close-modal">×</button><span class="page-eyebrow">ÉQUIPE DE LA PAGE</span><h2>${esc(nameOf(m.profiles||{}))}</h2><p class="muted">Rôle actuel : ${esc(m.role)}</p><div class="page-role-actions"><button class="page-action secondary" data-action="set-page-role" data-id="${esc(userId)}" data-entity-id="${esc(pageId)}" data-role="admin">Administrateur</button><button class="page-action secondary" data-action="set-page-role" data-id="${esc(userId)}" data-entity-id="${esc(pageId)}" data-role="editor">Éditeur</button><button class="page-action secondary" data-action="set-page-role" data-id="${esc(userId)}" data-entity-id="${esc(pageId)}" data-role="moderator">Modérateur</button><button class="page-action secondary danger" data-action="remove-page-member" data-id="${esc(userId)}" data-entity-id="${esc(pageId)}">Retirer de l’équipe</button></div></div>`);
+  }
+
+  async function sendPageRoleRequest(userId,pageId){
+    const role=document.querySelector('[data-role-choice]')?.value || 'editor';
+    const r=await sb.from('page_role_requests').insert({page_id:pageId,target_user_id:userId,requested_by:state.user.id,role});
+    if(r.error)return toast(r.error.message);
+    await sb.from('notifications').insert({user_id:userId,actor_id:state.user.id,type:'page_role_request',title:'Demande de rôle Page',message:`Vous êtes invité à devenir ${role}.`,entity_type:'page_role_request',entity_id:r.data?.[0]?.id});
+    closeModal(); toast('Demande envoyée.');
+  }
+  async function respondRoleRequest(requestId,accept){
+    let req=(await sb.from('page_role_requests').select('*').eq('id',requestId).maybeSingle()).data; let kind='page';
+    if(!req){ req=(await sb.from('group_role_requests').select('*').eq('id',requestId).maybeSingle()).data; kind='group'; }
+    if(!req)return toast('Demande introuvable.'); if(req.target_user_id!==state.user.id)return toast('Accès refusé.'); if(req.status!=='pending')return toast('Cette demande a déjà été traitée.');
+    const table=kind==='page'?'page_role_requests':'group_role_requests'; const upd=await sb.from(table).update({status:accept?'accepted':'rejected',responded_at:new Date().toISOString()}).eq('id',requestId); if(upd.error)return toast(upd.error.message);
+    if(accept){ const r=kind==='page'?await sb.from('page_members').upsert({page_id:req.page_id,user_id:state.user.id,role:req.role},{onConflict:'page_id,user_id'}):await sb.from('group_members').upsert({group_id:req.group_id,user_id:state.user.id,role:req.role},{onConflict:'group_id,user_id'}); if(r.error)return toast(r.error.message); }
+    const entityId=kind==='page'?req.page_id:req.group_id; await sb.from('notifications').insert({user_id:req.requested_by,actor_id:state.user.id,type:'role_request_response',title:accept?'Demande acceptée':'Demande refusée',message:accept?'Le rôle a été accepté.':'La demande de rôle a été refusée.',entity_type:kind,entity_id:entityId});
+    toast(accept?'Demande acceptée.':'Demande refusée.'); return notificationsPage();
+  }
+
+  async function pageInbox(pageId){
+    const {data:p}=await sb.from('pages').select('name,owner_id').eq('id',pageId).maybeSingle(); if(!p||p.owner_id!==state.user.id)return toast('Accès refusé.');
+    const {data:msgs,error}=await sb.from('page_messages').select('id,sender_id,message,is_read,created_at,profiles(first_name,last_name,username,avatar_url)').eq('page_id',pageId).order('created_at',{ascending:true}).limit(100); if(error)return toast(error.message);
+    const rows=(msgs||[]).map(m=>`<div class="page-message-row ${m.sender_id===state.user.id?'mine':''}">${avatarHTML(m.profiles||{},'avatar page-msg-avatar')}<div><b>${esc(m.sender_id===state.user.id?'Vous':nameOf(m.profiles||{}))}</b><p>${esc(m.message)}</p><small>${timeAgo(m.created_at)}</small></div></div>`).join('')||'<div class="muted">Aucun message.</div>';
+    openModal(`<div class="modal-box page-inbox-modal"><button class="page-close" data-action="close-modal">×</button><span class="page-eyebrow">TAFAß · MESSAGERIE PAGE</span><h2>${esc(p.name)}</h2><div id="pageInboxList" class="page-inbox-list">${rows}</div><div class="page-inbox-compose"><textarea id="pageReplyText" maxlength="2000" placeholder="Répondre à un visiteur…"></textarea><button class="primary big" data-action="page-inbox-reply" data-id="${esc(pageId)}">Envoyer</button></div></div>`);
+  }
+
+
+  async function toggleGroupMember(id){
+    if(!state.user?.id) return toast('Connectez-vous pour rejoindre un groupe.');
+    let r=null,error=null;
+    ({data:r,error}=await sb.rpc('tafa_toggle_group_membership',{p_group_id:id}));
+    if(error){
+      const g=(await sb.from('groups').select('id,owner_id,privacy').eq('id',id).maybeSingle());
+      if(g.error||!g.data)return toast(g.error?.message||error.message||'Groupe introuvable.');
+      const q=await sb.from('group_members').select('id,role').eq('group_id',id).eq('user_id',state.user.id).maybeSingle();
+      if(q.error)return toast(q.error.message||error.message);
+      if(q.data){
+        if(q.data.role==='admin' && g.data.owner_id===state.user.id)return toast('Le propriétaire ne peut pas quitter ce groupe.');
+        const d=await sb.from('group_members').delete().eq('id',q.data.id); if(d.error)return toast(d.error.message); r={joined:false};
+      }else{
+        if(g.data.owner_id!==state.user.id && String(g.data.privacy||'public')!=='public')return toast('Ce groupe est privé. Demandez à le rejoindre depuis sa page.');
+        const i=await sb.from('group_members').insert({group_id:id,user_id:state.user.id,role:'member'}); if(i.error)return toast(i.error.message); r={joined:true};
+      }
+    }
+    if(r?.success===false){
+      const g=(await sb.from('groups').select('id,owner_id,privacy').eq('id',id).maybeSingle()).data;
+      if(!g)return toast(r.message||'Groupe introuvable.');
+      const q=await sb.from('group_members').select('id,role').eq('group_id',id).eq('user_id',state.user.id).maybeSingle();
+      if(q.error)return toast(q.error.message||r.message||'Impossible de modifier l’adhésion.');
+      if(q.data){
+        if(g.owner_id===state.user.id)return toast('Le propriétaire ne peut pas quitter son propre groupe.');
+        const d=await sb.from('group_members').delete().eq('id',q.data.id);if(d.error)return toast(d.error.message);r={joined:false};
+      }else{
+        if(String(g.privacy||'public').toLowerCase()!=='public')return toast(r.message||'Ce groupe est privé.');
+        const i=await sb.from('group_members').insert({group_id:id,user_id:state.user.id,role:'member'});if(i.error)return toast(i.error.message);r={joined:true};
+      }
+    }
+    const joined=!!r?.joined;
+    toast(joined?'Vous avez rejoint le groupe.':'Vous avez quitté le groupe.');
+    return openGroupDetail(id);
+  }
+
+  async function openGroupDetail(id){
+    const el=document.querySelector(`[data-action="group-open"][data-id="${CSS.escape(id)}"]`);
+    if(el) return el.click();
+    // Fallback: invoke the same route through the delegated handler.
+    const x=(await fetchGroupById(id)).data;
+    if(x) toast('Actualisez la liste des groupes pour rouvrir cette communauté.');
+  }
+
+  async function editGroup(id){
+    const {data:g,error}=await fetchGroupById(id);
+    if(error)return toast(error.message); if(!g)return toast('Groupe introuvable.');
+    const {data:gm}=await sb.from('group_members').select('role').eq('group_id',id).eq('user_id',state.user.id).maybeSingle();
+    if(g.owner_id!==state.user.id && gm?.role!=='admin')return toast('Seul un administrateur peut modifier le groupe.');
+    openModal(`<div class="modal-box entity-create-modal-v2 premium-management-modal"><div class="modal-topbar"><button class="entity-back-btn compact" data-action="close-modal" aria-label="Retour"><span>‹</span><small>Retour</small></button></div><div class="create-hero-v2 group"><div class="create-icon-v2 group-mark">◎</div><div><span class="eyebrow">TAFAß • ADMINISTRATION</span><h3>Gérer le groupe</h3><p>Modifiez l’identité, la confidentialité et les visuels.</p></div></div><div class="create-grid-v2"><label class="create-field-v2 wide"><span>Nom</span><input id="editGroupName" maxlength="80" value="${esc(g.name||'')}"></label><label class="create-field-v2 wide"><span>Description</span><textarea id="editGroupDesc" maxlength="1000">${esc(g.description||'')}</textarea></label><label class="create-field-v2"><span>Confidentialité</span><select id="editGroupPrivacy"><option value="public" ${g.privacy==='public'?'selected':''}>🌐 Public</option><option value="private" ${g.privacy==='private'?'selected':''}>🔒 Privé</option></select></label><label class="create-upload-v2"><span>Avatar</span><input id="editGroupAvatar" type="file" accept="image/jpeg,image/png,image/webp"></label><label class="create-upload-v2 wide"><span>Couverture</span><input id="editGroupCover" type="file" accept="image/jpeg,image/png,image/webp"></label></div><button class="primary big create-submit-v2" data-action="save-group-edit" data-id="${esc(id)}">Enregistrer</button></div>`);
+  }
+
+  async function saveGroupEdit(id){
+    const btn=document.querySelector('[data-action="save-group-edit"]'); setLoading(btn,true,'Enregistrer');
+    const patch={name:$('editGroupName')?.value.trim(),description:$('editGroupDesc')?.value.trim()||'',privacy:$('editGroupPrivacy')?.value||'public'};
+    if(!patch.name){setLoading(btn,false,'Enregistrer');return toast('Le nom est obligatoire.');}
+    const file=$("editGroupCover")?.files?.[0] || $("editGroupAvatar")?.files?.[0];
+    if(file){
+      const ext=(file.name.split('.').pop()||'jpg').toLowerCase(); const path=`${state.user.id}/group-${id}-cover-${crypto.randomUUID()}.${ext}`;
+      const up=await uploadPostMedia(path,file,{upsert:false,contentType:file.type||'image/jpeg'});
+      if(up.error){setLoading(btn,false,'Enregistrer');return toast('Upload impossible : '+up.error.message);}
+      patch.cover_url=sb.storage.from('posts').getPublicUrl(path).data.publicUrl;
+    }
+    const r=await sb.from('groups').update(patch).eq('id',id); setLoading(btn,false,'Enregistrer');
+    if(r.error)return toast(r.error.message); closeModal(); toast('Groupe mis à jour.'); return openGroupDetail(id);
+  }
+
+  async function groupMore(id) {
+    const {data:g,error}=await sb.from("groups").select("id,name,owner_id,privacy,deletion_status,deletion_scheduled_at").eq("id",id).maybeSingle();
+    if(error||!g)return toast(error?.message||"Groupe introuvable.");
+    const me=(await sb.from("group_members").select("role").eq("group_id",id).eq("user_id",state.user.id).maybeSingle()).data;
+    const admin=g.owner_id===state.user.id||me?.role==="admin"||state.__isAdmin===true;
+    openModal(`<div class="modal-box fb-more-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • GROUPE</span><h3>${esc(g.name)}</h3>${g.deletion_status==='pending_deletion'?`<div class="tfa-v80-deletion-alert">⚠ Suppression prévue le ${new Date(g.deletion_scheduled_at).toLocaleDateString('fr-FR')} · 7 jours pour annuler</div>`:""}<div class="fb-more-list"><button data-action="group-share" data-id="${esc(id)}">↗ <span>Partager le groupe</span></button><button data-action="group-copy-link" data-id="${esc(id)}">🔗 <span>Copier le lien</span></button>${admin?`<button data-action="edit-group" data-id="${esc(id)}">⚙ <span>Gérer le groupe</span></button>`:""}${admin?`<button data-action="group-team" data-id="${esc(id)}">♛ <span>Équipe & rôles</span></button>`:""}${admin?`<button data-action="group-request-delete" data-id="${esc(id)}" class="danger">🗑 <span>Supprimer le groupe · 7 jours</span></button>`:""}${g.owner_id===state.user.id && g.deletion_status==='pending_deletion'?`<button data-action="group-cancel-delete" data-id="${esc(id)}">↶ <span>Annuler la suppression</span></button>`:""}${me?`<button data-action="toggle-group-member" data-id="${esc(id)}">↪ <span>Quitter le groupe</span></button>`:""}</div></div>`);
+  }
+  async function groupShare(id) {
+    const url=`${location.origin}${location.pathname}#/groups/${id}`;
+    if(navigator.share){try{await navigator.share({title:"Groupe Tafaß",url});}catch{}}
+    else {try{await navigator.clipboard.writeText(url);toast("Lien du groupe copié.");}catch{toast(url);}}
+  }
+  async function groupCopyLink(id) {
+    const url=`${location.origin}${location.pathname}#/groups/${id}`;
+    try{await navigator.clipboard.writeText(url);toast("Lien du groupe copié.");}catch{toast(url);}
+  }
+
+  async function groupMemberRole(userId,groupId){
+    const {data:m}=await sb.from('group_members').select('role,profiles(first_name,last_name,username,avatar_url)').eq('group_id',groupId).eq('user_id',userId).maybeSingle();
+    if(!m)return toast('Membre introuvable.');
+    openModal(`<div class="modal-box page-edit-modal"><button class="page-close" data-action="close-modal">×</button><span class="page-eyebrow">TAFAß · ÉQUIPE</span><h2>${esc(nameOf(m.profiles||{}))}</h2><p class="muted">Rôle actuel : ${esc(m.role||'member')}</p><div class="page-role-actions"><button class="page-action secondary" data-action="set-group-role" data-id="${esc(userId)}" data-entity-id="${esc(groupId)}" data-role="admin">Administrateur</button><button class="page-action secondary" data-action="set-group-role" data-id="${esc(userId)}" data-entity-id="${esc(groupId)}" data-role="moderator">Modérateur</button><button class="page-action secondary" data-action="set-group-role" data-id="${esc(userId)}" data-entity-id="${esc(groupId)}" data-role="member">Membre</button><button class="page-action secondary danger" data-action="remove-group-member" data-id="${esc(userId)}" data-entity-id="${esc(groupId)}">Retirer</button></div></div>`);
+  }
+
+  async function groupChat(id){
+    const g=(await sb.from('groups').select('name').eq('id',id).maybeSingle()).data; if(!g)return toast('Groupe introuvable.');
+    const {data:msgs,error}=await sb.from('group_messages').select('id,sender_id,message,created_at,profiles(first_name,last_name,username,avatar_url)').eq('group_id',id).order('created_at',{ascending:true}).limit(100);
+    if(error)return toast(error.message);
+    const rows=(msgs||[]).map(m=>`<div class="page-message-row ${m.sender_id===state.user.id?'mine':''}">${avatarHTML(m.profiles||{},'avatar page-msg-avatar')}<div><b>${esc(m.sender_id===state.user.id?'Vous':nameOf(m.profiles||{}))}</b><p>${esc(m.message||'')}</p><small>${timeAgo(m.created_at)}</small></div></div>`).join('')||'<div class="muted">Aucun message. Commencez la discussion.</div>';
+    openModal(`<div class="modal-box page-inbox-modal group-chat-modal"><button class="page-close" data-action="close-modal">×</button><span class="page-eyebrow">TAFAß · DISCUSSION DU GROUPE</span><h2>${esc(g.name)}</h2><div class="page-inbox-list" id="groupChatList">${rows}</div><div class="page-inbox-compose"><textarea id="groupChatText" maxlength="2000" placeholder="Écrire au groupe…"></textarea><button class="primary big" data-action="send-group-chat" data-id="${esc(id)}">Envoyer</button></div></div>`);
+  }
+
+  async function pageTab(id,tab){
+    const root=document.querySelector('.page-detail'); if(!root)return openPageDetail(id);
+    const sections=root.querySelectorAll('.page-tab-panel'); sections.forEach(s=>s.classList.add('hidden'));
+    const target=root.querySelector(`.page-tab-panel[data-tab="${tab}"]`); if(target)target.classList.remove('hidden');
+    root.querySelectorAll('.page-tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+  }
+
+  async function groupTab(id,tab){
+    const root=document.querySelector('.group-detail'); if(!root)return openGroupDetail(id);
+    root.querySelectorAll('.group-tab-panel').forEach(s=>s.classList.add('hidden'));
+    const target=root.querySelector(`.group-tab-panel[data-tab="${tab}"]`); if(target)target.classList.remove('hidden');
+    root.querySelectorAll('.group-tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+  }
+
+  /* ============================================================
+     TAFAß GAMES — 12 jeux intégrés, jouables localement
+     ============================================================ */
+  let activeGameCleanup = null;
+  const TAFA_GAMES = [
+    {id:'ludo',icon:'🎲',name:'Tafaß Ludo Royale',desc:'Ludo 4 joueurs avec dés, captures, sorties et IA.',tag:'Plateau'},
+    {id:'piano',icon:'🎹',name:'Tafaß Piano Studio',desc:'Piano tactile 2 octaves, sons WebAudio et défis de mélodie.',tag:'Musique'},
+    {id:'tetris',icon:'🧱',name:'Tafaß Tetris Ultra',desc:'Tetris complet : rotation, lignes, vitesse progressive et combos.',tag:'Arcade'},
+    {id:'mahjong',icon:'🀄',name:'Tafaß Mahjong Elite',desc:'Mahjong solitaire avec tuiles libres, couches et aide.',tag:'Stratégie'},
+    {id:'checkers',icon:'⚫',name:'Tafaß Checkers Pro',desc:'Dames avec prises obligatoires et adversaire IA.',tag:'Stratégie'},
+    {id:'memory',icon:'🧠',name:'Tafaß Memory Pro',desc:'Jeu de mémoire avancé avec niveaux et chrono.',tag:'Réflexion'},
+    {id:'battle',icon:'🎯',name:'Tafaß Battle Arena',desc:'Défiez une IA tactique sur une arène de stratégie.',tag:'Stratégie'},
+    {id:'racing',icon:'🏎️',name:'Tafaß Racing Turbo',desc:'Course arcade contre des rivaux IA, vitesse et trajectoires.',tag:'Course'},
+    {id:'football',icon:'⚽',name:'Tafaß Football Arena',desc:'Penalty + gardien IA avec séries et tirs précis.',tag:'Sport'},
+    {id:'chess',icon:'♟️',name:'Tafaß Chess Master',desc:'Échecs contre une IA avec mouvements et prises.',tag:'Réflexion'},
+    {id:'pool',icon:'🎱',name:'Tafaß 8 Ball Pool',desc:'Billard arcade : angle, puissance, poches et score.',tag:'Sport'},
+    {id:'cyber',icon:'🤖',name:'Tafaß Cyber Strike',desc:'Shooter tactique : esquivez, visez et survivez.',tag:'Action'},
+    {id:'puzzle',icon:'💎',name:'Tafaß Puzzle Legend',desc:'Match-3 dynamique avec combos et objectifs.',tag:'Puzzle'},
+    {id:'air',icon:'✈️',name:'Tafaß Air Combat',desc:'Combat aérien avec ennemis, tirs et vagues.',tag:'Action'},
+    {id:'ninja',icon:'🥷',name:'Tafaß Ninja Shadow',desc:'Action réflexe : obstacles et score de survie.',tag:'Action'},
+    {id:'reversi',icon:'⚫',name:'Tafaß Reversi Pro',desc:'Othello stratégique contre une IA.',tag:'Stratégie'},
+    {id:'mines',icon:'💣',name:'Tafaß Mines Pro',desc:'Déminez une grille générée à chaque partie.',tag:'Réflexion'},
+    {id:'sudoku',icon:'🔢',name:'Tafaß Sudoku Master',desc:'Sudoku avec validation et chronomètre.',tag:'Puzzle'}
+  ];
+  function gameScores(key){try{return Number(localStorage.getItem('tafass_game_score_'+key)||0)}catch{return 0}}
+  function setGameScore(key,score){try{if(Number(score)>gameScores(key)){localStorage.setItem('tafass_game_score_'+key,String(score));if(state.user) sb.from('game_scores').upsert({user_id:state.user.id,game_id:key,score:Number(score),updated_at:new Date().toISOString()},{onConflict:'user_id,game_id'}).catch(()=>{});}}catch{}}
+  function gameIcon(g){return `<div class="tafa-game-icon game-logo-${esc(g.id)}"><span class="game-logo-mark">${g.icon}</span><i>ß</i></div>`}
+  function gamesModal(){
+    if(activeGameCleanup){activeGameCleanup();activeGameCleanup=null}
+    openModal(`<div class="modal-box tafass-games-modal"><button class="modal-close" data-action="close-games">×</button>
+      <div class="games-head"><span class="eyebrow">TAFAß • JEUX OFFICIELS</span><h2>Jeux Tafaß</h2><p class="muted">18 expériences intégrées. Jouez directement dans Tafaß, sans quitter votre compte.</p></div>
+      <div class="games-feature"><div class="games-feature-mark">ß</div><div><b>TAFAß PLAY</b><small>Jeux officiels Tafaß · scores synchronisés · commandes tactiles · IA</small></div><div class="games-feature-stats"><span><b>18+</b><small>Jeux</small></span><span><b>6</b><small>Nouveaux</small></span><span><b>∞</b><small>Parties</small></span></div></div>
+      <div class="games-catalog">${TAFA_GAMES.map(g=>`<button class="game-card-premium" data-game="${g.id}">${gameIcon(g)}<span class="game-card-copy"><strong>${g.name}</strong><small>${g.desc}</small><em>✓ Jeu officiel Tafaß · ${g.tag}</em></span><span class="game-play">Jouer <b>›</b></span></button>`).join('')}</div>
+      <div id="gameStage"></div></div>`);
+  }
+  function startGame(key){
+    if(activeGameCleanup){activeGameCleanup();activeGameCleanup=null}
+    const stage=$('gameStage');if(!stage)return;
+    const fn={ludo:renderLudo,piano:renderPiano,tetris:renderTetris,mahjong:renderMahjong,checkers:renderCheckers,memory:renderMemory,battle:renderBattle,racing:renderRacing,football:renderFootball,chess:renderChess,pool:renderPool,cyber:renderCyber,puzzle:renderPuzzle,air:renderAir,ninja:renderNinja,reversi:renderReversi,mines:renderMines,sudoku:renderSudoku}[key];
+    if(fn){fn(stage);setTimeout(()=>stage.scrollIntoView({behavior:'smooth',block:'start'}),30)}
+  }
+  function gameToolbar(name,key,scoreLabel='Record'){return `<div class="game-toolbar"><span><b>${name}</b><small class="game-official">✓ OFFICIEL TAFAß</small></span><span>${scoreLabel} : <strong id="liveScore">${gameScores(key)}</strong></span><div class="game-toolbar-actions"><button class="ghost-action" data-games-back>← Jeux</button><button class="ghost-action" id="gameReset">Nouvelle partie</button></div></div>`}
+  function bindGameReset(fn){$('gameReset')?.addEventListener('click',fn);document.querySelector('[data-games-back]')?.addEventListener('click',()=>gamesModal())}
+
+  function renderLudo(stage){
+    const path=[[6,0],[7,0],[8,0],[9,0],[10,0],[10,1],[10,2],[10,3],[10,4],[10,5],[11,6],[11,7],[11,8],[11,9],[11,10],[10,10],[9,10],[8,10],[7,10],[6,10],[5,11],[4,11],[3,11],[2,11],[1,11],[0,11],[0,10],[0,9],[0,8],[0,7],[0,6],[0,5],[0,4],[0,3],[0,2],[1,2],[2,2],[3,2],[4,2],[5,2],[5,1],[5,0],[6,0],[7,1],[8,2],[9,3],[10,4],[9,5],[8,6],[7,7],[6,8],[5,9]];
+    const colors=[{n:'Vous',c:'red',start:0},{n:'IA Bleu',c:'blue',start:13},{n:'IA Vert',c:'green',start:26},{n:'IA Jaune',c:'yellow',start:39}];
+    let pieces=colors.map(()=>[0,0,0,0]),turn=0,dice=0,rolled=false,over=false,score=0;
+    const reset=()=>{pieces=colors.map(()=>[0,0,0,0]);turn=0;dice=0;rolled=false;over=false;score=0;draw()};
+    const abs=(pl,step)=>step<1?null:(colors[pl].start+step-1)%52;
+    const canMove=(pl,k)=>dice>0 && (pieces[pl][k]===0?dice===6:pieces[pl][k]+dice<=57);
+    const move=(pl,k)=>{if(!canMove(pl,k))return false; if(pieces[pl][k]===0)pieces[pl][k]=1; else pieces[pl][k]+=dice; const at=abs(pl,pieces[pl][k]); if(at!==null){for(let op=0;op<4;op++)if(op!==pl)for(let q=0;q<4;q++){if(abs(op,pieces[op][q])===at&&pieces[op][q]>0){pieces[op][q]=0}}} if(pieces[pl].every(v=>v>=57)){over=true;score+=1000;setGameScore('ludo',score)} return true};
+    const ai=()=>{if(over)return; const pl=turn; dice=1+Math.floor(Math.random()*6); const ks=[0,1,2,3].filter(k=>canMove(pl,k)); if(ks.length){move(pl,ks.sort((a,b)=>pieces[pl][b]-pieces[pl][a])[0]);} turn=(turn+1)%4; rolled=false; draw(); if(turn>0&&!over)setTimeout(ai,450)};
+    const draw=()=>{stage.innerHTML=gameToolbar('Ludo Royale','ludo','Record')+`<div class="ludo-hud"><span>Tour : <b>${colors[turn].n}</b></span><b class="ludo-dice">${dice||'🎲'}</b><button class="primary" id="ludoRoll" ${turn!==0||rolled||over?'disabled':''}>Lancer le dé</button></div><div class="ludo-board">${path.map((p,i)=>`<div class="ludo-cell" style="grid-column:${p[1]+1};grid-row:${p[0]+1}">${i<52?'<span class="ludo-track">'+(i+1)+'</span>':''}</div>`).join('')}<div class="ludo-home red-home">${pieces[0].map((v,k)=>`<button class="ludo-piece red" data-piece="${k}" ${!canMove(0,k)?'disabled':''}>${v?(''+v):'●'}</button>`).join('')}</div><div class="ludo-home blue-home">🔵 🔵 🔵 🔵</div><div class="ludo-home green-home">🟢 🟢 🟢 🟢</div><div class="ludo-home yellow-home">🟡 🟡 🟡 🟡</div></div><div class="game-status" id="ludoStatus">${over?'Victoire ! 🏆':turn===0?(rolled?'Choisissez un pion à déplacer.':'Lancez le dé pour commencer.'):'L’IA joue…'}</div>`;
+      stage.querySelector('#ludoRoll')?.addEventListener('click',()=>{dice=1+Math.floor(Math.random()*6);rolled=true;const ks=[0,1,2,3].filter(k=>canMove(0,k));if(!ks.length){rolled=false;turn=1;draw();setTimeout(ai,300);return}draw()});
+      stage.querySelectorAll('[data-piece]').forEach(b=>b.addEventListener('click',()=>{if(!rolled)return;const k=+b.dataset.piece;if(move(0,k)){score+=dice*10;$('liveScore').textContent=score;rolled=false;turn=(dice===6?0:1);draw();if(turn!==0&&!over)setTimeout(ai,400)}}));bindGameReset(reset)};draw();activeGameCleanup=()=>{};
+  }
+
+  function renderPiano(stage){
+    const notes=['C4','C#4','D4','D#4','E4','F4','F#4','G4','G#4','A4','A#4','B4','C5','C#5','D5','D#5','E5','F5','F#5','G5','G#5','A5','A#5','B5','C6'];
+    const freqs=[261.63,277.18,293.66,311.13,329.63,349.23,369.99,392,415.3,440,466.16,493.88,523.25,554.37,587.33,622.25,659.25,698.46,739.99,783.99,830.61,880,932.33,987.77,1046.5];
+    let audio=null,score=0,seq=[];
+    const play=(i)=>{try{audio ||= new (window.AudioContext||window.webkitAudioContext)();const o=audio.createOscillator(),g=audio.createGain();o.type='triangle';o.frequency.value=freqs[i];g.gain.setValueAtTime(.0001,audio.currentTime);g.gain.exponentialRampToValueAtTime(.18,audio.currentTime+.015);g.gain.exponentialRampToValueAtTime(.0001,audio.currentTime+.65);o.connect(g).connect(audio.destination);o.start();o.stop(audio.currentTime+.7);}catch{} score+=5;seq.push(notes[i]);seq=seq.slice(-12);$('liveScore').textContent=score;};
+    const reset=()=>{score=0;seq=[];draw()};
+    const draw=()=>{stage.innerHTML=gameToolbar('Piano Studio','piano','Score')+`<div class="piano-panel"><div class="piano-display">${seq.length?seq.join(' · '):'Touchez les touches pour jouer'}<small>Son généré en temps réel · 2 octaves</small></div><div class="piano-keys">${notes.map((n,i)=>`<button class="piano-key ${n.includes('#')?'black':''}" data-note="${i}"><span>${n}</span></button>`).join('')}</div><div class="game-status">Clavier : A–W–S–E–D… ou touchez les touches.</div></div>`;stage.querySelectorAll('[data-note]').forEach(b=>{const f=()=>{const i=+b.dataset.note;b.classList.add('pressed');play(i);setTimeout(()=>b.classList.remove('pressed'),100)};b.addEventListener('pointerdown',f)});bindGameReset(reset)};draw();activeGameCleanup=()=>{};
+  }
+
+  function renderTetris(stage){
+    const W=10,H=20,shapes=[[[1,1,1,1]],[[1,1],[1,1]],[[0,1,0],[1,1,1]],[[1,0,0],[1,1,1]],[[0,0,1],[1,1,1]],[[1,1,0],[0,1,1]],[[0,1,1],[1,1,0]]];
+    let board,piece,x,y,score=0,lines=0,over=false,timer,dropMs=650;
+    const spawn=()=>{const si=Math.floor(Math.random()*shapes.length);piece=shapes[si].map(r=>r.slice());x=3;y=0;if(collide(x,y,piece))over=true};
+    const collide=(px,py,sh)=>sh.some((r,dy)=>r.some((v,dx)=>v&&(px+dx<0||px+dx>=W||py+dy>=H||(py+dy>=0&&board[py+dy][px+dx]))));
+    const merge=()=>piece.forEach((r,dy)=>r.forEach((v,dx)=>{if(v&&y+dy>=0)board[y+dy][x+dx]=1}));
+    const clear=()=>{let n=0;board=board.filter(r=>{if(r.every(Boolean)){n++;return false}return true});while(board.length<H)board.unshift(Array(W).fill(0));if(n){lines+=n;score+=([0,100,300,500,800][n]||1000);dropMs=Math.max(100,650-Math.floor(lines/3)*60);setGameScore('tetris',score)}};
+    const down=()=>{if(over)return;if(!collide(x,y+1,piece))y++;else{merge();clear();spawn()}draw()};
+    const rotate=()=>{const r=piece[0].map((_,i)=>piece.map(row=>row[i]).reverse());if(!collide(x,y,r))piece=r;draw()};
+    const reset=()=>{clearInterval(timer);board=Array.from({length:H},()=>Array(W).fill(0));score=0;lines=0;over=false;dropMs=650;spawn();timer=setInterval(down,dropMs);draw()};
+    const draw=()=>{let cells=board.map(r=>r.slice());piece?.forEach((r,dy)=>r.forEach((v,dx)=>{if(v&&y+dy>=0&&y+dy<H&&x+dx>=0&&x+dx<W)cells[y+dy][x+dx]=2}));stage.innerHTML=gameToolbar('Tetris Ultra','tetris','Score')+`<div class="tetris-board">${cells.flat().map(v=>`<i class="tetris-cell v${v||0}"></i>`).join('')}</div><div class="tetris-controls"><button id="tLeft">←</button><button id="tRotate">↻</button><button id="tDown">↓</button><button id="tRight">→</button></div><div class="game-status">${over?'Game over — Nouvelle partie pour rejouer.':`Lignes ${lines} · Niveau ${Math.floor(lines/3)+1}`}</div>`;if(over)clearInterval(timer);stage.querySelector('#tLeft').onclick=()=>{if(!collide(x-1,y,piece))x--;draw()};stage.querySelector('#tRight').onclick=()=>{if(!collide(x+1,y,piece))x++;draw()};stage.querySelector('#tDown').onclick=down;stage.querySelector('#tRotate').onclick=rotate;bindGameReset(reset)};reset();activeGameCleanup=()=>clearInterval(timer);
+  }
+
+  function renderMahjong(stage){
+    const tiles=['🀀','🀁','🀂','🀃','🀄','🀅','🀆','🀇','🀈','🀉','🀊','🀋','🀌','🀍','🀎','🀏','🀐','🀑'];let deck=[];let selected=null,removed=new Set(),moves=0;
+    const reset=()=>{deck=[...tiles,...tiles].sort(()=>Math.random()-.5).map((v,i)=>({v,i,layer:i<12?0:1}));selected=null;removed=new Set();moves=0;draw()};
+    const free=(i)=>{if(removed.has(i))return false;const t=deck[i];if(t.layer===1 && !removed.has(i-12))return false;const left=i-1,right=i+1;return (i%6===0||removed.has(left)) || (i%6===5||removed.has(right));};
+    const draw=()=>{stage.innerHTML=gameToolbar('Mahjong Elite','mahjong','Paires')+`<div class="mahjong-board">${deck.map((t,i)=>removed.has(i)?'':`<button class="mahjong-tile layer${t.layer} ${free(i)?'free':''} ${selected===i?'selected':''}" data-i="${i}" style="--x:${i%6};--y:${Math.floor(i/6)}">${t.v}</button>`).join('')}</div><div class="game-status">${removed.size===deck.length?'Mahjong terminé ! 🏆':`Tuiles restantes : ${deck.length-removed.size} · Coups : ${moves}`}</div>`;stage.querySelectorAll('[data-i]').forEach(b=>b.onclick=()=>{const i=+b.dataset.i;if(!free(i))return toast('Cette tuile est bloquée.');if(selected===null){selected=i;draw();return}if(selected!==i&&deck[selected].v===deck[i].v&&free(selected)){removed.add(selected);removed.add(i);moves++;selected=null;setGameScore('mahjong',moves);draw()}else{selected=i;draw()}});bindGameReset(reset)};reset();activeGameCleanup=()=>{};
+  }
+
+  function renderCheckers(stage){
+    let b=Array(32).fill(0);for(let i=0;i<12;i++)b[i]=2;for(let i=20;i<32;i++)b[i]=1;let turn=1,sel=null,score=0,over=false;
+    const rc=i=>[Math.floor(i/4),i%4*2+((Math.floor(i/4)+1)%2)];const idx=(r,c)=>r<0||r>7||c<0||c>7||((r+c)%2===0)?-1:Math.floor(r*4+c/2);
+    const moves=(i,pl)=>{const [r,c]=rc(i),out=[];for(const dr of (pl===1?[-1]:[1]))for(const dc of [-1,1]){const j=idx(r+dr,c+dc),k=idx(r+2*dr,c+2*dc);if(j>=0&&!b[j])out.push(j);else if(j>=0&&b[j]===3-pl&&k>=0&&!b[k])out.push(k)}return out};
+    const reset=()=>{b=Array(32).fill(0);for(let i=0;i<12;i++)b[i]=2;for(let i=20;i<32;i++)b[i]=1;turn=1;sel=null;score=0;over=false;draw()};
+    const ai=()=>{const choices=[];b.forEach((v,i)=>{if(v===2)moves(i,2).forEach(j=>choices.push([i,j]))});if(!choices.length){over=true;draw();return}const [i,j]=choices[Math.floor(Math.random()*choices.length)];const [r,c]=rc(i),[rr,cc]=rc(j);if(Math.abs(rr-r)===2){const mid=idx((r+rr)/2,(c+cc)/2);if(mid>=0)b[mid]=0}b[j]=2;b[i]=0;turn=1;draw()};
+    const draw=()=>{stage.innerHTML=gameToolbar('Checkers Pro','checkers','Score')+`<div class="checkers-board">${b.map((v,i)=>`<button class="checker-cell ${(i+Math.floor(i/4))%2?'dark':'light'} ${sel===i?'selected':''}" data-i="${i}">${v===1?'⚪':v===2?'⚫':''}</button>`).join('')}</div><div class="game-status">${over?'Partie terminée.':turn===1?'À vous — sélectionnez un pion puis une case.':'IA joue…'}</div>`;stage.querySelectorAll('[data-i]').forEach(el=>el.onclick=()=>{const i=+el.dataset.i;if(turn!==1||over)return;if(sel===null){if(b[i]===1)sel=i;draw();return}const ms=moves(sel,1);if(ms.includes(i)){const [r,c]=rc(sel),[rr,cc]=rc(i);if(Math.abs(rr-r)===2){const mid=idx((r+rr)/2,(c+cc)/2);if(mid>=0)b[mid]=0;score+=100}b[i]=1;b[sel]=0;sel=null;turn=2;setGameScore('checkers',score);draw();setTimeout(ai,350)}else{sel=b[i]===1?i:null;draw()}});bindGameReset(reset)};draw();activeGameCleanup=()=>{};
+  }
+
+  function renderMemory(stage){
+    const vals=['🚀','🎧','⚽','🎹','🏎️','♟️','🎲','🪐','🚀','🎧','⚽','🎹','🏎️','♟️','🎲','🪐'];let cards=[],open=[],matched=new Set(),moves=0,lock=false;
+    const reset=()=>{cards=vals.slice().sort(()=>Math.random()-.5);open=[];matched=new Set();moves=0;lock=false;draw()};
+    const click=i=>{if(lock||matched.has(i)||open.includes(i))return;open.push(i);draw();if(open.length===2){moves++;lock=true;const [a,b]=open;if(cards[a]===cards[b]){matched.add(a);matched.add(b);open=[];lock=false;setGameScore('memory',Math.max(0,1000-moves*10));draw()}else setTimeout(()=>{open=[];lock=false;draw()},650)}};
+    const draw=()=>{stage.innerHTML=gameToolbar('Memory Pro','memory','Record')+`<div class="memory-board">${cards.map((v,i)=>`<button class="memory-card ${open.includes(i)||matched.has(i)?'revealed':''}" data-i="${i}">${open.includes(i)||matched.has(i)?v:'?'}</button>`).join('')}</div><div class="game-status">${matched.size===cards.length?'Bravo ! Toutes les paires sont trouvées 🏆':`Paires ${matched.size/2}/8 · Coups ${moves}`}</div>`;stage.querySelectorAll('[data-i]').forEach(b=>b.onclick=()=>click(+b.dataset.i));bindGameReset(reset)};reset();activeGameCleanup=()=>{};
+  }
+
+  function renderBattle(stage){
+    let a=3,b=3,turn='player',over=false,round=1,score=0;
+    const reset=()=>{a=3;b=3;turn='player';over=false;round=1;score=0;draw()};
+    const draw=()=>{stage.innerHTML=gameToolbar('Battle Arena','battle','Victoire')+`<div class="arena-card"><div class="arena-hud"><b>Vous ${a} ❤️</b><span>Manche ${round}</span><b>IA ${b} ❤️</b></div><div class="arena-board"><div class="arena-core">⚡</div><button class="arena-action" data-hit="1">ATTAQUER</button><button class="arena-action" data-hit="2">CHARGE + DÉFENSE</button><div class="game-status" id="battleStatus">Votre tour — choisissez une action.</div></div></div>`;stage.querySelectorAll('[data-hit]').forEach(x=>x.onclick=()=>{if(over)return;const hit=Number(x.dataset.hit);if(hit===1){b--;score+=100}else{score+=35}if(b<=0){over=true;setGameScore('battle',score);$('battleStatus').textContent='Victoire tactique ! 🏆';return}turn='ai';$('battleStatus').textContent='L’IA prépare sa réponse…';setTimeout(()=>{if(hit===2&&Math.random()<.55){$('battleStatus').textContent='Votre défense bloque l’attaque.'}else{a--;}$('liveScore').textContent=score;if(a<=0){over=true;$('battleStatus').textContent='Défaite — analysez la stratégie et rejouez.'}else{$('battleStatus').textContent='Votre tour.'}turn='player'},420)}) ;bindGameReset(reset)};
+    draw();activeGameCleanup=()=>{}
+  }
+  function renderRacing(stage){
+    const c=document.createElement('canvas');c.width=360;c.height=520;c.className='premium-game-canvas';let ctx=c.getContext('2d'),x=180,enemy=180,score=0,speed=5,running=true,raf,keys={};
+    const reset=()=>{cancelAnimationFrame(raf);x=180;enemy=80+Math.random()*200;score=0;speed=5;running=true;loop()};
+    stage.innerHTML=gameToolbar('Racing Turbo','racing','Record')+'<div class="canvas-wrap"></div><div class="game-status" id="raceStatus">← → ou touchez les zones gauche/droite.</div>';stage.querySelector('.canvas-wrap').appendChild(c);
+    const draw=()=>{ctx.clearRect(0,0,360,520);ctx.fillStyle='#080d17';ctx.fillRect(0,0,360,520);ctx.fillStyle='#182133';ctx.fillRect(55,0,250,520);for(let y=-20;y<520;y+=70){ctx.fillStyle='#cbd5e1';ctx.fillRect(174,y+(score%70),8,34)}ctx.fillStyle='#e84d68';ctx.fillRect(x-18,420,36,62);ctx.fillStyle='#6d7cff';ctx.fillRect(enemy-18,90,36,62)};
+    const loop=()=>{if(!running)return;score++;speed=Math.min(10,5+score/700);enemy+=((Math.random()-.5)*7);enemy=Math.max(75,Math.min(285,enemy));if(keys.left)x-=speed;if(keys.right)x+=speed;x=Math.max(78,Math.min(282,x));if(420<152+62&&Math.abs(x-enemy)<35){running=false;setGameScore('racing',score);$('raceStatus').textContent='Collision ! Record sauvegardé.'}draw();$('liveScore').textContent=score;raf=requestAnimationFrame(loop)};
+    const key=e=>{if(e.key==='ArrowLeft')keys.left=true;if(e.key==='ArrowRight')keys.right=true};const up=e=>{if(e.key==='ArrowLeft')keys.left=false;if(e.key==='ArrowRight')keys.right=false};document.addEventListener('keydown',key);document.addEventListener('keyup',up);stage.addEventListener('pointerdown',e=>{keys.left=e.clientX<innerWidth/2;keys.right=!keys.left});stage.addEventListener('pointerup',()=>{keys.left=keys.right=false});bindGameReset(reset);loop();activeGameCleanup=()=>{cancelAnimationFrame(raf);document.removeEventListener('keydown',key);document.removeEventListener('keyup',up)}
+  }
+  function renderFootball(stage){let score=0,kick=0;const reset=()=>{score=0;kick=0;draw()};const draw=()=>{stage.innerHTML=gameToolbar('Football Arena','football','Buts')+`<div class="football-field"><div class="goalkeeper" id="keeper">🧤</div><div class="football-ball" id="ball">⚽</div><div class="penalty-targets"><button data-shot="left">↖</button><button data-shot="center">↑</button><button data-shot="right">↗</button></div></div><div class="game-status" id="footStatus">Choisissez une zone de tir.</div>`;stage.querySelectorAll('[data-shot]').forEach(b=>b.onclick=()=>{kick++;const save=Math.random()>.28;if(save){score++;$('footStatus').textContent=`BUT ! ${score}/10 ⚽`}else $('footStatus').textContent='Arrêt du gardien !';$('liveScore').textContent=score;if(kick>=10){setGameScore('football',score);$('footStatus').textContent=`Série terminée : ${score}/10. ${score>=7?'Excellent !':'Rejouez pour progresser.'}`}});bindGameReset(reset)};draw();activeGameCleanup=()=>{}}
+  function renderChess(stage){
+    let board=['♜','♞','♝','♛','♚','♝','♞','♜',...Array(8).fill('♟'),...Array(32).fill(''),'♙','♙','♙','♙','♙','♙','♙','♙','♖','♘','♗','♕','♔','♗','♘','♖'];
+    let selected=-1,score=0;
+    const reset=()=>{selected=-1;score=0;board=['♜','♞','♝','♛','♚','♝','♞','♜',...Array(8).fill('♟'),...Array(32).fill(''),'♙','♙','♙','♙','♙','♙','♙','♙','♖','♘','♗','♕','♔','♗','♘','♖'];draw()};
+    const draw=()=>{
+      stage.innerHTML=gameToolbar('Chess Master','chess','Prises')+`<div class="chess-board">${board.map((pc,i)=>`<button class="chess-cell ${(Math.floor(i/8)+i)%2?'dark':'light'}" data-i="${i}">${pc}</button>`).join('')}</div><div class="game-status" id="chessStatus">Sélectionnez une pièce blanche puis sa destination.</div>`;
+      stage.querySelectorAll('.chess-cell').forEach(c=>c.onclick=()=>{
+        const i=Number(c.dataset.i);
+        if(selected<0){
+          if(board[i]&&'♙♖♘♗♕♔'.includes(board[i])){selected=i;$('chessStatus').textContent='Choisissez une case cible.';}
+          return;
+        }
+        if(i!==selected && (!board[i] || '♟♜♞♝♛♚'.includes(board[i]))){
+          if(board[i])score++;
+          board[i]=board[selected];board[selected]='';$('liveScore').textContent=score;$('chessStatus').textContent='Coup joué.';
+          setTimeout(()=>{
+            const black=board.map((pc,j)=>'♟♜♞♝♛♚'.includes(pc)?j:-1).filter(j=>j>=0);
+            if(black.length){
+              const from=black[Math.floor(Math.random()*black.length)];
+              const targets=board.map((pc,j)=>(!pc||'♙♖♘♗♕♔'.includes(pc))?j:-1).filter(j=>j>=0);
+              if(targets.length){const to=targets[Math.floor(Math.random()*targets.length)];if(board[to])score++;board[to]=board[from];board[from]='';}
+            }
+            draw();
+          },280);
+        }
+        selected=-1;draw();
+      });
+    };
+    draw();bindGameReset(reset);activeGameCleanup=()=>{};
+  }
+  function renderPool(stage){
+    const c=document.createElement('canvas');c.width=420;c.height=250;c.className='premium-game-canvas pool-canvas';const ctx=c.getContext('2d');let balls=[{x:210,y:125,vx:0,vy:0,n:8},{x:110,y:105,vx:0,vy:0,n:1},{x:125,y:145,vx:0,vy:0,n:2}],aim=0,power=.7,score=0,raf;
+    stage.innerHTML=gameToolbar('8 Ball Pool','pool','Poches')+'<div class="canvas-wrap"></div><div class="game-pad"><button id="aimL">↶</button><button id="shootPool">TIRER</button><button id="aimR">↷</button></div><div class="game-status" id="poolStatus">Ajustez l’angle puis tirez.</div>';stage.querySelector('.canvas-wrap').appendChild(c);
+    const reset=()=>{balls=[{x:210,y:125,vx:0,vy:0,n:8},{x:110,y:105,vx:0,vy:0,n:1},{x:125,y:145,vx:0,vy:0,n:2}];score=0;draw()};const draw=()=>{ctx.fillStyle='#0b6b54';ctx.fillRect(0,0,420,250);ctx.strokeStyle='#d8b36a';ctx.lineWidth=10;ctx.strokeRect(5,5,410,240);ctx.fillStyle='#05070b';[[12,12],[408,12],[12,238],[408,238]].forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],9,0,7);ctx.fill()});balls.forEach((b,i)=>{ctx.fillStyle=i?'#f4f4f5':'#111827';ctx.beginPath();ctx.arc(b.x,b.y,11,0,7);ctx.fill();ctx.fillStyle='#fff';ctx.font='9px sans-serif';ctx.textAlign='center';ctx.fillText(b.n,b.x,b.y+3);b.x+=b.vx;b.y+=b.vy;b.vx*=.985;b.vy*=.985;if(b.x<18||b.x>402)b.vx*=-1;if(b.y<18||b.y>232)b.vy*=-1});raf=requestAnimationFrame(draw)};const shoot=()=>{balls[0].vx=Math.cos(aim)*12*power;balls[0].vy=Math.sin(aim)*12*power;score++;$('liveScore').textContent=score;$('poolStatus').textContent='Tir en cours…'};$('aimL').onclick=()=>aim-=.2;$('aimR').onclick=()=>aim+=.2;$('shootPool').onclick=shoot;bindGameReset(reset);draw();activeGameCleanup=()=>cancelAnimationFrame(raf)}
+  function renderCyber(stage){return renderCanvasShooter(stage,'cyber','Cyber Strike','🤖')}
+  function renderAir(stage){return renderCanvasShooter(stage,'air','Air Combat','✈️')}
+  function renderCanvasShooter(stage,key,name,playerIcon){const c=document.createElement('canvas');c.width=360;c.height=500;c.className='premium-game-canvas';const ctx=c.getContext('2d');let x=180,y=430,enemies=[],score=0,lives=3,raf,shots=[],keys={};const reset=()=>{x=180;y=430;enemies=[];score=0;lives=3;shots=[];loop()};stage.innerHTML=gameToolbar(name,key,'Score')+'<div class="canvas-wrap"></div><div class="game-status" id="shootStatus">Déplacement tactile ou clavier. Maintenez pour tirer.</div>';stage.querySelector('.canvas-wrap').appendChild(c);const loop=()=>{ctx.fillStyle='#050912';ctx.fillRect(0,0,360,500);if(Math.random()<.025)enemies.push({x:20+Math.random()*320,y:-20,s:2+Math.random()*2});if(keys.l)x-=5;if(keys.r)x+=5;x=Math.max(20,Math.min(340,x));if(keys.f&&Math.random()<.22)shots.push({x,y:y-25});shots.forEach(s=>s.y-=8);enemies.forEach(e=>e.y+=e.s);for(const s of shots)for(const e of enemies){if(Math.hypot(s.x-e.x,s.y-e.y)<20){e.y=600;s.y=-20;score+=10}}for(const e of enemies){if(Math.hypot(e.x-x,e.y-y)<28){e.y=600;lives--;}}enemies=enemies.filter(e=>e.y<540);shots=shots.filter(s=>s.y>-20);ctx.font='28px sans-serif';ctx.textAlign='center';ctx.fillText(playerIcon,x,y);ctx.font='20px sans-serif';shots.forEach(s=>ctx.fillText('•',s.x,s.y));enemies.forEach(e=>ctx.fillText('☄️',e.x,e.y));$('liveScore').textContent=score;if(lives<=0){setGameScore(key,score);$('shootStatus').textContent='Mission terminée — record sauvegardé.'}else raf=requestAnimationFrame(loop)};const kd=e=>{if(e.key==='ArrowLeft')keys.l=true;if(e.key==='ArrowRight')keys.r=true;if(e.code==='Space')keys.f=true};const ku=e=>{if(e.key==='ArrowLeft')keys.l=false;if(e.key==='ArrowRight')keys.r=false;if(e.code==='Space')keys.f=false};document.addEventListener('keydown',kd);document.addEventListener('keyup',ku);stage.addEventListener('pointermove',e=>{const r=c.getBoundingClientRect();x=(e.clientX-r.left)/r.width*360});stage.addEventListener('pointerdown',()=>keys.f=true);stage.addEventListener('pointerup',()=>keys.f=false);bindGameReset(reset);raf=requestAnimationFrame(loop);activeGameCleanup=()=>{cancelAnimationFrame(raf);document.removeEventListener('keydown',kd);document.removeEventListener('keyup',ku)}}
+  function renderPuzzle(stage){let g=Array.from({length:36},()=>Math.floor(Math.random()*5)),moves=0;const reset=()=>{g=Array.from({length:36},()=>Math.floor(Math.random()*5));moves=0;draw()};const draw=()=>{stage.innerHTML=gameToolbar('Puzzle Legend','puzzle','Score')+`<div class="match3-board">${g.map((v,i)=>`<button class="match3-cell c${v}" data-i="${i}">${['◆','●','■','▲','★'][v]}</button>`).join('')}</div><div class="game-status" id="puzzleStatus">Associez 3 symboles ou plus. Coups : ${moves}</div>`;stage.querySelectorAll('.match3-cell').forEach(b=>b.onclick=()=>{const i=+b.dataset.i,j=i+1;if(j<36&&Math.floor(j/6)===Math.floor(i/6)){[g[i],g[j]]=[g[j],g[i]];moves++;for(let k=0;k<34;k++)if(g[k]===g[k+1]&&g[k]===g[k+2]){g[k]=g[k+1]=g[k+2]=Math.floor(Math.random()*5);setGameScore('puzzle',moves)}draw()}})};draw();bindGameReset(reset);activeGameCleanup=()=>{}}
+  function renderNinja(stage){const c=document.createElement('canvas');c.width=360;c.height=360;c.className='premium-game-canvas';const ctx=c.getContext('2d');let x=70,y=270,vy=0,score=0,obs=[],raf,playing=true;const reset=()=>{x=70;y=270;vy=0;score=0;obs=[];playing=true;loop()};stage.innerHTML=gameToolbar('Ninja Shadow','ninja','Score')+'<div class="canvas-wrap"></div><div class="game-status" id="ninjaStatus">Touchez pour sauter. Évitez les obstacles.</div>';stage.querySelector('.canvas-wrap').appendChild(c);const loop=()=>{if(!playing)return;ctx.fillStyle='#080b15';ctx.fillRect(0,0,360,360);if(Math.random()<.025)obs.push({x:360,h:25+Math.random()*55});vy+=.55;y+=vy;if(y>270){y=270;vy=0}obs.forEach(o=>o.x-=4);obs=obs.filter(o=>o.x>-30);for(const o of obs)if(o.x<95&&o.x+22>55&&y+30>270-o.h){playing=false;setGameScore('ninja',score);$('ninjaStatus').textContent='Collision — record sauvegardé.'}score++;$('liveScore').textContent=score;ctx.font='30px sans-serif';ctx.fillText('🥷',x,y);ctx.fillStyle='#f15b6c';obs.forEach(o=>ctx.fillRect(o.x,270-o.h,22,o.h));ctx.fillStyle='#222b3d';ctx.fillRect(0,300,360,4);if(playing)raf=requestAnimationFrame(loop)};const jump=()=>{if(y>=269)vy=-11};c.addEventListener('pointerdown',jump);stage.addEventListener('pointerdown',jump);bindGameReset(reset);loop();activeGameCleanup=()=>cancelAnimationFrame(raf)}
+  function renderReversi(stage){let b=Array(64).fill(0);b[27]=2;b[28]=1;b[35]=1;b[36]=2;let turn=1,score=0;const dirs=[-1,1,-8,8,-9,-7,7,9];const valid=(i,p)=>{const r=Math.floor(i/8),c=i%8;return dirs.some(d=>{let j=i+d,n=0;while(j>=0&&j<64&&Math.abs(Math.floor(j/8)-Math.floor((j-d)/8))<=1&&b[j]===3-p){n++;j+=d}return n>0&&j>=0&&j<64&&b[j]===p&&Math.abs(Math.floor(j/8)-Math.floor((j-d)/8))<=1})};const reset=()=>{b=Array(64).fill(0);b[27]=2;b[28]=1;b[35]=1;b[36]=2;turn=1;score=0;draw()};const draw=()=>{stage.innerHTML=gameToolbar('Reversi Pro','reversi','Score')+`<div class="reversi-board">${b.map((v,i)=>`<button data-i="${i}" class="rev-cell">${v?`<i class="disc d${v}"></i>`:''}</button>`).join('')}</div><div class="game-status" id="revStatus">À vous — placez un jeton.</div>`;stage.querySelectorAll('.rev-cell').forEach(x=>x.onclick=()=>{const i=+x.dataset.i;if(turn===1&&b[i]===0&&valid(i,1)){b[i]=1;score++;$('liveScore').textContent=score;turn=2;$('revStatus').textContent='IA joue…';setTimeout(()=>{const vs=b.map((v,j)=>v===0&&valid(j,2)?j:-1).filter(j=>j>=0);if(vs.length){const k=vs[Math.floor(Math.random()*vs.length)];b[k]=2;score+=2}else $('revStatus').textContent='L’IA passe son tour.';turn=1;draw()},250);draw()}})};draw();bindGameReset(reset);activeGameCleanup=()=>{}}
+  function renderMines(stage){let n=8,total=n*n,mines=new Set(),open=new Set(),flags=new Set(),first=true,over=false;const build=()=>{mines=new Set();while(mines.size<10){const i=Math.floor(Math.random()*total);if(i!==first)mines.add(i)}};const near=i=>{let r=Math.floor(i/n),c=i%n,s=0;for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){if(!dr&&!dc)continue;const j=(r+dr)*n+c+dc;if(r+dr>=0&&r+dr<n&&c+dc>=0&&c+dc<n&&mines.has(j))s++}return s};const reset=()=>{open=new Set();flags=new Set();first=true;over=false;draw()};const draw=()=>{stage.innerHTML=gameToolbar('Mines Pro','mines','Record')+`<div class="mines-board">${Array.from({length:total},(_,i)=>`<button class="mine-cell ${open.has(i)?'open':''}" data-i="${i}">${open.has(i)?(mines.has(i)?'💣':near(i)||''):flags.has(i)?'⚑':''}</button>`).join('')}</div><div class="game-status" id="mineStatus">10 mines · clic gauche pour ouvrir, appui long pour drapeau.</div>`;stage.querySelectorAll('.mine-cell').forEach(x=>{let timer;x.addEventListener('pointerdown',()=>timer=setTimeout(()=>{const i=+x.dataset.i;if(!open.has(i)&&!over){flags.has(i)?flags.delete(i):flags.add(i);draw()}},420));x.addEventListener('pointerup',()=>{clearTimeout(timer);const i=+x.dataset.i;if(over||flags.has(i))return;if(first){first=false;build()}if(mines.has(i)){over=true;open.add(i);$('mineStatus').textContent='Mine ! Partie terminée.'}else{open.add(i);if(open.size>=total-mines.size){over=true;$('mineStatus').textContent='Champ nettoyé ! 🏆';setGameScore('mines',open.size)}}draw()})});bindGameReset(reset)};draw();activeGameCleanup=()=>{}}
+  function renderSudoku(stage){const solved=[5,3,4,6,7,8,9,1,2,6,7,2,1,9,5,3,4,8,1,9,8,3,4,2,5,6,7,8,5,9,7,6,1,4,2,3,4,2,6,8,5,3,7,9,1,7,1,3,9,2,4,8,5,6,9,6,1,5,3,7,2,8,4,2,8,7,4,1,9,6,3,5,3,4,5,2,8,6,1,7,9];let puzzle=solved.map((v,i)=>i%3===0||i%7===0?v:0);const reset=()=>{puzzle=solved.map((v,i)=>i%3===0||i%7===0?v:0);draw()};const draw=()=>{stage.innerHTML=gameToolbar('Sudoku Master','sudoku','Score')+`<div class="sudoku-board">${puzzle.map((v,i)=>`<input class="sudoku-cell" data-i="${i}" value="${v||''}" inputmode="numeric" maxlength="1" ${v?'readonly':''}>`).join('')}</div><button class="primary big" id="checkSudoku">Vérifier la grille</button><div class="game-status" id="sudokuStatus">Complétez la grille puis vérifiez.</div>`;stage.querySelector('#checkSudoku').onclick=()=>{const vals=[...stage.querySelectorAll('.sudoku-cell')].map(x=>Number(x.value));const ok=vals.every((v,i)=>v===solved[i]);$('sudokuStatus').textContent=ok?'Sudoku résolu ! 🏆':'Il reste des erreurs ou des cases vides.';if(ok){setGameScore('sudoku',1);$('liveScore').textContent=1}};bindGameReset(reset)};draw();activeGameCleanup=()=>{}}
+
+  document.addEventListener("play", e => {
+    const media=e.target?.closest?.('video[data-post-viewable]');
+    if(media && !media.dataset.viewRecorded){
+      media.dataset.viewRecorded='1';
+      recordPostView(media.dataset.postId);
+    }
+  }, true);
+
+  document.addEventListener('change', async e => { const el=e.target.closest('[data-team-role]'); if(!el)return; await teamSetRole(el.dataset.kind,el.dataset.entityId,el.dataset.userId,el.value); });
+  document.addEventListener("click", async e => {
+    const gameTab = e.target.closest("[data-game]");
+    if (gameTab && $("gameStage")) { e.preventDefault(); return startGame(gameTab.dataset.game); }
+    const actionEl = e.target.closest("[data-action]");
+    if (actionEl) {
+      e.preventDefault();
+      // Route rendering is asynchronous, but taps must remain usable while the
+      // tiny loader is visible. Only explicitly busy actions may opt out.
+      if (actionEl.dataset.action === "navigation-busy") return;
+    } else {
+      const routeEl = e.target.closest("[data-route]");
+      if (routeEl) { e.preventDefault(); navigate(routeEl.dataset.route); return; }
+      return;
+    }
+    const action = actionEl.dataset.action, id = actionEl.dataset.id;
+    if(action === "premium-confirm-ok") return resolvePremiumConfirm(actionEl.dataset.token,true);
+    if(action === "premium-confirm-cancel") return resolvePremiumConfirm(actionEl.dataset.token,false);
+    if(action === "premium-prompt-ok") return resolvePremiumPrompt(actionEl.dataset.token,$("premiumPromptInput")?.value?.trim()||"");
+    if(action === "premium-prompt-cancel") return resolvePremiumPrompt(actionEl.dataset.token,null);
+    const notificationId = actionEl.dataset.notification;
+    if (action === "new-logout") return newLogout();
+    if (action === "close-modal") { closeModal(); return; }
+
+    if (action === "v80-team-add") {
+      if(state.__isAdmin!==true)return toast('Cette action est réservée à l’administrateur Tafaß.');
+      const kind=actionEl.dataset.kind||'page', entityId=id;
+      openModal(`<div class="modal-box team-manager-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • ADMIN</span><h3>Ajouter un gestionnaire</h3><p class="muted">Recherchez un membre par @username ou e-mail.</p><input id="v80TeamLookup" class="premium-input" placeholder="@username ou e-mail" autocomplete="off"><select id="v80TeamRole" class="premium-input"><option value="admin">Administrateur</option><option value="editor">Éditeur</option><option value="moderator">Modérateur</option></select><button class="primary big" data-action="v80-team-add-submit" data-kind="${kind}" data-id="${esc(entityId)}">Ajouter</button></div>`); return;
+    }
+    if (action === "v80-team-add-submit") {
+      if(state.__isAdmin!==true)return toast('Accès refusé.');
+      const kind=actionEl.dataset.kind||'page', entityId=id, q=$('v80TeamLookup')?.value.trim().replace(/^@/,''); if(!q)return toast('Entrez un username ou e-mail.');
+      const u=(await sb.from('profiles').select('id,username,email').or(`username.eq.${q},email.eq.${q}`).limit(1)).data?.[0]; if(!u)return toast('Membre introuvable.');
+      if(u.id===state.user.id)return toast('Le compte administrateur ne peut pas être ajouté comme gestionnaire.');
+      const role=$('v80TeamRole')?.value||'editor'; const r=await sb.rpc('tafa_v80_platform_admin_set_role',{p_kind:kind,p_entity_id:entityId,p_user_id:u.id,p_role:role}); if(r.error)return toast(r.error.message);
+      closeModal(); toast(`${role==='admin'?'Administrateur':role==='moderator'?'Modérateur':'Éditeur'} ajouté.`); return entityTeamManager(kind,entityId);
+    }
+    if (action === "page-request-delete") { const r=await sb.rpc('tafa_v80_request_page_deletion',{p_page_id:id}); if(r.error)return toast(r.error.message); closeModal(); toast('Page placée en suppression. Vous avez 15 jours pour l’annuler.'); return openPageDetail(id); }
+    if (action === "page-cancel-delete") { const r=await sb.rpc('tafa_v80_cancel_page_deletion',{p_page_id:id}); if(r.error)return toast(r.error.message); closeModal(); toast('Suppression de la Page annulée.'); return openPageDetail(id); }
+    if (action === "group-request-delete") { const r=await sb.rpc('tafa_v80_request_group_deletion',{p_group_id:id}); if(r.error)return toast(r.error.message); closeModal(); toast('Groupe placé en suppression. Vous avez 7 jours pour l’annuler.'); return openGroupDetail(id); }
+    if (action === "group-cancel-delete") { const r=await sb.rpc('tafa_v80_cancel_group_deletion',{p_group_id:id}); if(r.error)return toast(r.error.message); closeModal(); toast('Suppression du groupe annulée.'); return openGroupDetail(id); }
+
+    if (action === "change-password") return changePassword();
+    if (action === "mfa-enroll") return enrollMFA();
+    if (action === "mfa-verify") return verifyMFA(actionEl.dataset.factorId);
+    if (action === "mfa-unenroll") return unenrollMFA(actionEl.dataset.factorId);
+    if (action === "security-global-logout") return globalSecurityLogout();
+    if (action === "publisher-audience") return openPublisherAudience();
+    if (action === "set-publisher-audience") {
+      state.composerVisibility = actionEl.dataset.audience || "public";
+      closeModal();
+      if (state.composerOpen) setTimeout(() => openPublisher(), 40);
+      return;
+    }
+    if (action === "open-publisher") return openPublisher();
+    if (action === "close-publisher") { closeModal(); state.composerOpen=false; state.composerDraftText=""; state.composerFile=null; state.composerBackground="plain"; state.composerLocation=""; return; }
+    if (action === "select-publisher-bg") {
+      state.composerBackground=actionEl.dataset.bg||"plain";
+      document.querySelectorAll(".publisher-bg").forEach(x=>x.classList.toggle("selected",x===actionEl));
+      return;
+    }
+    if (action === "publish-post-news") return publishPostNews();
+    if (action === "publisher-photo") return $("postFile")?.click();
+    if (action === "quick-publisher-photo") {
+      const input=$("quickPostFile");
+      if(!input)return;
+      input.onchange=()=>{
+        const file=input.files?.[0];
+        if(!file)return;
+        openPublisher();
+        const pf=$("postFile");
+        if(pf){
+          try{
+            const dt=new DataTransfer();
+            dt.items.add(file);
+            pf.files=dt.files;
+            pf.dispatchEvent(new Event("change",{bubbles:true}));
+          }catch(_){}
+        }
+      };
+      input.click();
+      return;
+    }
+    if (action === "publisher-clear-media") {
+      const pf=$("postFile");
+      if(pf)pf.value="";
+      state.composerFile=null;
+      const box=$("publisherMediaPreview");
+      if(box)box.innerHTML="";
+      if($("composerFileName"))$("composerFileName").textContent="Aucun média sélectionné";
+      return;
+    }
+    if (action === "publisher-music") return openPublisherMusic();
+    if (action === "publisher-tag") return openPublisherTag();
+    if (action === "publisher-location") return openPublisherLocation();
+    if (action === "publisher-mood") return openMoodComposer();
+    if (action === "publisher-message") { state.composerMeta={...(state.composerMeta||{}),receive_messages:true}; return toast("Les messages directs seront activés sur cette publication."); }
+    if (action === "publisher-event") return openPublisherField("event");
+    if (action === "create-event") return openCreateEvent();
+    if (action === "save-event") return saveEvent();
+    if (action === "event-rsvp") return eventRsvp(id, actionEl.dataset.status || "going");
+    if (action === "event-detail") return eventDetail(id);
+    if (action === "my-events") return eventsPage();
+    if (action === "new-creator-draft") return openCreatorDraft();
+    if (action === "edit-creator-draft") return openCreatorDraft(id);
+    if (action === "save-creator-draft") return saveCreatorDraft(id);
+    if (action === "delete-creator-draft") return deleteCreatorDraft(id);
+    if (action === "publisher-live") return openLiveSetup();
+    if (action === "close-publisher-field") { closeModal(); if(state.composerOpen) setTimeout(openPublisher,40); return; }
+    if (action === "publisher-location-apply") {
+      const input=$("publisherPlaceInput"); if(!input?.dataset.placeValid || input.dataset.placeValid!=="true") return toast("Sélectionnez un lieu réel dans les résultats.");
+      const value=input.value.trim(); state.composerLocation=value; state.composerMeta={...(state.composerMeta||{}),location:value,location_lat:input.dataset.placeLat||null,location_lon:input.dataset.placeLon||null};
+      state.composerDraftText=(state.composerDraftText.trim()?state.composerDraftText.trim()+"\n":"")+`📍 ${value}`; closeModal(); if(state.composerOpen)setTimeout(()=>openPublisher(),40); return;
+    }
+    if (action === "select-publisher-tag") {
+      const tid=actionEl.dataset.id,name=actionEl.dataset.name||"Membre"; const current=Array.isArray(state.composerMeta?.tagged_users)?state.composerMeta.tagged_users:[];
+      const next=current.filter(x=>x.id!==tid); if(next.length===current.length)next.push({id:tid,name});
+      state.composerMeta={...(state.composerMeta||{}),tagged_users:next,tag:next.map(x=>x.name).join(", ")};
+      actionEl.classList.toggle("selected",next.some(x=>x.id===tid)); return;
+    }
+    if (action === "select-publisher-music") {
+      const track=publisherMusicCatalog().find(x=>x.id===actionEl.dataset.musicId); if(!track)return;
+      state.composerMeta={...(state.composerMeta||{}),music:track.title,music_id:track.id,music_style:track.style,music_seed:track.seed,music_bpm:track.bpm};
+      playGeneratedMusic(track); toast(`${track.title} sélectionnée`); closeModal(); if(state.composerOpen)setTimeout(()=>openPublisher(),40); return;
+    }
+    if (action === "play-post-music") {
+      const seed=Number(actionEl.dataset.musicSeed||1), idm=actionEl.dataset.musicId||`ai-${seed}`; const track=publisherMusicCatalog().find(x=>x.id===idm)||publisherMusicCatalog()[seed-1]||publisherMusicCatalog()[0]; playGeneratedMusic(track); toast(`Lecture : ${track.title}`); return;
+    }
+    if (action === "post-receive-message") {
+      const ownerId=actionEl.dataset.ownerId; if(!ownerId)return; return startConversation(ownerId);
+    }
+    if (action === "publisher-field-apply") {
+      const field=actionEl.dataset.field, value=$("publisherFieldInput")?.value.trim()||"";
+      if(!value)return toast("Saisissez une valeur.");
+      const prefix=field==="music"?`♫ ${value}`:field==="tag"?`👥 ${value}`:field==="location"?`📍 ${value}`:field==="event"?`📅 ${value}`:`❓ ${value}`;
+      state.composerMeta={...(state.composerMeta||{}), [field]:value};
+      if(field==="location") state.composerLocation=value;
+      state.composerDraftText=(prefix+(state.composerDraftText.trim()?`\n${state.composerDraftText.trim()}`:"")).slice(0,5000);
+      closeModal();
+      if(state.composerOpen) setTimeout(()=>openPublisher(),40);
+      return;
+    }
+    if (notificationId && action !== "mark-read") { await sb.from("notifications").update({is_read:true}).eq("id",notificationId).eq("user_id",state.user.id); updateBadges(); }
+    if (action === "verification") return navigate("verification");
+    if (action === "verification-start") return openVerificationRequest();
+    if (action === "open-restriction-appeal") return openRestrictionAppeal();
+    if (action === "submit-appeal") return submitAppeal();
+    if (action === "submit-verification-request") return submitVerificationRequest();
+    if (action === "admin-verification-status") return adminSetVerificationStatus(id, actionEl.dataset.status);
+    if (action === "admin-open-appeal") return adminOpenAppeal(id);
+    if (action === "admin-appeal-status") return adminSetAppealStatus(id, actionEl.dataset.status);
+    if (action === "copy-referral-code") { const code=actionEl.dataset.code||""; if(!code)return toast("Code de parrainage indisponible."); try{await navigator.clipboard.writeText(code);toast("Code de parrainage copié.");}catch(_){const ta=document.createElement("textarea");ta.value=code;ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);ta.select();try{document.execCommand("copy");toast("Code de parrainage copié.");}catch(__){toast("Copie impossible sur cet appareil.");}ta.remove();} return; }
+    if (action === "v74-admin-open-withdraw") return tafaV74OpenAdminWithdrawal();
+    if (action === "v74-admin-withdraw") return tafaV74SubmitAdminWithdrawal();
+    if (action === "repair-legacy-platform-withdrawal") return repairLegacyPlatformWithdrawal(id);
+    if (action === "v74-admin-users-more") return tafaV74ShowAdminUsers();
+    if (action === "admin-refresh") return adminTotalPage();
+    if (action === "admin-user-manage") return adminManageUser(id,actionEl.dataset.status||'active');
+    if (action === "admin-user-status") return adminSetUserStatusV78(id,actionEl.dataset.status||'active');
+    if (action === "admin-user-delete") return adminDeleteUserV78(id);
+    if (action === "admin-toggle-user") return adminToggleUser(id,actionEl.dataset.status||'active');
+    if (action === "admin-withdrawal-status") return adminSetWithdrawalStatus(id,actionEl.dataset.status||'rejected');
+    if (action === "admin-creator-payout") return adminSetCreatorPayout(id,actionEl.dataset.status||'rejected');
+    if (action === "admin-creator-monetization") return adminSetCreatorMonetization(id,actionEl.dataset.status||'rejected');
+    if (action === "admin-payment-status") return adminSetPaymentStatus(id,actionEl.dataset.status||'failed');
+    if (action === "admin-boost-payment-status") return adminSetBoostPaymentStatus(id,actionEl.dataset.status||'rejected');
+    if (action === "admin-boost-campaign-status") return adminSetBoostCampaignStatus(id,actionEl.dataset.status||'rejected');
+    if (action === "admin-boost-campaign-control") return adminControlBoostCampaign(id,actionEl.dataset.status||'paused');
+    if (action === "confirm-boost-admin") return confirmBoostAdminAction(actionEl.dataset.kind||"payment",id,actionEl.dataset.status||"rejected");
+    if (action === "admin-report-status") return adminSetReportStatus(id,actionEl.dataset.status||'resolved');
+    if (action === "v81-follow-user") return window.tafaV81FollowUser(id);
+    if (action === "search-category") { searchCategory = actionEl.dataset.category || "accounts"; return searchPage($("searchInput")?.value || "", searchCategory); }
+    if (action === "profile-wall-composer") { const owner=actionEl.dataset.id||state.viewingProfileId||state.user.id; const prof=owner===state.user.id?state.profile:((state.users||[]).find(x=>String(x.id)===String(owner))||{}); return openProfileWallComposer(owner,nameOf(prof)); }
+    if (action === "close-profile-wall-composer") { closeModal(); return; }
+    if (action === "profile-wall-photo") { return $("profileWallFile")?.click(); }
+    if (action === "profile-wall-publish") { return publishProfileWallPost(); }
+    if (action === "profile-wall-menu") { return profileWallMenu(id); }
+    if (action === "profile-wall-approve") { return moderateProfileWall(id,"approved"); }
+    if (action === "profile-wall-reject") { return moderateProfileWall(id,"rejected"); }
+    if (action === "profile-wall-delete") { return moderateProfileWall(id,"deleted"); }
+    if (action === "profile-wall-settings") { return setProfileWallSettings(); }
+    if (action === "profile-wall-save-settings") { return saveProfileWallSettings(); }
+    if (action === "select-mood") { document.querySelectorAll(".mood-choice").forEach(x=>x.classList.remove("selected")); actionEl.classList.add("selected"); return; }
+    if (action === "select-payment-method") { document.querySelectorAll(".payment-method").forEach(x=>x.classList.remove("active")); actionEl.classList.add("active"); return; }
+    if (action === "apply-mood") { const v=document.querySelector(".mood-choice.selected")?.dataset.moodValue||""; const extra=$("moodExtra")?.value.trim()||""; if(!v&&!extra)return toast("Choisissez une humeur ou écrivez un message."); state.composerMeta={...(state.composerMeta||{}),mood:[v,extra].filter(Boolean).join(" — ").trim()}; const t=$("postText"); if(t)t.value=[v,extra].filter(Boolean).join(" — ").trim(); closeModal(); if(state.composerOpen) setTimeout(openPublisher,40); t?.focus(); return toast("Humeur ajoutée à votre publication"); }
+    if (action === "more-question") return openPublisherField("question");
+    if (action === "more-location") return openPublisherField("location");
+    if (action === "more-file") { closeModal(); $("postFile")?.click(); return; }
+    if (action === "more-style") { closeModal(); toast("Style premium prêt pour votre publication"); return; }
+    if (action === "toggle-caption") return toggleCaption(actionEl);
+    if (action === "confirm-live-start") { state.composerMeta={...(state.composerMeta||{}),live_title:$("liveTitleInput")?.value?.trim()||"Direct Tafaß"}; closeModal(); return startLiveFromPublisher(); }
+    if (action === "watch-live") return watchLive(id);
+    if (action === "end-live") return endLive();
+    if (action === "end-live-session") {
+      const id = actionEl.dataset.id || null;
+      return endLive(id);
+    }
+    if (action === "live-flip-camera") return flipLiveCamera();
+    if (action === "live-toggle-mic") return toggleLiveMic();
+    if (action === "close-live-viewer") { if(liveChannel){try{await sb.removeChannel(liveChannel);}catch(_){}} if(liveCommentsChannel){try{await sb.removeChannel(liveCommentsChannel);}catch(_){} liveCommentsChannel=null;} liveChannel=null; liveViewerPc?.close(); liveViewerPc=null; liveSessionId=null; liveRole=null; liveViewerId=null; liveCommentRows=[]; closeModal(); return; }
+    if (action === "react") return showReactions(id);
+    if (action === "comment") { $("comment-"+id)?.focus(); return; }
+    if (action === "send-comment") return addComment(id);
+    if (action === "reply-comment") { const box = $("reply-"+id); if (box) { box.innerHTML = `<div class="reply-form"><input id="reply-input-${esc(id)}" placeholder="Votre réponse..."><button data-action="send-reply" data-id="${esc(id)}">Envoyer</button></div>`; $("reply-input-"+id)?.focus(); } return; }
+    if (action === "send-reply") { const c = await sb.from("comments").select("post_id").eq("id",id).maybeSingle(); if(c.error || !c.data) return toast("Commentaire introuvable"); return addComment(c.data.post_id,id); }
+    if (action === "delete-comment") return deleteComment(id);
+    if (action === "share") return sharePost(id);
+    if (action === "post-menu") {
+      let post = state.posts.find(x => x.id === id);
+      if (!post) post = (await sb.from("posts").select("*").eq("id", id).maybeSingle()).data;
+      const owner = post?.user_id === state.user.id;
+      return openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">PUBLICATION</span><h3>Actions</h3><div class="menu-grid"><button class="menu-card" data-action="save-post" data-id="${esc(id)}"><span class="menu-icon">♡</span><span><b>Enregistrer</b><small>Disponible pour tous</small></span></button>${owner ? `<button class="menu-card premium-boost-menu-card" data-action="boost-post" data-id="${esc(id)}"><span class="menu-icon">✦</span><span><b>Booster / Sponsoriser</b><small>Audience, budget et ciblage</small></span></button><button class="menu-card" data-action="edit-post" data-id="${esc(id)}"><span class="menu-icon">✎</span><span><b>Modifier</b><small>Uniquement votre publication</small></span></button><button class="menu-card danger-card" data-action="delete-post" data-id="${esc(id)}"><span class="menu-icon">⌫</span><span><b>Supprimer</b><small>Vous êtes le propriétaire</small></span></button>` : `<button class="menu-card" data-action="report-post" data-id="${esc(id)}"><span class="menu-icon">⚑</span><span><b>Signaler</b><small>Signaler cette publication</small></span></button>`}</div></div>`);
+    }
+    if (action === "delete-search-history") {
+      const r=await sb.from("search_history").delete().eq("id",id).eq("user_id",state.user.id);
+      if(r.error) return toast(r.error.message);
+      toast("Recherche supprimée");
+      return servicePage("activity");
+    }
+    if (action === "clear-search-history") {
+      const r=await sb.from("search_history").delete().eq("user_id",state.user.id);
+      if(r.error) return toast(r.error.message);
+      toast("Historique de recherche effacé");
+      return servicePage("activity");
+    }
+
+    if (action === "page-mode-focus") {
+      const box = document.getElementById("pageModePostText");
+      if (box) { box.focus(); box.scrollIntoView({behavior:"smooth",block:"center"}); }
+      return;
+    }
+    if (action === "page-mode-publish") {
+      const pageId = id || state.activePage?.id;
+      const content = $("pageModePostText")?.value.trim() || "";
+      if (!pageId || !content) return toast("Ajoutez un texte à votre publication.");
+      const {data:pg} = await sb.from("pages").select("owner_id").eq("id",pageId).maybeSingle();
+      if (!pg || pg.owner_id !== state.user.id) return toast("Seul le propriétaire peut publier en mode Page.");
+      const r = await sb.from("page_posts").insert({page_id:pageId,user_id:state.user.id,content,media_url:null,media_type:null,visibility:"public"});
+      if (r.error) return toast(r.error.message);
+      toast("Publication de la Page publiée.");
+      return renderPageFeed();
+    }
+    if (action === "page-exit-mode") { closeModal(); state.activePage=null; state.entityBackRoute=null; state.navStack=["home"]; state.route="home"; restoreAccountNavigation(); syncIdentityUI(); return navigate("home",{replaceStack:true}); }
+    if (action === "page-manage-current") { return editPage(state.activePage?.id); }
+    if (action === "page-settings") return pageSettings(id || state.activePage?.id);
+    if (action === "page-name-history") return pageNameHistory(id);
+    if (action === "page-settings-save") return pageSettings(id);
+    if (action === "save-page-settings") { const pgId=id||state.activePage?.id; const key=`tafass_page_settings_${pgId}`; const values={}; document.querySelectorAll('[data-page-setting]').forEach(x=>values[x.dataset.pageSetting]=x.checked); localStorage.setItem(key,JSON.stringify(values)); closeModal(); toast('Paramètres de la Page enregistrés.'); return; }
+    if (action === "close-entity") { closeModal(); return navigate("home", {replaceStack:true}); }
+    if (action === "page-manage-back") { const pageId=actionEl.dataset.id || ""; closeModal(); return pageId ? openPageDetail(pageId) : navigate("home", {replaceStack:true}); }
+    if (action === "page-back") return goBack();
+    if (action === "toggle-page-follow") return togglePageFollow(id);
+    if (action === "edit-page") { const pg=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data; if(!pg || String(pg.owner_id)!==String(state.user.id)) return toast('Accès refusé : réservé au propriétaire de la Page.'); return editPage(id); }
+    if (action === "save-page-edit") { const pg=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data; if(!pg || String(pg.owner_id)!==String(state.user.id)) return toast('Accès refusé : réservé au propriétaire de la Page.'); return savePageEdit(id); }
+    if (action === "page-member-menu") return pageMemberMenu(id, actionEl.dataset.entityId);
+    if (action === "set-page-role") { const role=actionEl.dataset.role; const r=state.__isAdmin===true ? await sb.rpc('tafa_v80_platform_admin_set_role',{p_kind:'page',p_entity_id:actionEl.dataset.entityId,p_user_id:id,p_role:role}) : await sb.from('page_members').update({role}).eq('page_id',actionEl.dataset.entityId).eq('user_id',id); if(r.error)return toast(r.error.message); closeModal(); toast('Rôle mis à jour.'); return openPageDetail(actionEl.dataset.entityId); }
+    if (action === "remove-page-member") { const r=await sb.from('page_members').delete().eq('page_id',actionEl.dataset.entityId).eq('user_id',id); if(r.error)return toast(r.error.message); closeModal(); toast('Gestionnaire retiré.'); return openPageDetail(actionEl.dataset.entityId); }
+    if (action === "page-contact") {
+      const pg=(await sb.from('pages').select('id,name,owner_id').eq('id',id).maybeSingle()).data;
+      if(!pg)return toast('Page introuvable.');
+      openModal(`<div class="modal-box interaction-modal page-contact-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • CONTACT</span><h3>Contacter ${esc(pg.name)}</h3><p class="muted">Votre message sera envoyé à l’équipe de la Page.</p><textarea id="pageContactText" class="premium-input" maxlength="2000" placeholder="Écrivez votre message…"></textarea><button class="primary big" data-action="page-contact-send" data-id="${esc(id)}">Envoyer le message</button></div>`);
+      setTimeout(()=>$('pageContactText')?.focus(),50); return;
+    }
+    if (action === "page-contact-send") {
+      const text=$('pageContactText')?.value.trim(); if(!text)return toast('Écrivez un message.');
+      const r=await sb.from('page_messages').insert({page_id:id,sender_id:state.user.id,message:text}); if(r.error)return toast(r.error.message);
+      closeModal(); toast('Message envoyé à la Page.'); return;
+    }
+    if (action === "page-inbox") return pageInbox(id);
+    if (action === "page-inbox-reply") { const text=$('pageReplyText')?.value.trim(); if(!text)return toast('Écrivez un message.'); const r=await sb.from('page_messages').insert({page_id:id,sender_id:state.user.id,message:text}); if(r.error)return toast(r.error.message); $('pageReplyText').value=''; toast('Réponse envoyée.'); return pageInbox(id); }
+    if (action === "page-tab") return pageTab(id, actionEl.dataset.tab || "posts");
+    if (action === "page-about-tab") return pageTab(id,'about');
+    if (action === "page-admin-tab") return pageTab(id,'team');
+    if (action === "page-publish") {
+      const ownerRow=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data;
+      if(!ownerRow || String(ownerRow.owner_id)!==String(state.user.id)) return toast('Accès refusé : seul le propriétaire peut publier au nom de la Page.');
+      const content=$('pagePostText')?.value.trim(); const file=$('pagePostMedia')?.files?.[0];
+      if(!content && !file)return toast('Ajoutez un texte ou un média.');
+      const btn=actionEl; setLoading(btn,true,'Publier');
+      let media_url=null, media_type=null;
+      if(file){ const ext=(file.name.split('.').pop()||'bin').toLowerCase(); const path=`${state.user.id}/page-post-${id}-${crypto.randomUUID()}.${ext}`; const up=await uploadPostMedia(path,file,{upsert:false,contentType:file.type||undefined}); if(up.error){setLoading(btn,false,'Publier');return toast(up.error.message);} media_url=sb.storage.from('posts').getPublicUrl(path).data.publicUrl; media_type=file.type||''; }
+      const r=await sb.from('page_posts').insert({page_id:id,user_id:state.user.id,content:content||'',media_url,media_type,visibility:'public'});
+      setLoading(btn,false,'Publier'); if(r.error)return toast(r.error.message); toast('Publication publiée.'); return openPageDetail(id);
+    }
+    if (action === "page-post-menu") return pagePostMenu(id, actionEl.dataset.entityId);
+    if (action === "copy-page-post-link") { const link=actionEl.dataset.link||''; try{await navigator.clipboard.writeText(link); toast('Lien de la publication copié.');}catch{toast('Impossible de copier le lien.');} return; }
+    if (action === "edit-page-post") return editPagePost(id, actionEl.dataset.entityId);
+    if (action === "save-page-post-edit") {
+      const pageId=actionEl.dataset.entityId, text=$('pagePostEditText')?.value.trim()||'';
+      if(!text)return toast('La publication ne peut pas être vide.');
+      const pgOwner=(await sb.from('pages').select('owner_id').eq('id',pageId).maybeSingle()).data;
+      if(!pgOwner || String(pgOwner.owner_id)!==String(state.user.id)) return toast('Accès refusé : seul le propriétaire peut modifier les publications de la Page.');
+      const r=await sb.from('page_posts').update({content:text}).eq('id',id).eq('user_id',state.user.id);
+      if(r.error)return toast(r.error.message);
+      closeModal(); toast('Publication modifiée.'); return openPageDetail(pageId);
+    }
+    if (action === "page-post-like") return pagePostReaction(id, actionEl.dataset.entityId);
+    if (action === "page-post-comment") return pagePostComment(id, actionEl.dataset.entityId);
+    if (action === "page-send-comment") {
+      const text=$('pageCommentInput')?.value.trim(); if(!text)return toast('Écrivez un commentaire.');
+      const r=await sb.from('page_post_comments').insert({page_post_id:id,user_id:state.user.id,content:text}); if(r.error)return toast(r.error.message); closeModal(); toast('Commentaire publié.'); return openPageDetail(actionEl.dataset.entityId);
+    }
+    if (action === "share-page-post") return pagePostShare(id, actionEl.dataset.entityId);
+    if (action === "group-post-like") return groupPostReaction(id, actionEl.dataset.entityId);
+    if (action === "group-post-comment") return groupPostComment(id, actionEl.dataset.entityId);
+    if (action === "group-send-comment") {
+      const text=$('groupCommentInput')?.value.trim(); if(!text)return toast('Écrivez un commentaire.');
+      const r=await sb.from('group_post_comments').insert({group_post_id:id,user_id:state.user.id,content:text}); if(r.error)return toast(r.error.message); closeModal(); toast('Commentaire publié.'); return reopenGroupDetail(actionEl.dataset.entityId);
+    }
+    if (action === "share-group-post") return groupPostShare(id, actionEl.dataset.entityId);
+    if (action === "delete-group-post") {
+      const gid = actionEl.dataset.entityId;
+      const {data:g} = await sb.from("groups").select("owner_id").eq("id",gid).maybeSingle();
+      const {data:m} = await sb.from("group_members").select("role").eq("group_id",gid).eq("user_id",state.user.id).maybeSingle();
+      if (!g || (g.owner_id !== state.user.id && m?.role !== "admin")) return toast("Vous n’avez pas les droits pour supprimer cette publication.");
+      const r = await sb.from("group_posts").delete().eq("id",id).eq("group_id",gid);
+      if (r.error) return toast(r.error.message);
+      toast("Publication du groupe supprimée.");
+      return openGroupDetail(gid);
+    }
+    if (action === "send-group-chat") {
+      const text = $("groupChatText")?.value.trim();
+      if (!text) return toast("Écrivez un message.");
+      const gid = id;
+      const member = await sb.from("group_members").select("id").eq("group_id",gid).eq("user_id",state.user.id).maybeSingle();
+      if (member.error || !member.data) return toast("Rejoignez le groupe pour participer à la discussion.");
+      const r = await sb.from("group_messages").insert({group_id:gid,sender_id:state.user.id,message:text});
+      if (r.error) return toast(r.error.message);
+      $("groupChatText").value = "";
+      toast("Message envoyé.");
+      return groupChat(gid);
+    }
+
+    if (action === "auth-onboarding-back") { state.entering=false; state.user=null; sb.auth.signOut().catch(()=>{}); return showLogin(); }
+    if (action === "boost-post") { closeModal(); return openBoostPost(id); }
+    if (action === "create-boost-post") return createBoostPost();
+    if (action === "boost-page") return toast('La promotion de Page n’est plus disponible.');
+    if (action === "create-boost-page") return createBoostPage();
+    if (action === "open-boost-dashboard") return openBoostOwnerDashboard(id);
+    if (action === "owner-pause-boost") return pauseOwnerBoost(id);
+    if (action === "owner-refresh-boost-dashboard") return openBoostOwnerDashboard(id);
+    if (action === "select-boost-payment") { document.querySelectorAll('[data-action="select-boost-payment"]').forEach(x=>x.classList.remove('active')); actionEl.classList.add('active'); const i=$("boostPaymentMethod"); if(i)i.value=actionEl.dataset.method||'Airtel Money'; return; }
+    if (action === "submit-boost-payment") return submitBoostPayment(id,Number(actionEl.dataset.amount||0));
+    if (action === "sponsored-view") return openSponsoredView(actionEl);
+    if (action === "sponsored-open-page") { closeModal(); if(actionEl.dataset.pageId) return openPageDetail(actionEl.dataset.pageId); return; }
+    if (action === "sponsored-open-target") { await recordSponsoredEvent(id,'click'); const target=actionEl.dataset.target||''; if(target){try{window.open(target,'_blank','noopener,noreferrer')}catch(_){}} return; }
+    if (action === "sponsored-click") { await recordSponsoredEvent(id,'click'); const target=actionEl.dataset.target||''; if(target){try{window.open(target,'_blank','noopener,noreferrer')}catch(_){}} else if(actionEl.dataset.pageId) return openPageDetail(actionEl.dataset.pageId); return; }
+    if (action === "new-ad-campaign") return openAdCampaign();
+    if (action === "save-ad-campaign") return saveAdCampaign();
+    if (action === "toggle-ad-campaign") return toggleAdCampaign(id, actionEl.dataset.status||"draft");
+    if (action === "delete-ad-campaign") return deleteAdCampaign(id);
+    if (action === "edit-business-profile") { const r=await sb.from("tafab_business_profiles").select("*").eq("owner_id",state.user.id).maybeSingle(); window.__tafassBusiness=r.data||{}; return openBusinessProfile(); }
+    if (action === "save-business-profile") return saveBusinessProfile();
+    if (action === "menu-route") { const target = actionEl.dataset.routeTarget; if (target) navigate(target); return; }
+    if (action === "retry-route") { const target = actionEl.dataset.routeTarget; if (target) { state.renderToken++; state.route=target; await render(); } return; }
+    if (action === "menu-info") { settingInfo(actionEl.dataset.name || "Menu"); return; }
+    if (action === "menu-service") return servicePage(actionEl.dataset.service);
+    if (action === "help-item") return openHelpTopic(actionEl.dataset.helpTopic || "technical", actionEl.dataset.name || "Aide");
+    if (action === "payment-request") return createPaymentRequest(actionEl.dataset.method);
+    if (action === "social-hashtag") return openSocialHashtag(actionEl.dataset.tag || "");
+    if (action === "social-mention") return openSocialMention(actionEl.dataset.username || "");
+    if (action === "copy-post-link") return copyPostLink(id);
+    if (action === "save-post") { const r=await sb.from("saved_posts").upsert({user_id:state.user.id,post_id:id},{onConflict:"user_id,post_id"}); toast(r.error?r.error.message:"Publication enregistrée"); closeModal(); return; }
+    if (action === "unsave-post") { const r=await sb.from("saved_posts").delete().eq("user_id",state.user.id).eq("post_id",id); if(r.error)return toast(r.error.message); toast("Retiré des Enregistrements"); if(state.route==="saved") return genericListPage("saved"); return; }
+    if (action === "edit-post") return editPost(id);
+    if (action === "save-post-edit") return savePostEdit(id);
+    if (action === "delete-post") return deletePost(id);
+    if (action === "report-post") return reportPost(id);
+    if (action === "add-friend") return addFriend(id);
+    if (action === "accept-friend") return handleFriend(id,"accepted");
+    if (action === "decline-friend") return handleFriend(id,"declined");
+    if (action === "friends-tab") return friendsPage(actionEl.dataset.tab);
+    if (action === "view-profile") {
+      return openUserProfile(id);
+    }
+    if (action === "open-notification-post") return openNotificationPost(notificationId || id);
+    if (action === "notification-read") return notificationRead(id);
+    if (action === "accept-role-request") return respondRoleRequest(id,true);
+    if (action === "reject-role-request") return respondRoleRequest(id,false);
+    if (action === "search-post") {
+      const p=(await sb.from("posts").select("*").eq("id",id).maybeSingle()).data;
+      if(!p)return toast("Publication introuvable");
+      const ids=[p.user_id].filter(Boolean); const pp=ids.length?await sb.from("profiles").select("*").in("id",ids):{data:[]}; const author=(pp.data||[])[0]||state.profile;
+      return openModal(`<div class="modal-box post-preview-modal"><button class="modal-close" data-action="close-modal">×</button>${await postHTML({...p,author})}</div>`);
+    }
+    if (action === "profile-tab") return profilePage(actionEl.dataset.tab);
+    if (action === "public-profile-tab") return openUserProfileTab(id, actionEl.dataset.tab);
+    if (action === "edit-profile") return editProfile();
+    if (action === "remove-profile-avatar") return removeProfileMedia("avatar");
+    if (action === "remove-profile-cover") return removeProfileMedia("cover");
+    if (action === "confirm-remove-profile-media") return performRemoveProfileMedia(actionEl.dataset.kind || "avatar");
+    if (action === "account-settings") return accountSettings();
+    if (action === "save-account-settings") return saveAccountSettings();
+    if (action === "complete-onboarding") return completeOnboarding();
+    if (action === "save-profile") return saveProfile();
+    if (action === "profile-more") return profileMore(id);
+    if (action === "message-user") return startConversation(id);
+    if (action === "remove-friend") return removeFriend(id);
+    if (action === "report-profile") return reportProfile(id);
+    if (action === "block-profile") return blockProfile(id);
+    if (action === "unblock-profile") return unblockProfile(id);
+    if (action === "new-message") return newMessage();
+    if (action === "start-conversation") return startConversation(id);
+    if (action === "reply-message") { closeModal(); return replyConversationMessage(id); }
+    if (action === "cancel-message-reply") return cancelMessageReply();
+    if (action === "message-menu") return messageActionMenu(id);
+    if (action === "message-mention") return openSocialMention(actionEl.dataset.username || "");
+    if (action === "message-mention-select") return selectMessageMention(actionEl.dataset.username || "");
+    if (action === "conversation-search") return openConversationSearch();
+    if (action === "conversation-search-close") return closeConversationSearch();
+    if (action === "toggle-message-reactions") return toggleMessageReactionPicker(id);
+    if (action === "edit-message") return editConversationMessage(id);
+    if (action === "save-message-edit") return saveConversationMessageEdit(id);
+    if (action === "delete-message") return deleteConversationMessage(id);
+    if (action === "delete-message-me") return hideMessageForMe(id);
+    if (action === "delete-message-everyone") return deleteMessageForEveryone(id);
+    if (action === "confirm-delete-message") return confirmDeleteMessageForEveryone(id);
+    if (action === "message-history") return messageHistory(id);
+    if (action === "message-emoji") return openMessageEmojiPicker();
+    if (action === "send-greeting") return sendGreeting(actionEl.dataset.index);
+    if (action === "confirm-delete-conversation") return confirmDeleteConversation(id);
+    if (action === "message-aliases") return messageAliases(id);
+    if (action === "message-theme") return openMessageTheme(id);
+    if (action === "save-message-theme") return saveMessageTheme(id);
+    if (action === "copy-message") return copyMessage(id);
+    if (action === "react-message") return reactToMessage(id, actionEl.dataset.reaction||"👍");
+    if (action === "download-message-file") return downloadMessageFile(actionEl.dataset.url, actionEl.dataset.name);
+    if (action === "conversation-menu") return conversationActionMenu(id);
+    if (action === "delete-conversation-me") return deleteConversationForMe(id);
+    if (action === "block-messages-user") return blockMessagesUser(id);
+    if (action === "block-user-all") return blockUserAll(id);
+    if (action === "open-conversation") return openConversation(id);
+    if (action === "mark-read") return markRead();
+    if (action === "theme") return toggleTheme();
+    if (action === "enable-push-notifications") return enableTafaPushNotifications();
+    if (action === "skip-login-push") { closeLoginPushPrompt(); return; }
+    if (action === "settings-focus-search") { $("settingsSearch")?.focus(); return; }
+    if (action === "open-games") return gamesModal();
+    if (action === "capture-exact-location") return captureExactLocation();
+    if (action === "close-games") { if (activeGameCleanup) { activeGameCleanup(); activeGameCleanup=null; } return closeModal(); }
+    if (["save-profile-lock","save-privacy-assistance","save-find-contact-settings","save-notification-settings","save-family-settings","save-story-settings","save-publication-settings","save-public-content-settings","save-media-settings","save-time-settings","save-reaction-settings","save-audience-setting","save-followers-settings","save-profile-identification","save-online-settings","save-location-settings","save-professional-settings","save-accessibility-settings","save-effects-settings"].includes(action)) {
+      if (action === "save-audience-setting") {
+        const key = actionEl.dataset.audienceKey || "default_post_audience";
+        const patch = {}; patch[key] = $("audienceValue")?.value || "public";
+        return saveSettingsTable("audience_settings", patch, "Audience enregistrée");
+      }
+      return saveSettingsDetail(action);
+    }
+    if (action === "unblock-from-settings") {
+      const r=await sb.from("blocked_profiles").delete().eq("blocker_id",state.user.id).eq("blocked_id",id);
+      if(r.error) return toast(r.error.message);
+      await logActivity("profile_unblocked","Compte débloqué","profile",id);
+      blockedCache.loadedAt=0; await getBlockedIds(true); toast("Compte débloqué");
+      return openAdvancedSetting("blocking");
+    }
+    if (action === "revoke-connected-app") {
+      const r=await sb.from("connected_apps").update({status:"revoked",revoked_at:new Date().toISOString()}).eq("id",id).eq("user_id",state.user.id);
+      if(r.error) return toast(r.error.message);
+      toast("Connexion révoquée");
+      return openAdvancedSetting("apps-web");
+    }
+    if (action === "revoke-professional-integration") {
+      const r=await sb.from("professional_integrations").update({status:"revoked",revoked_at:new Date().toISOString()}).eq("id",id).eq("user_id",state.user.id);
+      if(r.error) return toast(r.error.message);
+      toast("Intégration révoquée");
+      return openAdvancedSetting("professional-integrations");
+    }
+    if (action === "payment-review") { const method=document.querySelector(".payment-method.active")?.dataset.paymentMethod||"Airtel Money"; return submitPaymentRequest(method,$("paymentAmount")?.value||"",$("paymentPhone")?.value||""); }
+    if (action === "close-payment") return servicePage("payment");
+    if (action === "payment-settings") return servicePage("payment");
+    if (action === "activity-settings") return servicePage("activity");
+
+    if (action === "close-business-suite") { state.businessSuiteOpen=false; return closeModal(); }
+    if (action === "business-refresh") return pageBusinessSuite();
+    if (action === "business-open-messages") {
+      closeModal(); state.businessSuiteOpen=false; return navigate("messages");
+    }
+    if (action === "business-open-pages") {
+      closeModal(); state.businessSuiteOpen=false; return navigate("home", {replaceStack:true});
+    }
+    if (action === "business-open-team") {
+      const first=(await sb.from("pages").select("id").eq("owner_id",state.user.id).order("created_at",{ascending:false}).limit(1)).data?.[0];
+      if(!first)return toast("Créez une Page pour gérer une équipe.");
+      return openPageDetail(first.id);
+    }
+    if (action === "business-open-settings") {
+      const first=(await sb.from("pages").select("id").eq("owner_id",state.user.id).order("created_at",{ascending:false}).limit(1)).data?.[0];
+      if(!first)return toast("Créez une Page pour ouvrir ses paramètres.");
+      return pageSettings(first.id);
+    }
+    if (action === "create-story") return createStory();
+    if (action === "story-create") return storyComposer();
+    if (action === "conversation-menu") return conversationActionMenu(id);
+    if (action === "conversation-call" || action === "conversation-video") return toast("Les appels seront disponibles dans une prochaine activation du service temps réel.");
+    if (action === "open-story") {
+      const s=(await sb.from("stories").select("*").eq("id",id).maybeSingle()).data;
+      if(!s)return toast("Story introuvable ou expirée.");
+      await sb.from("story_views").upsert({story_id:s.id,user_id:state.user.id},{onConflict:"story_id,user_id"});
+      let viewersHtml="";
+      if(String(s.user_id)===String(state.user.id)){
+        const vr=await sb.from("story_views").select("user_id,viewed_at,profiles(first_name,last_name,username,avatar_url)").eq("story_id",s.id).order("viewed_at",{ascending:false}).limit(200);
+        if(!vr.error){
+          const viewers=vr.data||[];
+          viewersHtml=`<section class="story-viewers-panel"><div class="story-viewers-head"><b>Vues</b><span>${viewers.length} vue${viewers.length!==1?'s':''}</span></div><div class="story-viewers-list">${viewers.map(v=>`<div class="story-viewer-row">${avatarHTML(v.profiles||{},'avatar tiny-avatar')}<div><b>${esc(nameOf(v.profiles||{}))}</b><small>${timeAgo(v.viewed_at)}</small></div></div>`).join('')||'<div class="empty">Aucune vue pour le moment.</div>'}</div></section>`;
+        }
+      }
+      return openModal(`<div class="modal-box story-view-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • STORY</span><div class="story-view-content">${s.media_type==="video"?`<video src="${esc(s.media_url)}" controls autoplay playsinline></video>`:s.media_type==="text"?`<div class="story-view-text">${esc(s.text_overlay||"")}</div>`:`<img src="${esc(s.media_url)}" alt="Story">`}</div>${s.text_overlay&&s.media_type!=="text"?`<p class="story-view-caption">${esc(s.text_overlay)}</p>`:""}<small class="muted">Expire automatiquement après 24 heures.</small>${viewersHtml}</div>`);
+    }
+    if (action === "save-advanced-visibility") return saveUserSetting({profile_visibility:$("advancedVisibility")?.value||"public"});
+
+    if (action === "create-tafab-listing") return createTafabListing();
+    if (action === "save-tafab-listing") return saveTafabListing();
+    if (action === "create-tafab-ad") return createTafabAd();
+    if (action === "tafab-ad") {
+      const r = await sb.from("tafab_ads").select("*").eq("id",id).maybeSingle();
+      if (r.error || !r.data) return toast(r.error?.message || "Publicité introuvable.");
+      const a = r.data;
+      return openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß • PUBLICITÉ</span><h3>${esc(a.title)}</h3>${a.image_url?`<img class="post-media" src="${esc(a.image_url)}" alt="Publicité" loading="lazy">`:""}<p>${esc(a.description||"")}</p>${a.target_url?`<a class="primary big" href="${esc(a.target_url)}" target="_blank" rel="noopener noreferrer">Ouvrir le lien</a>`:""}</div>`);
+    }
+    if (action === "save-tafab-ad") return saveTafabAd();
+    if (action === "tafab-message") return contactTafabListing(id);
+    if (action === "tafab-order") return orderTafabListing(id);
+    if (action === "confirm-tafab-order") return confirmTafabOrder(id);
+    if (action === "tafab-favorite") return toggleTafabFavorite(id);
+    if (action === "show-tafab-orders") return showTafabOrders();
+    if (action === "message-attachment") return openMessageAttachment();
+    if (action === "message-voice") return toggleVoiceRecording();
+    if (action === "discard-voice") return discardVoice();
+    if (action === "send-voice-draft") return sendVoiceDraft();
+    if (action === "live-gift") return sendLiveGift(actionEl.dataset.gift||"heart",Number(actionEl.dataset.coins||10));
+    if (action === "ai-mode") { window.__tafassAiMode=actionEl.dataset.mode||"assistant"; document.querySelectorAll('[data-action="ai-mode"]').forEach(x=>x.classList.toggle("active",x===actionEl)); const labels={assistant:"Assistant",write:"Écrire",translate:"Traduire",summarize:"Résumer"}; if($("aiModeHint"))$("aiModeHint").textContent=`Mode : ${labels[window.__tafassAiMode]||"Assistant"}`; return; }
+    if (action === "run-ai") return runAi();
+    if (action === "copy-ai") { const text=$("aiResponse")?.dataset.copy||""; if(!text)return; try{await navigator.clipboard.writeText(text);toast("Réponse copiée.");}catch(_){toast("Copie indisponible sur cet appareil.");} return; }
+    if (action === "music-play-db") return playDbMusic(id);
+    if (action === "music-like") return toggleMusicLike(id);
+    if (action === "music-create-playlist") return openMusicPlaylist();
+    if (action === "save-music-playlist") return saveMusicPlaylist();
+    if (action === "request-monetization") return openMonetizationRequest();
+    if (action === "papi-buy-coins") return openPapiCoinsPurchase();
+    if (action === "papi-create-payment") return createPapiCoinPayment();
+    if (action === "submit-monetization-request") return submitMonetizationRequest();
+    if (action === "add-payout-method") return openPayoutMethod();
+    if (action === "save-payout-method") return savePayoutMethod();
+    if (action === "request-withdrawal") return openWithdrawalRequest();
+    if (action === "submit-withdrawal") return submitWithdrawal();
+    if (action === "creator-pricing") return openCreatorPricing();
+    if (action === "tafab-contact") return contactTafabListing(id);
+    if (action === "send-tafab-message") return sendTafabMessage(id);
+    if (action === "tafab-info") { const x=(await sb.from("tafab_listings").select("*").eq("id",id).maybeSingle()).data; if(!x)return toast("Offre introuvable"); return openModal(`<div class="modal-box"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">OFFRE TAFAß</span><h3>${esc(x.title)}</h3><p>${esc(x.description||"")}</p><p class="muted">${esc(x.location||"")} ${x.price!=null?"• "+esc(x.price)+" "+esc(x.currency||"MGA"):""}</p><button class="primary big" data-action="tafab-contact" data-id="${esc(x.id)}">Contacter le vendeur</button></div>`); }
+    if (action === "security-settings") return securitySettings();
+    if (action === "setting") return settingInfo(actionEl.dataset.name);
+    if (["family-center","audience-defaults","reaction-settings","accessibility-settings","media-settings","time-management","effects-settings","profile-lock","professional-mode","post-privacy","story-privacy","page-privacy","followers-public","profile-identification","blocking","online-status","location-settings","apps-web","professional-integrations","information-management","terms","privacy-policy","cookies","community-standards","about-tafass","find-contact-settings","notifications-settings"].includes(action)) return openAdvancedSetting(action);
+    if (action === "privacy-settings") return openPrivacySettings();
+    if (action === "save-privacy") return saveUserSetting({ profile_visibility: $("privacyVisibility").value });
+    if (action === "save-setting-toggle") { const key=actionEl.dataset.settingKey; return saveUserSetting({ [key]: !!$("settingToggle")?.checked }); }
+    if (action === "save-search-privacy") return saveUserSetting({ allow_search_by_phone: !!$("allowSearchPhone")?.checked, allow_search_by_email: !!$("allowSearchEmail")?.checked });
+    if (action === "save-language") return saveUserSetting({ language: $("languageSelect")?.value || "fr" });
+    if (["friend-settings","message-settings","search-privacy-settings","language-settings","message-notification-settings","friend-notification-settings","reaction-notification-settings","comment-notification-settings"].includes(action)) return openSettingControl(action);
+    if (action === "page-add-member") { return openModal(`<div class="modal-box page-edit-modal"><button class="page-close" data-action="close-modal">×</button><span class="page-eyebrow">TAFAß · ÉQUIPE</span><h2>Ajouter un gestionnaire</h2><p class="muted">Recherchez un membre par @username ou e-mail.</p><input id="pageManagerLookup" class="premium-input" placeholder="@username ou email"><select id="pageManagerRole" class="premium-input"><option value="editor">Éditeur</option><option value="admin">Administrateur</option></select><button class="primary big" data-action="add-page-member" data-id="${esc(id)}">Ajouter</button></div>`); }
+    if (action === "add-page-member") { const q=$('pageManagerLookup')?.value.trim().replace(/^@/,''); if(!q)return toast('Entrez un username ou e-mail.'); let u=(await sb.from('profiles').select('id,first_name,last_name,username,email,avatar_url').or(`username.eq.${q},email.eq.${q}`).limit(1)).data?.[0]; if(!u)return toast('Membre introuvable.'); if(u.id===state.user.id)return toast('Vous ne pouvez pas vous inviter vous-même.'); const role=$('pageManagerRole')?.value||'editor'; const r=await sb.from('page_role_requests').insert({page_id:id,target_user_id:u.id,requested_by:state.user.id,role}); if(r.error)return toast(r.error.message); await sb.from('notifications').insert({user_id:u.id,actor_id:state.user.id,type:'page_role_request',title:'Nouvelle demande de rôle',message:`Vous êtes invité à devenir ${role==='admin'?'administrateur':'éditeur'} d’une Page Tafaß.`,entity_type:'page_role_request',entity_id:r.data?.[0]?.id||id}); closeModal(); toast('Demande envoyée. Le membre doit accepter ou refuser.'); return openPageDetail(id); }
+    if (action === "invite-group") { return openModal(`<div class="modal-box page-edit-modal"><button class="page-close" data-action="close-modal">×</button><span class="page-eyebrow">TAFAß · GROUPE</span><h2>Inviter un membre</h2><p class="muted">Recherchez un membre par @username ou e-mail.</p><input id="groupInviteLookup" class="premium-input" placeholder="@username ou email"><button class="primary big" data-action="add-group-member" data-id="${esc(id)}">Inviter</button></div>`); }
+    if (action === "add-group-member") { const q=$('groupInviteLookup')?.value.trim().replace(/^@/,''); if(!q)return toast('Entrez un username ou e-mail.'); const u=(await sb.from('profiles').select('id,username,email').or(`username.eq.${q},email.eq.${q}`).limit(1)).data?.[0]; if(!u)return toast('Membre introuvable.'); if(u.id===state.user.id)return toast('Vous êtes déjà dans ce groupe.'); const fr=(await sb.from('friendships').select('id').or(`and(user_id.eq.${state.user.id},friend_id.eq.${u.id}),and(user_id.eq.${u.id},friend_id.eq.${state.user.id})`).maybeSingle()).data; if(!fr)return toast('Vous pouvez inviter uniquement un ami accepté.'); const r=await sb.from('notifications').insert({user_id:u.id,actor_id:state.user.id,type:'group_join',title:'Invitation à rejoindre un groupe',message:'Vous êtes invité à rejoindre un groupe Tafaß.',entity_type:'group',entity_id:id}); if(r.error)return toast(r.error.message); closeModal(); toast('Invitation envoyée.'); return openGroupDetail(id); }
+    if (action === "toggle-group-member") return toggleGroupMember(id);
+    if (action === "edit-group") return editGroup(id);
+    if (action === "save-group-edit") return saveGroupEdit(id);
+    if (action === "group-member-role") return groupMemberRole(id, actionEl.dataset.entityId);
+    if (action === "set-group-role") { const role=actionEl.dataset.role; if(state.__isAdmin===true){ const r=await sb.rpc('tafa_v80_platform_admin_set_role',{p_kind:'group',p_entity_id:actionEl.dataset.entityId,p_user_id:id,p_role:role==='member'?'editor':role}); if(r.error)return toast(r.error.message); closeModal(); toast('Rôle du membre mis à jour.'); return openGroupDetail(actionEl.dataset.entityId); } if(role==='member'){ const r=await sb.from('group_members').update({role}).eq('group_id',actionEl.dataset.entityId).eq('user_id',id); if(r.error)return toast(r.error.message); closeModal(); toast('Rôle du membre mis à jour.'); return openGroupDetail(actionEl.dataset.entityId); } const r=await sb.from('group_role_requests').insert({group_id:actionEl.dataset.entityId,target_user_id:id,requested_by:state.user.id,role}); if(r.error)return toast(r.error.message); await sb.from('notifications').insert({user_id:id,actor_id:state.user.id,type:'group_role_request',title:'Nouvelle demande de rôle',message:`Vous êtes invité à devenir ${role==='admin'?'administrateur':'modérateur'} du groupe.`,entity_type:'group_role_request',entity_id:r.data?.[0]?.id}); closeModal(); toast('Demande envoyée. Le membre doit accepter ou refuser.'); return openGroupDetail(actionEl.dataset.entityId); }
+    if (action === "remove-group-member") { const r=await sb.from('group_members').delete().eq('group_id',actionEl.dataset.entityId).eq('user_id',id); if(r.error)return toast(r.error.message); closeModal(); toast('Membre retiré.'); return openGroupDetail(actionEl.dataset.entityId); }
+    if (action === "group-chat") return groupChat(id);
+    if (action === "group-tab") return groupTab(id, actionEl.dataset.tab || "posts");
+    if (action === "group-members-tab") return groupTab(id,'members');
+    if (action === "group-about-tab") return groupTab(id,'about');
+    if (action === "create-group") return openModal(`<div class="modal-box entity-create-modal-v2"><button class="modal-close" data-action="close-modal">×</button><div class="create-hero-v2 group"><span class="create-icon-v2 group-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="9" r="3"/><circle cx="17" cy="10" r="2.5"/><path d="M2.8 20c.6-4 2.5-6 5.2-6s4.6 2 5.2 6M13.5 15c3-.2 5 1.5 5.7 5"/></svg></span><div><span class="eyebrow">TAFAß • GROUPES</span><h3>Créer un groupe</h3><p>Créez votre espace communautaire avec une identité claire.</p></div></div><div class="create-grid-v2"><label class="create-field-v2 wide"><span>Nom du groupe</span><input id="newGroupName" maxlength="80" placeholder="Ex. Passion Madagascar"></label><label class="create-field-v2 wide"><span>Description</span><textarea id="newGroupDesc" maxlength="500" placeholder="Présentez votre groupe…"></textarea></label><label class="create-upload-v2"><span>Avatar du groupe</span><input id="newGroupAvatar" type="file" accept="image/jpeg,image/png,image/webp"><small>Optionnel • avatar par défaut automatique</small></label><label class="create-upload-v2"><span>Photo de couverture</span><input id="newGroupCover" type="file" accept="image/jpeg,image/png,image/webp"><small>Optionnel</small></label></div><button class="primary big create-submit-v2" data-action="save-group"><span>＋</span> Créer le groupe</button></div>`);
+    if (action === "save-group") {
+      const limit=await sb.rpc("tafa_can_create_group",{p_user_id:state.user.id}); if(limit.error)return toast(limit.error.message); if(limit.data===false)return toast("Limite atteinte : 5 groupes maximum sur 15 jours. Vous pourrez en créer un nouveau après la période de 15 jours.");
+      const name=$("newGroupName")?.value.trim(); if(!name)return toast("Entrez un nom.");
+      const r=await sb.from("groups").insert({owner_id:state.user.id,name,description:$("newGroupDesc")?.value.trim()||"",privacy:"public"}).select().single();
+      if(r.error)return toast(r.error.message);
+      const g=r.data;
+      await sb.from("group_members").insert({group_id:g.id,user_id:state.user.id,role:"admin"});
+      const patch={};
+      const coverFile=$("newGroupCover")?.files?.[0] || $("newGroupAvatar")?.files?.[0];
+      if(coverFile){ const ext=(coverFile.name.split('.').pop()||'jpg').toLowerCase(); const path=`${state.user.id}/group-${g.id}-cover-${crypto.randomUUID()}.${ext}`; const up=await uploadPostMedia(path,coverFile,{upsert:false,contentType:coverFile.type||'image/jpeg'}); if(up.error){ toast('Groupe créé. Image non envoyée : '+up.error.message); } else patch.cover_url=sb.storage.from('posts').getPublicUrl(path).data.publicUrl; }
+      if(Object.keys(patch).length) await sb.from('groups').update(patch).eq('id',g.id).eq('owner_id',state.user.id);
+      closeModal(); toast("Groupe créé"); return genericListPage("groups");
+    }
+    if (action === "pages-tab") { state.pagesTab=actionEl.dataset.tab||"mine"; return pagesV80Hub(); }
+    if (action === "groups-tab") { state.groupsTab=actionEl.dataset.tab||"mine"; closeModal(); return groupsV80Hub(); }
+    if (action === "group-sort") { state.groupSort=actionEl.dataset.sort||"recent"; closeModal(); return groupsV80Hub(); }
+    if (action === "group-sort-menu") return groupSortMenu();
+    if (action === "page-switch") {
+      if (typeof window.__tafassV65PageSwitch === "function") {
+        const result = await window.__tafassV65PageSwitch(actionEl, id);
+        const pg = state.activePage;
+        if (pg) toast(`Mode ${pg.name} activé.`);
+        return result;
+      }
+      const pg=(await fetchPageById(id)).data; if(!pg)return toast("Page introuvable.");
+      closeModal(); state.activePage={...pg}; state.navStack=["home"]; state.route="home"; syncIdentityUI(); history.replaceState(null,"","#home"); return render();
+    }
+    if (action === "page-business") return pageBusinessSuite();
+    if (action === "create-page") { state.businessSuiteOpen=false; return openModal(`<div class="modal-box entity-create-modal-v2"><button class="modal-close" data-action="close-modal">×</button><div class="create-hero-v2 page"><span class="create-icon-v2 page-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 7h6M9 11h6M9 15h4"/></svg></span><div><span class="eyebrow">TAFAß • PAGES</span><h3>Créer une Page</h3><p>Donnez à votre Page une identité professionnelle et claire.</p></div></div><div class="create-grid-v2"><label class="create-field-v2 wide"><span>Nom de la Page</span><input id="newPageName" maxlength="80" placeholder="Nom de la Page"></label><label class="create-field-v2"><span>Catégorie</span><select id="newPageCategory" aria-label="Catégorie de la Page"><option value="" selected disabled>Choisir une catégorie</option>${pageCategoryOptions()}</select><small class="create-select-hint">Plus de 50 catégories disponibles • choisissez une catégorie.</small></label><label class="create-upload-v2"><span>Avatar de la Page</span><input id="newPageAvatar" type="file" accept="image/jpeg,image/png,image/webp"><small>Optionnel • avatar par défaut automatique</small></label><label class="create-field-v2 wide"><span>Présentation</span><textarea id="newPageBio" maxlength="500" placeholder="Présentez votre Page…"></textarea></label><label class="create-upload-v2 wide"><span>Photo de couverture</span><input id="newPageCover" type="file" accept="image/jpeg,image/png,image/webp"><small>Optionnel</small></label></div><button class="primary big create-submit-v2" data-action="save-page"><span>＋</span> Créer la Page</button></div>`); }
+    if (action === "save-page") {
+      const limit=await sb.rpc("tafa_can_create_page",{p_user_id:state.user.id}); if(limit.error)return toast(limit.error.message); if(limit.data===false)return toast("Limite atteinte : 3 Pages maximum sur 15 jours. Vous pourrez en créer une nouvelle après la période de 15 jours.");
+      const name=$("newPageName")?.value.trim(); if(!name)return toast("Entrez un nom.");
+      const r=await sb.from("pages").insert({owner_id:state.user.id,name,category:$("newPageCategory")?.value.trim()||"Autre",bio:$("newPageBio")?.value.trim()||""}).select().single();
+      if(r.error)return toast(r.error.message);
+      const pg=r.data;
+      await sb.from("page_members").upsert({page_id:pg.id,user_id:state.user.id,role:"owner"},{onConflict:"page_id,user_id"});
+      const patch={};
+      for(const [input,key] of [["newPageAvatar","logo_url"],["newPageCover","cover_url"]]){ const file=$(input)?.files?.[0]; if(!file) continue; const ext=(file.name.split('.').pop()||'jpg').toLowerCase(); const path=`${state.user.id}/page-${pg.id}-${key}-${crypto.randomUUID()}.${ext}`; const up=await uploadPostMedia(path,file,{upsert:false,contentType:file.type||'image/jpeg'}); if(up.error){ toast('Page créée. Image non envoyée : '+up.error.message); break; } patch[key]=sb.storage.from('posts').getPublicUrl(path).data.publicUrl; }
+      if(Object.keys(patch).length) await sb.from('pages').update(patch).eq('id',pg.id).eq('owner_id',state.user.id);
+      closeModal(); toast("Page créée"); return genericListPage("pages");
+    }
+    if (action === "page-profile") { state.entityBackRoute = state.route || "pages"; return openPageDetail(id); }
+    if (action === "page-open") { state.entityBackRoute = pageModeActive() && state.activePage?.id===id ? "home" : (state.route || "pages"); return openPageDetail(id); }
+    if (action === "page-post-more") return pagePostMore(id, actionEl.dataset.entityId);
+    if (action === "page-post-copy-link") return pagePostCopyLink(id, actionEl.dataset.entityId);
+    if (action === "page-post-share") return pagePostShare(id, actionEl.dataset.entityId);
+    if (action === "page-post-report") return pagePostReport(id, actionEl.dataset.entityId);
+    if (action === "page-team") { const pg=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data; if(!pg || String(pg.owner_id)!==String(state.user.id)) return toast('Accès refusé : réservé au propriétaire de la Page.'); return entityTeamManager("page",id); }
+    if (action === "page-invite-friends") { const pg=(await sb.from('pages').select('owner_id').eq('id',id).maybeSingle()).data; if(!pg || String(pg.owner_id)!==String(state.user.id)) return toast('Accès refusé : réservé au propriétaire de la Page.'); return pageInviteFriends(id); }
+    if (action === "page-role-request") return sendPageRoleRequest(id, actionEl.dataset.entityId);
+    if (action === "role-request-accept") return respondRoleRequest(id, true);
+    if (action === "role-request-reject") return respondRoleRequest(id, false);
+    if (action === "send-page-invites") return sendPageInvites(id);
+    if (action === "new-page-menu") return newPageMenu(id);
+    if (action === "page-copy-link") return pageCopyLink(id);
+    if (action === "page-cta-settings") return pageCtaSettings(id);
+    if (action === "save-page-cta") return savePageCta(id);
+    if (action === "select-page-cta") { document.querySelectorAll('.np-page-cta-option').forEach(x=>x.classList.remove('active')); actionEl.classList.add('active'); return; }
+    if (action === "page-share") return pageShare(id);
+    if (action === "page-report") return pageReport(id);
+    if (action === "group-more") return groupMore(id);
+    if (action === "group-team") return entityTeamManager("group",id);
+    if (action === "team-remove") return teamRemove(actionEl.dataset.kind,actionEl.dataset.entityId,id);
+    if (action === "group-share") { closeModal(); return groupShare(id); }
+    if (action === "group-copy-link") return groupCopyLink(id);
+    if (action === "group-open") {
+      state.entityBackRoute = state.route || "groups";
+      const x=(await fetchGroupById(id)).data;
+      if(!x)return toast("Groupe introuvable");
+      const [m,c,members,owner,posts]=await Promise.all([
+        sb.from("group_members").select("id,role").eq("group_id",id).eq("user_id",state.user.id).maybeSingle(),
+        sb.from("group_members").select("id",{count:"exact",head:true}).eq("group_id",id),
+        sb.from("group_members").select("user_id,role,profiles(first_name,last_name,username,avatar_url)").eq("group_id",id).limit(40),
+        sb.from("profiles").select("first_name,last_name,username,avatar_url,email,phone,country,city_current,bio").eq("id",x.owner_id).maybeSingle(),
+        sb.from("group_posts").select("*,group_post_reactions(id,user_id,reaction_type),group_post_comments(id,user_id,content,created_at,profiles(first_name,last_name,username,avatar_url)),group_post_shares(id,user_id)").eq("group_id",id).order("created_at",{ascending:false}).limit(30)
+      ]);
+      const ownerMe=x.owner_id===state.user.id, isMember=!!m.data, myGroupRole=m.data?.role||null, isGroupAdmin=ownerMe || myGroupRole==='admin', canPost=isMember||ownerMe;
+      const makeGroupPostRow=(p)=>{ const rr=p.group_post_reactions||[], cc=p.group_post_comments||[], mine=rr.some(r=>r.user_id===state.user.id), author=p.profiles||{}; const sharedBanner=p.shared_from_group_post_id?`<div class="shared-post-banner"><span>↗</span><div><b>${esc(p.user_id===state.user.id?"Vous":nameOf(author))} a partagé cette publication</b><small>Publication originale de ${esc(p.shared_from_user_name||"un membre Tafaß")} · ${esc(p.shared_from_group_name||x.name)}</small></div></div>`:""; const preview=cc.slice(-2).map(c=>`<div class="page-comment-row">${avatarHTML(c.profiles||{},'avatar page-comment-avatar')}<div><b>${esc(nameOf(c.profiles||{}))}</b><span>${esc(c.content||'')}</span></div></div>`).join(''); return `<article class="entity-post premium-entity-post"><div class="entity-post-top"><div>${avatarHTML(author,"avatar tiny-avatar")}<span><b>${esc(p.user_id===state.user.id?"Vous":nameOf(author)||x.name)}</b><small>${timeAgo(p.created_at)} · ${esc(x.name)}</small></span></div>${sharedBanner}${(p.user_id===state.user.id||isGroupAdmin)?`<button class="icon-mini" data-action="delete-group-post" data-id="${esc(p.id)}" data-entity-id="${esc(id)}" aria-label="Supprimer">×</button>`:""}</div>${p.content?`<div class="post-body">${esc(p.content)}</div>`:""}${p.media_url?`${String(p.media_type||'').startsWith('video')?`<video class="post-media" src="${esc(p.media_url)}" controls playsinline></video>`:`<img class="post-media" src="${esc(p.media_url)}" alt="Publication du groupe" loading="lazy">`}`:""}<div class="page-post-stats"><span>${rr.length} réactions</span><span>${cc.length} commentaires</span><span>${(p.group_post_shares||[]).length} partages</span></div><div class="entity-post-actions"><button class="${mine?'active':''}" data-action="group-post-like" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">${mine?'♥':'♡'} J’aime</button><button data-action="group-post-comment" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">💬 Commenter</button><button data-action="share-group-post" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">↗ Partager</button></div>${preview?`<div class="page-comments-preview">${preview}</div>`:''}</article>`; };
+      const allGroupPosts=posts.data||[], postRows=allGroupPosts.map(makeGroupPostRow).join("")||`<div class="entity-empty-state"><span>◎</span><b>Votre communauté commence ici</b><small>Publiez, échangez et retrouvez les nouveaux contenus en temps réel.</small></div>`, videoRows=allGroupPosts.filter(p=>String(p.media_type||"").startsWith("video")).map(makeGroupPostRow).join("")||`<div class="entity-empty-state"><span>▶</span><b>Aucune vidéo</b><small>Les vidéos publiées dans ce groupe apparaîtront ici.</small></div>`;
+      const memberRows=(members.data||[]).map(v=>`<div class="entity-member-row">${avatarHTML(v.profiles||{},"avatar tiny-avatar")}<div class="grow"><b>${esc(v.profiles?nameOf(v.profiles):"Membre")}</b><small>${esc(v.role||"member")}</small></div>${isGroupAdmin&&v.user_id!==state.user.id?`<button class="member-more" data-action="group-member-role" data-id="${esc(v.user_id)}" data-entity-id="${esc(id)}">•••</button>`:""}</div>`).join("")||`<div class="muted">Aucun membre pour le moment.</div>`;
+      await setupTafaV80Realtime('group',id);
+      return openModal(`<div class="modal-box entity-detail-modal premium-entity-detail group-detail fb-style-detail">
+        <button class="entity-back-btn" data-action="close-entity" data-route-back="${esc(state.entityBackRoute || "groups")}" aria-label="Retour aux Groupes"><span>‹</span><small>Groupes</small></button>
+        <div class="detail-cover premium-cover" ${x.cover_url?`style="background-image:url('${esc(x.cover_url)}')"`:''}><div class="cover-gradient"></div><span class="verified-chip">${x.privacy==='private'?'🔒 PRIVÉ':'🌐 PUBLIC'}</span></div>
+        <div class="detail-head-wrap">${entityAvatarHTML(x,"group","detail-logo premium-detail-logo")}</div>
+        <div class="detail-main"><span class="eyebrow">TAFAß • GROUPE COMMUNAUTAIRE</span><h3>${esc(x.name)}</h3>${x.deletion_status==='pending_deletion'?`<div class="tfa-v80-deletion-alert">⚠ Suppression prévue le ${new Date(x.deletion_scheduled_at).toLocaleDateString('fr-FR')} · récupérable pendant 7 jours</div>`:""}<p class="entity-description">${esc(x.description||"Aucune description pour le moment.")}</p>
+        <div class="detail-stats premium-stats"><span><b>${c.count||0}</b><small>Membres</small></span><span><b>${posts.data?.length||0}</b><small>Publications</small></span><span><b>${esc(x.privacy==='private'?'Privé':'Public')}</b><small>Confidentialité</small></span><span><b>${esc(owner.data?nameOf(owner.data):"Propriétaire du groupe")}</b><small>Administrateur</small></span></div>
+        <div class="group-action-bar"><button class="primary" data-action="toggle-group-member" data-id="${esc(id)}">${isMember?"✓ Membre":"＋ Rejoindre"}</button>${isMember?`<button class="secondary-pill" data-action="group-chat" data-id="${esc(id)}">💬 Discussion</button>`:""}<button class="secondary-pill" data-action="group-share" data-id="${esc(id)}">↗ Partager</button>${isGroupAdmin?`<button class="secondary-pill" data-action="edit-group" data-id="${esc(id)}">⚙ Gérer</button>`:""}<button class="member-more" data-action="group-more" data-id="${esc(id)}" aria-label="Plus">•••</button></div>
+        ${canPost?`<div class="entity-composer premium-composer"><div class="composer-label"><span>◎</span><b>Partager avec le groupe</b></div><textarea id="groupPostText" maxlength="5000" placeholder="Quoi de neuf dans la communauté ?"></textarea><div class="composer-tools"><label class="media-pick">＋ Média<input id="groupPostMedia" type="file" accept="image/*,video/*" hidden></label><span id="groupPostMediaName" class="muted">Aucun fichier</span><button class="primary composer-publish" data-action="group-publish" data-id="${esc(id)}">Publier</button></div></div>`:`<div class="join-callout"><b>Rejoignez le groupe</b><span>pour publier, commenter et participer aux discussions.</span><button class="primary" data-action="toggle-group-member" data-id="${esc(id)}">Rejoindre le groupe</button></div>`}
+        <div class="entity-tabs group-tabs"><button class="active" data-tab="posts" data-action="group-tab" data-id="${esc(id)}">Publications</button><button data-tab="videos" data-action="group-tab" data-id="${esc(id)}">Vidéos</button><button data-tab="events" data-action="group-tab" data-id="${esc(id)}">Événements</button><button data-tab="members" data-action="group-tab" data-id="${esc(id)}">Membres</button><button data-tab="about" data-action="group-tab" data-id="${esc(id)}">À propos</button></div>
+        <section class="group-tab-panel entity-feed-section" data-tab="posts"><div class="section-heading"><div><span class="eyebrow">COMMUNAUTÉ</span><h4>Publications</h4></div><span class="live-dot">● EN DIRECT</span></div><div class="entity-posts">${postRows}</div></section>
+        <section class="group-tab-panel entity-feed-section hidden" data-tab="videos"><div class="section-heading"><div><span class="eyebrow">MÉDIAS</span><h4>Vidéos</h4></div></div><div class="entity-posts">${videoRows}</div></section>
+        <section class="group-tab-panel entity-feed-section hidden" data-tab="events"><div class="group-events-empty"><div>📅</div><b>Événements</b><span>Aucun événement n’est programmé pour ce groupe.</span></div></section>
+        <section class="group-tab-panel entity-members-section premium-about hidden" data-tab="members"><div class="section-heading"><div><span class="eyebrow">COMMUNAUTÉ</span><h4>Membres (${c.count||0})</h4></div>${isMember?`<button class="small-action" data-action="invite-group" data-id="${esc(id)}">＋ Inviter</button>`:""}</div>${memberRows}</section>
+        <section class="group-tab-panel entity-about premium-about hidden" data-tab="about"><span class="eyebrow">INFORMATIONS</span><h4>À propos du groupe</h4><p>Créé le ${new Date(x.created_at).toLocaleDateString()} · Communauté ${esc(x.privacy||"publique")}.</p>${owner.data?.city_current?`<p>📍 ${esc(owner.data.city_current)}</p>`:""}</section>
+        <div class="detail-actions premium-detail-actions">${isGroupAdmin?`<button class="ghost-action" data-action="edit-group" data-id="${esc(id)}">Modifier le groupe</button>`:""}<button class="primary big" data-action="toggle-group-member" data-id="${esc(id)}">${isMember?"Quitter le groupe":"Rejoindre le groupe"}</button></div>
+        </div></div>`);
+    }
+    if (action === "group-publish") {
+      const content=$('groupPostText')?.value.trim(); const file=$("groupPostMedia")?.files?.[0]; if(!content && !file)return toast("Ajoutez un texte ou un média.");
+      let media_url=null, media_type=null;
+      if(file){ const ext=(file.name.split('.').pop()||'bin').toLowerCase(); const path=`${state.user.id}/group-post-${id}-${crypto.randomUUID()}.${ext}`; const up=await uploadPostMedia(path,file,{upsert:false,contentType:file.type||undefined}); if(up.error)return toast(up.error.message); media_url=sb.storage.from('posts').getPublicUrl(path).data.publicUrl; media_type=file.type||''; }
+      const r=await sb.from("group_posts").insert({group_id:id,user_id:state.user.id,content:content||"",media_url,media_type}).select().single(); if(r.error)return toast(r.error.message); toast("Publication publiée dans le groupe");
+      return document.querySelector(`[data-action="group-open"][data-id="${id}"]`)?.click() || closeModal();
+    }
+    if (action === "delete-page-post") {
+      const pageId=actionEl.dataset.entityId;
+      const [{data:post},{data:page},{data:member}]=await Promise.all([
+        sb.from('page_posts').select('user_id').eq('id',id).maybeSingle(),
+        sb.from('pages').select('owner_id').eq('id',pageId).maybeSingle(),
+        sb.from('page_members').select('role').eq('page_id',pageId).eq('user_id',state.user.id).maybeSingle()
+      ]);
+      const allowed=post && page && String(page.owner_id)===String(state.user.id);
+      if(!allowed)return toast('Vous n’avez pas les droits pour supprimer cette publication.');
+      const ok=window.confirm('Supprimer définitivement cette publication ?');
+      if(!ok)return;
+      const r=await sb.from("page_posts").delete().eq("id",id);
+      if(r.error)return toast(r.error.message);
+      closeModal(); toast("Publication supprimée"); return openPageDetail(pageId);
+    }
+  });
+
+  // Auth UI — bound explicitly so login/signup/recovery remain clickable even while the app is loading.
+  const bindAuthUI = () => {
+    const loginForm=$("loginForm");
+    if(loginForm && !loginForm.dataset.bound){
+      loginForm.dataset.bound="1";
+      loginForm.addEventListener("submit", async e=>{
+        e.preventDefault();
+        const email=($("loginEmail")?.value||"").trim(), password=$("loginPassword")?.value||"";
+        if(!email){$("authMsg").textContent="Saisissez votre adresse e-mail ou votre numéro.";return;}
+        if(!password){$("authMsg").textContent="Saisissez votre mot de passe.";return;}
+        const btn=loginForm.querySelector('button[type="submit"]'); setLoading(btn,true,"Connexion"); $("authMsg").textContent="Connexion en cours…";
+        try{
+          let authEmail=email;
+          if(!email.includes("@")){
+            const normalized=normalizePhone(email,COUNTRY_META.MG);
+            const lookup=await sb.from("profiles").select("email").eq("phone",normalized).maybeSingle();
+            if(lookup.error||!lookup.data?.email) throw new Error("Compte introuvable. Utilisez l’adresse e-mail associée à votre compte.");
+            authEmail=lookup.data.email;
+          }
+          const {error}=await sb.auth.signInWithPassword({email:authEmail,password});
+          if(error) throw error;
+          $("authMsg").textContent="";
+        }catch(err){$("authMsg").textContent=err?.message||"Connexion impossible.";}
+        finally{setLoading(btn,false,"Connexion");}
+      });
+    }
+    const signupForm=$("signupForm");
+    if(signupForm && !signupForm.dataset.bound){
+      signupForm.dataset.bound="1";
+      signupForm.addEventListener("submit", async e=>{
+        e.preventDefault();
+        const first=$("firstName")?.value.trim()||"",last=$("lastName")?.value.trim()||"",email=$("signupEmail")?.value.trim()||"",password=$("signupPassword")?.value||"",confirm=$("signupPasswordConfirm")?.value||"";
+        if(!validateSignupStep(1)||!validateSignupStep(2)||!validateSignupStep(3)||!validateSignupStep(4))return;
+        if(password!==confirm)return toast("Les deux mots de passe ne correspondent pas.");
+        if(!$("terms")?.checked)return toast("Acceptez les conditions pour continuer.");
+        const selectedCode=$("phoneCode")?.value||"+261";
+        const signupMeta=Object.values(COUNTRY_META).find(x=>x.code===selectedCode)||COUNTRY_META.MG;
+        const phone=normalizePhone($("phone")?.value||"",signupMeta);
+        if(!signupMeta.test.test(phone)) return toast(`Numéro ${signupMeta.name} invalide. Exemple : ${signupMeta.placeholder}.`);
+        const signupCountry=$("country")?.value||signupMeta.name;
+        const btn=signupForm.querySelector('button[type="submit"]');setLoading(btn,true,"Créer mon compte");$("signupMsg").textContent="Création du compte…";
+        try{
+          const meta={first_name:first,last_name:last,phone,phone_code:signupMeta.code,country:signupCountry,birth:$("birth")?.value||null,referral_code:$("referralCode")?.value.trim().toUpperCase()||null};
+          const {data,error}=await sb.auth.signUp({email,password,data:meta});
+          if(error)throw error;
+          if(data.session){
+            const pr=await sb.from("profiles").upsert({id:data.user.id,...meta,email,updated_at:new Date().toISOString()},{onConflict:"id"});
+            if(pr.error)throw pr.error;
+            state.profile={...(state.profile||{}),id:data.user.id,first_name:first,last_name:last,email,phone,phone_code:signupMeta.code,country:signupCountry,birth:$("birth")?.value||null,referral_code:meta.referral_code};
+            state.user=data.user;await enterApp();
+          }else{$("signupMsg").textContent="Compte créé. Vérifiez votre e-mail si la confirmation est activée.";showLogin();$("loginEmail").value=email;}
+        }catch(err){$("signupMsg").textContent=err?.message||"Création du compte impossible.";}
+        finally{setLoading(btn,false,"Créer mon compte");}
+      });
+    }
+    $("forgotPasswordForm")?.addEventListener("submit",sendPasswordReset);
+    $("resetPasswordForm")?.addEventListener("submit",saveResetPassword);
+    $("showSignup")?.addEventListener("click",showSignup);
+    $("signupBackToLogin")?.addEventListener("click",showLogin);
+    $("signupConnect")?.addEventListener("click",showLogin);
+    $("showLogin")?.addEventListener("click",showLogin);
+    $("forgotPassword")?.addEventListener("click",showForgotPassword);
+    $("forgotBackLogin")?.addEventListener("click",showLogin);
+    document.querySelectorAll("[data-password-toggle]").forEach(btn=>{if(btn.dataset.bound)return;btn.dataset.bound="1";btn.addEventListener("click",()=>{const input=$(btn.dataset.passwordToggle);if(!input)return;input.type=input.type==="password"?"text":"password";});});
+    document.querySelectorAll(".signup-next").forEach(btn=>{if(btn.dataset.bound)return;btn.dataset.bound="1";btn.addEventListener("click",()=>{const n=Number(btn.dataset.nextStep);if(validateSignupStep(n-1))setSignupStep(n);});});
+    document.querySelectorAll(".signup-prev").forEach(btn=>{if(btn.dataset.bound)return;btn.dataset.bound="1";btn.addEventListener("click",()=>setSignupStep(Number(btn.dataset.prevStep)));});
+    document.querySelectorAll("[data-oauth]").forEach(btn=>{ if(btn.dataset.oauth==="apple"){ btn.remove(); return; } if(btn.dataset.bound)return; btn.dataset.bound="1"; btn.addEventListener("click",()=>signInWithProvider(btn.dataset.oauth)); });
+  };
+  document.addEventListener('click',e=>{
+    const b=e.target.closest('[data-v74-admin-jump]'); if(!b)return;
+    const key=b.dataset.v74AdminJump||'';
+    const root=document.querySelector('.admin-total-page'); if(!root)return;
+    const groups={'Évolution des comptes':'evolution','Comptes utilisateurs':'users','Monétisation':'monetization','Signalements':'reports'};
+    const group=groups[key]||'evolution';
+    root.querySelectorAll('[data-v75-admin-section]').forEach(sec=>{sec.hidden=sec.dataset.v75AdminSection!==group;});
+    root.querySelectorAll('.tafa-v74-admin-tabs button').forEach(x=>x.classList.toggle('active',x===b));
+    root.querySelector('.tafa-v74-admin-tabs')?.scrollIntoView({behavior:'smooth',block:'nearest'});
+  },{passive:true});
+  bindAuthUI();
+  // Tafaß utilise désormais uniquement Google pour la connexion sociale.
+  document.querySelectorAll("[data-oauth=apple]").forEach(el=>el.remove());
+  document.querySelectorAll(".social-auth-real").forEach(el=>el.classList.add("single-provider"));
+
+  $("themeBtn").addEventListener("click", toggleTheme);
+  syncThemeButton();
+  $("modal").addEventListener("click", e => { if (e.target.id === "modal") { if(liveRole==="broadcaster" && liveSessionId) return toast("Terminez le direct pour quitter."); closeModal(); } });
+  document.addEventListener("change", e => {
+    if (state.route === "settings" && state.settingsDetailAction) {
+      const autoMap = {
+        "profile-lock":"save-profile-lock", "privacy-settings":"save-privacy-assistance", "find-contact-settings":"save-find-contact-settings",
+        "notifications-settings":"save-notification-settings", "family-center":"save-family-settings", "story-privacy":"save-story-settings",
+        "post-privacy":"save-publication-settings", "followers-public":"save-public-content-settings", "media-settings":"save-media-settings",
+        "time-management":"save-time-settings", "reaction-settings":"save-reaction-settings", "profile-identification":"save-profile-identification",
+        "online-status":"save-online-settings", "location-settings":"save-location-settings", "professional-mode":"save-professional-settings",
+        "accessibility-settings":"save-accessibility-settings", "effects-settings":"save-effects-settings"
+      };
+      const saveAction = autoMap[state.settingsDetailAction];
+      if (saveAction && e.target.closest(".settings-detail-page")) {
+        clearTimeout(window.__tafassSettingsSaveTimer);
+        window.__tafassSettingsSaveTimer = setTimeout(() => saveSettingsDetail(saveAction), 60);
+      }
+    }
+    if(e.target.id==="pagePostMedia") $("pagePostMediaName")?.replaceChildren(document.createTextNode(e.target.files?.[0]?.name||"Aucun fichier"));
+    if(e.target.id==="groupPostMedia") $("groupPostMediaName")?.replaceChildren(document.createTextNode(e.target.files?.[0]?.name||"Aucun fichier"));
+  });
+  $("globalSearch").addEventListener("keydown", e => { if (e.key === "Enter") { const q=e.target.value; navigate("search"); setTimeout(()=>{ const input=$("searchInput"); if(input){input.value=q; searchPage(q);} },0); } });
+  window.addEventListener("hashchange", () => { const r=location.hash.slice(1); if(routes.includes(r) && r !== state.route) navigate(r); });
+  const initialRoute = routes.includes(location.hash.slice(1)) ? location.hash.slice(1) : "home";
+  state.route = initialRoute; state.navStack = [initialRoute];
+
+  document.body.classList.toggle("light", state.theme === "light");
+
+  // Splash stable : animation courte, puis sortie dès que l'initialisation est prête.
+  const splashStartedAt = Date.now();
+  const SPLASH_MIN_MS = 1200;
+  const SPLASH_MAX_MS = 3200;
+  let splashFinished = false;
+  let splashResolve;
+  const splashReady = new Promise(resolve => { splashResolve = resolve; });
+  let splashTimer = null;
+  const finishSplash = () => {
+    if (splashFinished) return;
+    const elapsed = Date.now() - splashStartedAt;
+    const wait = Math.max(0, SPLASH_MIN_MS - elapsed);
+    clearTimeout(splashTimer);
+    splashTimer = setTimeout(() => {
+      if (splashFinished) return;
+      splashFinished = true;
+      splashResolve?.(true);
+      document.documentElement.classList.remove("app-boot");
+      const splash = $("splash");
+      if (!splash) return;
+      splash.classList.add("splash-hide");
+      setTimeout(() => splash.remove(), 420);
+    }, wait);
+  };
+  const splashFallback = setTimeout(finishSplash, SPLASH_MAX_MS);
+
+  function ensureLiveFeedRealtime(){
+    if(state.liveFeedChannel || !state.user || !navigator.onLine) return;
+    state.liveFeedChannel=sb.channel(`tafass-live-feed:${state.user.id}`)
+      .on("postgres_changes",{event:"*",schema:"public",table:"live_sessions"},()=>{ if(state.route==="home") renderFeed(); })
+      .subscribe();
+  }
+
+  let authBootComplete = false;
+  let authEventTimer = null;
+  sb.auth.onAuthStateChange((event, session) => {
+    if(authEventTimer) clearTimeout(authEventTimer);
+    state.user = session?.user || null;
+    if (event === "PASSWORD_RECOVERY") {
+      setTimeout(() => showResetPassword(), 0);
+      return;
+    }
+    // TOKEN_REFRESHED must never rebuild the application or send a valid user
+    // back to the authentication page. Only real sign-in/out transitions do.
+    if (event === "TOKEN_REFRESHED") return;
+    if (event === "SIGNED_OUT") {
+      state.user=null;
+      if(state.loggingOut) return;
+      $("app")?.classList.add("hidden");
+      showLogin();
+      return;
+    }
+    if (!["SIGNED_IN","INITIAL_SESSION","USER_UPDATED"].includes(event)) return;
+    authEventTimer=setTimeout(async()=>{
+      if(state.loggingOut || !state.user) return;
+      try{
+        cleanOAuthCallbackUrl();
+        await enterApp();
+      }catch(err){
+        console.error("Tafaß auth/app:",err);
+        state.entering=false;
+        // Keep the valid session. A transient database/render error must not
+        // masquerade as a logout.
+        if(!authBootComplete && !state.user) showLogin();
+        else { $("auth")?.classList.add("hidden"); $("app")?.classList.remove("hidden"); }
+      }finally{
+        authBootComplete=true;
+      }
+    },20);
+  });
+
+  (async () => {
+    try {
+      const { data } = await sb.auth.getSession();
+      state.user = data.session?.user || null;
+      if (state.user) ensureLiveFeedRealtime();
+      if (state.user && location.search.includes("reset=1")) showResetPassword();
+      else if (state.user) { cleanOAuthCallbackUrl(); await enterApp(); } else showLogin();
+    } catch (err) {
+      console.error("Tafaß initialisation:", err);
+      showLogin();
+    } finally {
+      clearTimeout(splashFallback);
+      finishSplash();
+    }
+  })();
+
+  // PWA shell: cache-first for local assets, network-first for Supabase.
+  if("serviceWorker" in navigator && location.protocol !== "file:"){
+    window.addEventListener("load",()=>navigator.serviceWorker.register("sw.js",{scope:"./"}).catch(e=>console.warn("Tafaß service worker:",e)));
+  }
+
+  // Empêche la copie du contenu de l'application, tout en laissant les champs
+  // de formulaire utilisables normalement.
+  const isFormField = el => !!el?.closest?.("input, textarea, select, [contenteditable=\"true\"]");
+  document.addEventListener("contextmenu", e => {
+    if (!isFormField(e.target)) e.preventDefault();
+  });
+  document.addEventListener("copy", e => {
+    if (!isFormField(e.target)) e.preventDefault();
+  });
+  document.addEventListener("cut", e => {
+    if (!isFormField(e.target)) e.preventDefault();
+  });
+  document.addEventListener("dragstart", e => e.preventDefault());
+  window.addEventListener("unhandledrejection", e => {
+    console.warn("Tafaß unhandled rejection:", e.reason);
+    if(!navigator.onLine) networkBanner("Hors connexion — reconnexion automatique dès que le réseau revient.","offline");
+  });
+  window.addEventListener("error", e => {
+    if(e?.message) console.warn("Tafaß runtime error:", e.message);
+  });
+  const markMediaForPerformance = root => {
+    root?.querySelectorAll?.("img:not([loading]), video:not([preload])").forEach(el => {
+      if(el.tagName === "IMG" && !el.closest(".splash-screen,.auth-screen")) el.loading="lazy";
+      if(el.tagName === "VIDEO") el.preload="metadata";
+    });
+  };
+  markMediaForPerformance(document);
+  new MutationObserver(muts => muts.forEach(m => m.addedNodes.forEach(n => { if(n.nodeType===1) markMediaForPerformance(n); }))).observe(document.body,{childList:true,subtree:true});
+
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && liveRole === "broadcaster" && liveSessionId) { e.preventDefault(); toast("Terminez le direct pour quitter."); return; }
+    if (isFormField(e.target)) return;
+    const key = String(e.key || "").toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && ["c", "x", "a", "u", "s"].includes(key)) {
+      e.preventDefault();
+    }
+  });
+
+  /* TAFAß V49 — Recherche intelligente & suggestions instantanées */
+  const tafaV49Search = (() => {
+    let timer = null;
+    let seq = 0;
+    const escSafe = v => esc(String(v ?? ''));
+    const panel = () => {
+      const box = document.querySelector('.premium-searchbox');
+      if (!box) return null;
+      let el = document.getElementById('tafaV49SearchSuggestions');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'tafaV49SearchSuggestions';
+        el.className = 'tafa-v49-search-suggestions';
+        box.appendChild(el);
+      }
+      return el;
+    };
+    const close = () => { const el=document.getElementById('tafaV49SearchSuggestions'); if(el) el.innerHTML=''; };
+    async function show(q='') {
+      const input=document.getElementById('searchInput');
+      if (!input || state.route!=='search') return;
+      const term=String(q||'').trim();
+      const el=panel(); if(!el)return;
+      const my=++seq;
+      if(!term){
+        const r=state.user ? await sb.from('search_history').select('id,search_text,created_at').eq('user_id',state.user.id).order('created_at',{ascending:false}).limit(6) : {data:[]};
+        if(my!==seq || state.route!=='search')return;
+        const rows=(r.data||[]).filter(x=>x.search_text).map(x=>`<button type="button" class="tafa-v49-suggestion" data-v49-query="${escSafe(x.search_text)}"><span class="v49-suggest-icon">◷</span><span>${escSafe(x.search_text)}</span><small>Récent</small></button>`).join('');
+        el.innerHTML=rows?`<div class="tafa-v49-suggest-head"><b>Recherches récentes</b><span>Vos dernières recherches</span></div>${rows}`:'';
+        return;
+      }
+      if(term.length<2){ close(); return; }
+      el.innerHTML='<div class="tafa-v49-suggest-loading"><span></span><span></span><span></span> Recherche…</div>';
+      const safe=term.replace(/[%_]/g,'');
+      const [peopleR,groupsR]=await Promise.all([
+        sb.from('profiles').select('id,first_name,last_name,username,avatar_url').or(`first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,username.ilike.%${safe}%`).limit(5),
+        sb.from('groups').select('id,name,privacy').or(`name.ilike.%${safe}%,description.ilike.%${safe}%`).limit(3)
+      ]);
+      if(my!==seq || state.route!=='search')return;
+      const people=filterBlocked(peopleR.data||[],'id');
+      const phtml=people.map(x=>`<button type="button" class="tafa-v49-suggestion" data-v49-profile="${escSafe(x.id)}">${avatarHTML(x)}<span class="v49-suggest-copy"><b>${displayNameHTML(x)}</b><small>@${escSafe(x.username||'')}</small></span><small>Compte</small></button>`).join('');
+      const grouphtml=(groupsR.data||[]).map(x=>`<button type="button" class="tafa-v49-suggestion" data-v49-group="${escSafe(x.id)}"><span class="v49-suggest-icon">◎</span><span class="v49-suggest-copy"><b>${escSafe(x.name)}</b><small>${escSafe(x.privacy||'public')}</small></span><small>Groupe</small></button>`).join('');
+      const any=phtml||grouphtml;
+      el.innerHTML=any?`<div class="tafa-v49-suggest-head"><b>Suggestions</b><span>Résultats rapides</span></div>${phtml}${grouphtml}<button type="button" class="tafa-v49-search-all" data-v49-search-all="${escSafe(term)}">Voir tous les résultats pour « ${escSafe(term)} »</button>`:`<div class="tafa-v49-suggest-empty">Aucune suggestion · appuyez sur Entrée pour rechercher.</div>`;
+    }
+    function bind(){
+      if(window.__tafaV49SearchBound)return;
+      window.__tafaV49SearchBound=true;
+      document.addEventListener('input',e=>{
+        if(e.target?.id!=='searchInput')return;
+        clearTimeout(timer); timer=setTimeout(()=>show(e.target.value),90);
+      });
+      document.addEventListener('keydown',e=>{
+        if(e.target?.id==='searchInput' && e.key==='Escape')close();
+      });
+      document.addEventListener('click',e=>{
+        const b=e.target.closest?.('[data-v49-query],[data-v49-profile],[data-v49-group],[data-v49-search-all]');
+        if(!b)return;
+        e.preventDefault(); e.stopPropagation();
+        if(b.dataset.v49Query){ const input=document.getElementById('searchInput'); if(input){input.value=b.dataset.v49Query; searchPage(b.dataset.v49Query,searchCategory);} return close(); }
+        if(b.dataset.v49Profile){ close(); return openUserProfile(b.dataset.v49Profile); }
+        if(b.dataset.v49Page){ close(); return openPageDetail(b.dataset.v49Page); }
+        if(b.dataset.v49Group){ close(); return openGroupDetail(b.dataset.v49Group); }
+        if(b.dataset.v49SearchAll){ close(); return searchPage(b.dataset.v49SearchAll,searchCategory); }
+      },true);
+    }
+    return {bind,show};
+  })();
+  tafaV49Search.bind();
+  const oldNavigate = navigate;
+  if(!window.__tafaV49NavigateWrapped && typeof oldNavigate==='function'){
+    window.__tafaV49NavigateWrapped=true;
+    // Search suggestions are refreshed whenever the search route becomes visible.
+    const nav0=oldNavigate;
+    navigate=function(...args){ const r=nav0.apply(this,args); setTimeout(()=>{if(state.route==='search')tafaV49Search.show(document.getElementById('searchInput')?.value||'');},0); return r; };
+  }
+
+  /* TAFAß V51 — Admin Pro Moderation & Analytics */
+  const tafaV51Admin = (() => {
+    let mounted=false, auditLoaded=false;
+    const escSafe=v=>esc(String(v??''));
+    function root(){return document.querySelector('.admin-dashboard-premium');}
+    function section(title){return [...(root()?.querySelectorAll('.admin-total-section')||[])].find(s=>(s.querySelector('h3')?.textContent||'').includes(title));}
+    function openReport(row){
+      if(!row)return;
+      const reason=row.dataset.v51Reason||'Signalement';
+      const status=row.dataset.v51Status||'pending';
+      const created=row.dataset.v51Created ? new Date(row.dataset.v51Created).toLocaleString('fr-FR') : '—';
+      const people=row.querySelector('.grow b')?.textContent||'Compte';
+      openModal(`<div class="modal-box tafa-v51-report-modal"><button class="modal-close" data-action="close-modal">×</button><span class="eyebrow">TAFAß · MODÉRATION V51</span><h3>Détail du signalement</h3><div class="tafa-v51-detail-grid"><div><span>Signalement</span><b>${escSafe(reason)}</b></div><div><span>Statut</span><b>${escSafe(status)}</b></div><div><span>Comptes concernés</span><b>${escSafe(people)}</b></div><div><span>Date</span><b>${escSafe(created)}</b></div></div><div class="tafa-v51-detail-note">Analysez le contexte avant toute action. Les actions administratives existantes restent utilisées pour traiter le dossier.</div>${status==='pending'?`<button class="primary big" data-action="admin-report-status" data-id="${escSafe(row.dataset.v51ReportId)}" data-status="resolved">✓ Marquer comme traité</button>`:''}</div>`);
+    }
+    async function loadAudit(){
+      if(auditLoaded||!state.user||!state.__isAdmin||!supabaseReady())return;
+      auditLoaded=true;
+      const sec=section('Comptes utilisateurs')||section('Sécurité');
+      if(!sec)return;
+      try{
+        const r=await sb.from('tafa_admin_audit_logs').select('*').order('created_at',{ascending:false}).limit(20);
+        if(r.error)throw r.error;
+        const logs=r.data||[];
+        const html=logs.map(x=>{const action=x.action||x.event||x.type||'Action administrative';const target=x.target_user_id||x.target_id||x.user_id||'';const detail=x.details||x.note||x.description||'';return `<div class="tafa-v51-audit-row"><span class="tafa-v51-audit-icon">✓</span><div><b>${escSafe(action)}</b><small>${escSafe(target?`Cible : ${target} · `:'')}${escSafe(detail||'Action enregistrée')} · ${x.created_at?escSafe(new Date(x.created_at).toLocaleString('fr-FR')):'—'}</small></div></div>`}).join('')||'<div class="empty">Aucune action administrative récente.</div>';
+        const wrap=document.createElement('section'); wrap.className='admin-total-section tafa-v51-audit-section';
+        wrap.innerHTML=`<div class="admin-section-head"><div class="admin-section-title"><h3>🧾 Journal administratif</h3><small class="admin-section-note">20 dernières actions enregistrées.</small></div><button class="ghost-action" data-v51-export>Exporter</button></div><div class="tafa-v51-audit-list">${html}</div>`;
+        sec.parentNode?.insertBefore(wrap,sec.nextSibling);
+        wrap.querySelector('[data-v51-export]')?.addEventListener('click',()=>exportAudit(logs));
+      }catch(e){auditLoaded=false;console.warn('Tafaß V51 audit:',e?.message||e);}
+    }
+    function exportAudit(logs){
+      const rows=[['Date','Action','Cible','Détail'],...(logs||[]).map(x=>[x.created_at||'',x.action||x.event||x.type||'',x.target_user_id||x.target_id||x.user_id||'',x.details||x.note||x.description||''])];
+      const csv=rows.map(r=>r.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(',')).join('\n');
+      const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download=`tafass-admin-audit-${new Date().toISOString().slice(0,10)}.csv`;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},500);
+    }
+    function mount(){
+      const r=root(); if(!r)return;
+      if(!mounted){
+        mounted=true;
+        const hero=r.querySelector('.admin-dashboard-hero');
+        if(hero&&!r.querySelector('.tafa-v51-command')){
+          const reports=section('Signalements');
+          const verifs=section('Vérifications');
+          const appeals=section('Réactivations');
+          const count=(sec)=>sec?sec.querySelectorAll('.admin-data-row').length:0;
+          const pending=(sec)=>sec?[...sec.querySelectorAll('.admin-status')].filter(x=>/pending|en attente/i.test(x.textContent||'')).length:0;
+          const bar=document.createElement('section');bar.className='tafa-v51-command';
+          bar.innerHTML=`<div class="tafa-v51-command-head"><div><span class="eyebrow">TAFAß · ADMIN PRO V51</span><b>Moderation & Analytics</b><small>Priorisez les dossiers sensibles et surveillez les volumes clés.</small></div><span class="tafa-v51-live"><i></i> LIVE</span></div><div class="tafa-v51-kpis"><div><b>${pending(reports)}</b><span>Signalements en attente</span></div><div><b>${pending(verifs)}</b><span>Vérifications à examiner</span></div><div><b>${pending(appeals)}</b><span>Réactivations à examiner</span></div><div><b>${count(reports)}</b><span>Signalements affichés</span></div></div><div class="tafa-v51-priority"><span>⚡ Priorité actuelle</span><strong>${pending(reports)+pending(verifs)+pending(appeals)>0?'Action administrative requise':'Aucun dossier urgent détecté'}</strong></div>`;
+          hero.insertAdjacentElement('afterend',bar);
+        }
+      }
+      loadAudit();
+    }
+    function bind(){
+      if(window.__tafaV51AdminBound)return;window.__tafaV51AdminBound=true;
+      document.addEventListener('click',e=>{const b=e.target.closest?.('[data-v51-report-open]');if(b){e.preventDefault();e.stopPropagation();openReport(b.closest('.tafa-v51-report-row'));}},true);
+    }
+    function refresh(){auditLoaded=false;mounted=false;setTimeout(()=>{mount();},0);}
+    return {mount,bind,refresh};
+  })();
+  tafaV51Admin.bind();
+  tafaV51Admin.mount();
+  const tafaV51OriginalAdminTotalPage = adminTotalPage;
+  adminTotalPage = async function(...args){ const result=await tafaV51OriginalAdminTotalPage.apply(this,args); tafaV51Admin.refresh(); return result; };
+
+  /* TAFAß V50 — Admin Pro Command Center */
+  const tafaV50Admin = (() => {
+    let activeFilter='all';
+    let query='';
+    function root(){ return document.querySelector('.admin-dashboard-premium'); }
+    function apply(){
+      const r=root(); if(!r)return;
+      const sections=[...r.querySelectorAll('.admin-total-section')];
+      const q=query.toLowerCase();
+      sections.forEach(sec=>{
+        const text=(sec.textContent||'').toLowerCase();
+        const title=(sec.querySelector('h3')?.textContent||'').toLowerCase();
+        let show=activeFilter==='all';
+        if(activeFilter==='security') show=/sécurité|signalements|vérifications|réactivations/.test(title);
+        if(activeFilter==='finance') show=/monétisation|paiements|publicités sponsorisées|campagnes/.test(title);
+        if(activeFilter==='users') show=/comptes utilisateurs/.test(title);
+        if(activeFilter==='content') show=/santé de l’application|publications|contenu/.test(title);
+        if(q) show=show && text.includes(q);
+        sec.style.display=show?'':'none';
+      });
+      r.querySelectorAll('[data-v50-filter]').forEach(b=>b.classList.toggle('active',b.dataset.v50Filter===activeFilter));
+      const count=r.querySelector('[data-v50-result-count]');
+      if(count) count.textContent=`${sections.filter(x=>x.style.display!=='none').length} sections visibles`;
+    }
+    function mount(){
+      const r=root(); if(!r || r.querySelector('.tafa-v50-command')) return;
+      const hero=r.querySelector('.admin-dashboard-hero');
+      if(!hero)return;
+      const bar=document.createElement('div');
+      bar.className='tafa-v50-command';
+      bar.innerHTML=`<div class="tafa-v50-command-top"><div><span class="eyebrow">TAFAß · ADMIN PRO V50</span><b>Centre de contrôle</b><small>Modération, activité, finances et sécurité depuis un seul espace.</small></div><div class="tafa-v50-live"><i></i> SURVEILLANCE ACTIVE</div></div><div class="tafa-v50-command-tools"><label class="tafa-v50-search">⌕<input data-v50-search placeholder="Rechercher dans le tableau de bord…" autocomplete="off"><button type="button" data-v50-clear>×</button></label><div class="tafa-v50-filters"><button type="button" data-v50-filter="all" class="active">Tout</button><button type="button" data-v50-filter="security">Sécurité</button><button type="button" data-v50-filter="users">Comptes</button><button type="button" data-v50-filter="finance">Finances</button><button type="button" data-v50-filter="content">Contenu</button></div><span data-v50-result-count>—</span></div><div class="tafa-v50-shortcuts"><button data-v50-jump="🚨 Signalements">🚨 Signalements</button><button data-v50-jump="🔵 Vérifications">🔵 Vérifications</button><button data-v50-jump="♻️ Réactivations">♻️ Réactivations</button><button data-v50-jump="💳 Paiements">💳 Paiements</button><button data-v50-jump="👥 Comptes utilisateurs">👥 Utilisateurs</button></div>`;
+      hero.insertAdjacentElement('afterend',bar);
+      bar.addEventListener('click',e=>{
+        const f=e.target.closest('[data-v50-filter]');
+        if(f){activeFilter=f.dataset.v50Filter;apply();return;}
+        const c=e.target.closest('[data-v50-clear]');
+        if(c){const i=bar.querySelector('[data-v50-search]');i.value='';query='';apply();i.focus();return;}
+        const j=e.target.closest('[data-v50-jump]');
+        if(j){activeFilter='all';query='';const target=[...r.querySelectorAll('.admin-total-section')].find(x=>(x.querySelector('h3')?.textContent||'').includes(j.dataset.v50Jump));if(target){target.scrollIntoView({behavior:'smooth',block:'start'});target.classList.add('tafa-v50-focus');setTimeout(()=>target.classList.remove('tafa-v50-focus'),1200)}apply();}
+      });
+      bar.querySelector('[data-v50-search]').addEventListener('input',e=>{query=e.target.value.trim();apply()});
+      apply();
+    }
+    function refresh(){setTimeout(mount,0);}
+    return {mount,refresh};
+  })();
+  const tafaV50OriginalAdminTotalPage = adminTotalPage;
+  adminTotalPage = async function(...args){
+    const result = await tafaV50OriginalAdminTotalPage.apply(this,args);
+    tafaV50Admin.refresh();
+    return result;
+  };
+  tafaV50Admin.mount();
+
+
+  /* TAFAß V52 — Profil • Amis • Recherche • Para & Conf : COMPLETE UX */
+  (() => {
+    const originalProfilePage = profilePage;
+    const originalFriendsPage = friendsPage;
+    const originalSearchPage = searchPage;
+    const originalSettingsPage = settingsPage;
+
+    function v52SafeCount(v){ return Number(v||0).toLocaleString('fr-FR'); }
+    function v52Stat(label,value,icon){ return `<div class="tafa-v52-stat"><span>${icon}</span><div><b>${v52SafeCount(value)}</b><small>${esc(label)}</small></div></div>`; }
+
+    // PROFIL — richer dashboard while keeping the existing real data/functions.
+    profilePage = async function(tab = state.profileTab){
+      await originalProfilePage(tab);
+      if(state.route !== 'profile' || !state.profile) return;
+      try{
+        const p=state.profile;
+        const [postsR,friendsR,followersR,followingR]=await Promise.all([
+          sb.from('posts').select('id',{count:'exact',head:true}).eq('user_id',state.user.id),
+          sb.from('friendships').select('id',{count:'exact',head:true}).eq('user_id',state.user.id),
+          sb.from('follows').select('id',{count:'exact',head:true}).eq('following_id',state.user.id),
+          sb.from('follows').select('id',{count:'exact',head:true}).eq('follower_id',state.user.id)
+        ]);
+        const root=document.querySelector('.profile-page-premium'); if(!root)return;
+        const old=root.querySelector('.tafa-v52-profile-dashboard'); old?.remove();
+        const dash=document.createElement('section'); dash.className='tafa-v52-profile-dashboard';
+        const completeness=[p.first_name,p.last_name,p.bio,p.avatar_url,p.cover_url,p.city_current,p.city_origin].filter(Boolean).length;
+        const pct=Math.round(completeness/7*100);
+        dash.innerHTML=`
+          <div class="tafa-v52-profile-hero-line">
+            <div><span class="eyebrow">TAFAß • MON PROFIL</span><b>Votre espace personnel</b><small>Gérez votre identité, votre réseau et votre contenu depuis un seul endroit.</small></div>
+            <span class="tafa-v52-completion"><i style="width:${pct}%"></i><b>${pct}%</b><small>profil complété</small></span>
+          </div>
+          <div class="tafa-v52-stats-grid">
+            ${v52Stat('Publications',postsR.count,'▤')}${v52Stat('Amis',friendsR.count,'♙')}${v52Stat('Abonnés',followersR.count,'◎')}${v52Stat('Abonnements',followingR.count,'＋')}
+          </div>
+          <div class="tafa-v52-profile-actions">
+            <button class="tafa-v52-action-main" data-action="edit-profile">✎ Modifier mon profil</button>
+            <button data-action="friends-tab" data-tab="friends">♙ Mes amis</button>
+            <button data-action="privacy-settings">🔒 Confidentialité</button>
+            <button data-route="settings">⚙ Para & Conf</button>
+          </div>`;
+        root.querySelector('.profile-main-premium')?.insertAdjacentElement('afterend',dash);
+        // Make the tabs truly complete, including video content.
+        const tabs=root.querySelector('.profile-tabs');
+        if(tabs && !tabs.querySelector('[data-tab="videos"]')){
+          tabs.insertAdjacentHTML('beforeend','<button data-action="profile-tab" data-tab="videos">Vidéos</button>');
+        }
+        // Show a compact identity card with username when available.
+        const nameBlock=root.querySelector('.profile-name-block');
+        if(nameBlock && !nameBlock.querySelector('.tafa-v52-username') && p.username){
+          nameBlock.insertAdjacentHTML('beforeend',`<small class="tafa-v52-username">@${esc(p.username)}</small>`);
+        }
+      }catch(e){ console.warn('Tafaß V52 profil:',e); }
+    };
+
+    // FRIENDS — complete network hub: search, counts, outgoing requests and safer actions.
+    friendRow = function(p,type,commonCount=0){
+      const common = commonCount > 0 ? `<small class="mutual-friends">${commonCount} ami${commonCount>1?'s':''} en commun</small>` : `<small class="mutual-friends">Membre Tafaß</small>`;
+      let action='';
+      if(type==='friend') action=`<div class="friend-actions"><button class="ghost-action" data-action="view-profile" data-id="${esc(p.id)}">Profil</button><button class="ghost-action danger-lite" data-action="remove-friend" data-id="${esc(p.id)}">Retirer</button></div>`;
+      else if(type==='sent') action=`<button class="ghost-action" disabled>Demande envoyée ✓</button>`;
+      else if(type==='incoming') action=`<div class="friend-actions"><button class="small-action" data-action="accept-friend" data-id="${esc(p.id)}">Confirmer</button><button class="ghost-action" data-action="decline-friend" data-id="${esc(p.id)}">Refuser</button></div>`;
+      else action=`<button class="small-action" data-action="add-friend" data-id="${esc(p.id)}">Ajouter</button>`;
+      return `<div class="list-row friend-row tafa-v52-friend-row" data-person-name="${esc(nameOf(p).toLowerCase())}" data-person-user="${esc(p.username||'').toLowerCase()}">${avatarHTML(p)}<div class="grow">${displayNameHTML(p)}${common}${p.username?`<small class="tafa-v52-handle">@${esc(p.username)}</small>`:''}</div>${action}</div>`;
+    };
+    friendsPage = async function(tab = state.friendsTab){
+      await originalFriendsPage(tab);
+      if(state.route !== 'friends')return;
+      try{
+        const root=document.querySelector('.friends-page'); if(!root)return;
+        const header=root.querySelector('.clean-page-header');
+        if(header && !root.querySelector('.tafa-v52-friends-search')){
+          const box=document.createElement('div'); box.className='tafa-v52-friends-search';
+          box.innerHTML='<span>⌕</span><input id="friendsLiveSearch" type="search" placeholder="Rechercher dans votre réseau…" autocomplete="off"><button type="button" data-friends-clear>×</button>';
+          header.insertAdjacentElement('afterend',box);
+          const input=box.querySelector('input');
+          const apply=()=>{const q=(input.value||'').trim().toLowerCase();root.querySelectorAll('.tafa-v52-friend-row').forEach(row=>{row.hidden=!!q && !(`${row.dataset.personName} ${row.dataset.personUser}`).includes(q)});};
+          input.addEventListener('input',apply);
+          box.addEventListener('click',e=>{if(e.target.closest('[data-friends-clear]')){input.value='';apply();input.focus();}});
+        }
+        if(!root.querySelector('.tafa-v52-friends-info')){
+          const section=root.querySelector('.friends-section');
+          if(section){
+            const info=document.createElement('div'); info.className='tafa-v52-friends-info';
+            info.innerHTML='<div><b>Votre réseau</b><small>Ajoutez, confirmez ou gérez vos relations Tafaß.</small></div><span>100% réel · temps réel</span>';
+            section.insertAdjacentElement('afterbegin',info);
+          }
+        }
+      }catch(e){console.warn('Tafaß V52 amis:',e);}
+    };
+
+    // SEARCH — adds a complete explorer header, quick filters and result quality indicators.
+    searchPage = async function(q='',category=searchCategory){
+      await originalSearchPage(q,category);
+      if(state.route!=='search')return;
+      try{
+        const root=document.querySelector('.search-page-premium'); if(!root)return;
+        const input=root.querySelector('#searchInput');
+        if(input && !root.querySelector('.tafa-v52-search-tools')){
+          const tools=document.createElement('div'); tools.className='tafa-v52-search-tools';
+          tools.innerHTML=`<button type="button" data-v52-search-filter="accounts">♙ Comptes</button><button type="button" data-v52-search-filter="groups">◎ Groupes</button><button type="button" data-v52-search-filter="posts">▤ Publications</button><button type="button" data-v52-search-clear>Effacer</button>`;
+          root.querySelector('.clean-search')?.insertAdjacentElement('afterend',tools);
+          tools.addEventListener('click',e=>{
+            const f=e.target.closest('[data-v52-search-filter]');
+            if(f){ searchCategory=f.dataset.v52SearchFilter; return searchPage(input.value,searchCategory); }
+            if(e.target.closest('[data-v52-search-clear]')){input.value='';searchCategory='accounts';return searchPage('',searchCategory);}
+          });
+        }
+        if(input && !input.dataset.v52bound){
+          input.dataset.v52bound='1';
+          input.addEventListener('keydown',e=>{if(e.key==='Escape'){input.value='';searchPage('',searchCategory);}});
+        }
+        const active=root.querySelector('.search-active-result');
+        if(active && !active.querySelector('.tafa-v52-search-note')){
+          const note=document.createElement('div'); note.className='tafa-v52-search-note';
+          note.innerHTML='<span>✓</span><div><b>Recherche protégée</b><small>Les comptes bloqués et contenus masqués sont automatiquement exclus des résultats.</small></div>';
+          active.prepend(note);
+        }
+      }catch(e){console.warn('Tafaß V52 recherche:',e);}
+    };
+
+    // V61 cleanup: the legacy V52 Para & Conf dashboard is removed.
+    // The V60 Command Center below is now the single authoritative settings UI.
+    settingsPage = originalSettingsPage;
+
+  /* ============================================================
+     TAFAß V55 — PROFIL MEDIA • MESSAGERIE • RECHERCHE EXPERT
+     Frontend-only patch. Supabase schema is unchanged.
+     ============================================================ */
+  (function tafoV55CompleteUX(){
+    // PROFILE — allow the owner to remove PDP/PDC completely.
+    async function performRemoveProfileMedia(kind){
+      const key = kind === "cover" ? "cover_url" : "avatar_url";
+      const label = kind === "cover" ? "photo de couverture" : "photo de profil";
+      if(!state.user?.id) return toast("Vous devez être connecté.");
+      try{
+        const current = state.profile?.[key] || "";
+        // Best-effort Storage cleanup. The database value is the source of truth.
+        if(current){
+          try{
+            const url=String(current);
+            const markers=["/storage/v1/object/public/posts/","/storage/v1/object/sign/posts/"];
+            let path=null;
+            for(const marker of markers){
+              if(url.includes(marker)){ path=decodeURIComponent(url.split(marker)[1].split("?")[0]); break; }
+            }
+            if(path) await sb.storage.from("posts").remove([path]);
+          }catch(_){ /* DB cleanup still proceeds. */ }
+        }
+        const r=await sb.from("profiles").update({[key]:null}).eq("id",state.user.id);
+        if(r.error) throw new Error(r.error.message);
+        if(state.profile) state.profile[key]=null;
+        closeModal();
+        await loadProfile();
+        if(state.route==="profile") await profilePage(state.profileTab);
+        toast(`${label.charAt(0).toUpperCase()+label.slice(1)} supprimée.`);
+      }catch(e){ toast(e?.message || `Impossible de supprimer la ${label}.`); }
+    }
+    window.__tafaV55RemoveProfileMedia=performRemoveProfileMedia;
+    function removeProfileMedia(kind){
+      const key=kind==="cover"?"cover_url":"avatar_url";
+      const label=kind==="cover"?"photo de couverture":"photo de profil";
+      if(!state.profile?.[key]) return toast(`Aucune ${label} à supprimer.`);
+      openModal(`<div class="modal-box tafa-v55-danger-modal">
+        <button class="modal-close" data-action="close-modal">×</button>
+        <div class="tafa-v55-danger-icon">⌫</div>
+        <span class="eyebrow">TAFAß · PROFIL</span>
+        <h3>Supprimer la ${label} ?</h3>
+        <p>La ${label} sera retirée de votre profil. Vous pourrez en ajouter une nouvelle à tout moment.</p>
+        <div class="message-action-footer">
+          <button class="ghost-action" data-action="close-modal">Annuler</button>
+          <button class="primary danger-confirm" data-action="confirm-remove-profile-media" data-kind="${esc(kind)}">Supprimer</button>
+        </div>
+      </div>`);
+    };
+
+    const originalEditProfileV55=editProfile;
+    editProfile=function(){
+      originalEditProfileV55();
+      const root=document.querySelector('.profile-redesign-v5');
+      if(!root || root.querySelector('.tafa-v55-media-actions')) return;
+      const p=state.profile||{};
+      const meta=root.querySelector('.profile-visual-meta-v5');
+      if(!meta) return;
+      const actions=document.createElement('div');
+      actions.className='tafa-v55-media-actions';
+      actions.innerHTML=`<button type="button" class="tafa-v55-media-delete" data-action="remove-profile-avatar" ${p.avatar_url?'':'disabled'}>⌫ PDP</button><button type="button" class="tafa-v55-media-delete" data-action="remove-profile-cover" ${p.cover_url?'':'disabled'}>⌫ PDC</button>`;
+      meta.insertAdjacentElement('afterend',actions);
+    };
+
+    // SEARCH — professional explorer: quick syntax, history and explicit filters.
+    const originalSearchPageV55=searchPage;
+    searchPage=async function(q='',category=searchCategory){
+      const raw=String(q||'');
+      let normalized=raw.trim();
+      // Expert shortcuts: @username searches the account, #tag searches content.
+      const expertType=normalized.startsWith('@')?'account':normalized.startsWith('#')?'hashtag':'general';
+      if(expertType==='account') normalized=normalized.slice(1).trim();
+      else if(expertType==='hashtag') normalized=normalized.slice(1).trim();
+      await originalSearchPageV55(normalized,category);
+      if(state.route!=='search')return;
+      try{
+        const root=document.querySelector('.search-page-premium'); if(!root)return;
+        const input=root.querySelector('#searchInput');
+        if(input){
+          input.placeholder='Nom, @username, #hashtag, publication, Page ou groupe…';
+          input.setAttribute('aria-label','Recherche experte Tafaß');
+        }
+        if(!root.querySelector('.tafa-v55-search-pro')){
+          const pro=document.createElement('section'); pro.className='tafa-v55-search-pro';
+          pro.innerHTML=`<div class="tafa-v55-search-pro-head"><div><span class="eyebrow">TAFAß · SEARCH PRO</span><b>Recherche experte</b><small>Utilisez <strong>@nom</strong> pour un compte ou <strong>#mot</strong> pour explorer un sujet.</small></div><span class="tafa-v55-search-status">● PRÊT</span></div>
+            <div class="tafa-v55-search-shortcuts"><button data-v55-search-cat="accounts">♙ Comptes</button><button data-v55-search-cat="posts">▤ Publications</button><button data-v55-search-cat="groups">◎ Groupes</button><button data-v55-search-clear>Effacer</button></div>`;
+          root.querySelector('.clean-search')?.insertAdjacentElement('afterend',pro);
+          pro.addEventListener('click',e=>{
+            const cat=e.target.closest('[data-v55-search-cat]');
+            if(cat){searchCategory=cat.dataset.v55SearchCat;return searchPage(input?.value||'',searchCategory);}
+            if(e.target.closest('[data-v55-search-clear]')){if(input)input.value='';searchCategory='accounts';return searchPage('',searchCategory);}
+          });
+        }
+        // Personal recent searches — compact, removable, no extra schema.
+        if(!root.querySelector('.tafa-v55-recent-searches') && !normalized){
+          const rr=await sb.from('search_history').select('id,search_text,created_at').eq('user_id',state.user.id).order('created_at',{ascending:false}).limit(8);
+          const rows=rr.data||[];
+          if(rows.length){
+            const recent=document.createElement('section'); recent.className='tafa-v55-recent-searches';
+            recent.innerHTML=`<div class="tafa-v55-recent-head"><div><span class="eyebrow">VOS RECHERCHES</span><b>Récents</b></div><button type="button" data-v55-history-clear>Effacer</button></div><div class="tafa-v55-recent-list">${rows.map(r=>`<button type="button" data-v55-recent="${esc(r.search_text||'')}"><span>⌕</span>${esc(r.search_text||'')}</button>`).join('')}</div>`;
+            root.querySelector('.tafa-v55-search-pro')?.insertAdjacentElement('afterend',recent);
+            recent.addEventListener('click',async e=>{
+              const item=e.target.closest('[data-v55-recent]');
+              if(item&&input){input.value=item.dataset.v55Recent||'';return searchPage(input.value,searchCategory);}
+              if(e.target.closest('[data-v55-history-clear]')){
+                const del=await sb.from('search_history').delete().eq('user_id',state.user.id);
+                if(del.error)return toast(del.error.message);
+                recent.remove();toast('Historique de recherche effacé.');
+              }
+            });
+          }
+        }
+        if(input && !input.dataset.v55expert){
+          input.dataset.v55expert='1';
+          input.addEventListener('keydown',e=>{if(e.key==='Enter'){const v=input.value.trim(); if(v.startsWith('@')||v.startsWith('#')){e.preventDefault();searchPage(v,searchCategory);}}});
+        }
+        const status=root.querySelector('.tafa-v55-search-status');
+        if(status) status.textContent=expertType==='account'?'● COMPTE':expertType==='hashtag'?'● SUJET':'● PRÊT';
+      }catch(e){console.warn('Tafaß V55 recherche:',e);}
+    };
+
+    // Time limits — keep the timing cards and information visually side-by-side.
+    const originalTimeLimitSettingsHTMLV55=timeLimitSettingsHTML;
+    timeLimitSettingsHTML=function(){
+      const html=originalTimeLimitSettingsHTMLV55();
+      return html.replace('<div class="time-limit-settings-hero">','<div class="tafa-v55-limit-layout"><div class="time-limit-settings-hero">').replace('</div><div class="time-limit-policy-grid">','</div><div class="time-limit-policy-grid">').replace('</div><div class="settings-section-block time-limit-info-list">','</div><div class="tafa-v55-limit-info">').replace('</div><button class="ghost-action big" data-action="time-limit-intro">','</div></div><button class="ghost-action big" data-action="time-limit-intro">');
+    };
+  })();
+
+
+    // Tafaß V56 — Time Limits Premium UI
+    // Visual redesign only: keeps the existing policy/guard logic and values.
+    const originalTimeLimitSettingsHTMLV56=timeLimitSettingsHTML;
+    timeLimitSettingsHTML=function(){
+      const p=timeLimitPolicy();
+      const first=p.warningMinutes, second=p.secondWarningMinutes, final=p.logoutMinutes;
+      return `<section class="tafa-v56-limits-card">
+        <div class="tafa-v56-limits-hero">
+          <div class="tafa-v56-hero-icon"><span>◷</span></div>
+          <div class="tafa-v56-hero-copy">
+            <div class="tafa-v56-kicker"><span class="tafa-v56-live-dot"></span> TAFAß · TEMPS & ÉQUILIBRE</div>
+            <h3>Limites d’utilisation</h3>
+            <p>Un contrôle intelligent du temps, conçu pour rester clair, discret et élégant pendant votre utilisation de Tafaß.</p>
+          </div>
+          <div class="tafa-v56-hero-status"><span>PROTECTION</span><b>ACTIVE</b></div>
+        </div>
+
+        <div class="tafa-v56-timeline">
+          <div class="tafa-v56-line" aria-hidden="true"></div>
+          <article class="tafa-v56-time-card">
+            <div class="tafa-v56-time-icon">⌛</div>
+            <div class="tafa-v56-time-main"><span>PREMIER RAPPEL</span><strong>${first}<small> min</small></strong><p>Une première pause vous est proposée.</p></div>
+            <i>01</i>
+          </article>
+          <article class="tafa-v56-time-card">
+            <div class="tafa-v56-time-icon orange">◴</div>
+            <div class="tafa-v56-time-main"><span>SECOND RAPPEL</span><strong>${second}<small> min</small></strong><p>Un rappel renforcé avant la limite finale.</p></div>
+            <i>02</i>
+          </article>
+          <article class="tafa-v56-time-card final">
+            <div class="tafa-v56-time-icon gold">⏱</div>
+            <div class="tafa-v56-time-main"><span>LIMITE FINALE</span><strong>${final}<small> min</small></strong><p>La session est automatiquement arrêtée à ce palier.</p></div>
+            <i>03</i>
+          </article>
+        </div>
+
+        <div class="tafa-v56-info-head"><div><span class="tafa-v56-kicker">CENTRE DE CONTRÔLE</span><h4>Comment fonctionne votre temps</h4></div><span class="tafa-v56-secure-pill">● SÉCURISÉ</span></div>
+        <div class="tafa-v56-info-grid">
+          <article><div class="tafa-v56-info-icon">🔔</div><div><b>À chaque rappel</b><small>Une interface Tafaß s’affiche sans modifier votre compte ni vos données.</small></div></article>
+          <article><div class="tafa-v56-info-icon">↻</div><div><b>Si vous continuez</b><small>Le compteur reprend automatiquement jusqu’au prochain palier.</small></div></article>
+          <article><div class="tafa-v56-info-icon gold">⛔</div><div><b>À la limite finale</b><small>La session est fermée automatiquement et une nouvelle connexion sera nécessaire.</small></div></article>
+          <article><div class="tafa-v56-info-icon admin">★</div><div><b>Administrateur officiel</b><small>Le compte administrateur officiel n’est pas soumis à cette limite.</small></div></article>
+        </div>
+        <div class="tafa-v56-bottom"><div><b>${p.minor?'Protection -18 ans':'Gestion 18+ active'}</b><small>${p.minor?'Rappel à 15 min, nouvel avertissement à 30 min, déconnexion automatique à 45 min.':'Rappel à 30 min, nouvel avertissement à 60 min (1 h), déconnexion automatique à 90 min (1 h 30).'} Vous pouvez quitter Tafaß à tout moment.</small></div><button class="ghost-action big" data-action="time-limit-intro">Voir l’explication complète <span>→</span></button></div>
+      </section>`;
+    };
+
+  })();
+
+
+  /* ============================================================
+     TAFAß V59 — BADGE OFFICIEL : ZERO-WAIT / STABLE PREMIUM
+     - The verification screen is rendered immediately.
+     - Network/database reads never block the first paint.
+     - A slow or unavailable table becomes a recoverable status card.
+     - Existing schema/RPC logic is preserved.
+  ============================================================ */
+  const tafaV59Race = (promise, ms, message) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))
+  ]);
+
+  const tafaV59Rows = async (table, userId, ms=2500) => {
+    try {
+      if(!sb || !userId) return {data:[],error:null};
+      const q = sb.from(table).select('*').eq('user_id', userId).order('created_at',{ascending:false}).limit(20);
+      const r = await tafaV59Race(q, ms, 'TIMEOUT');
+      if(r?.error) return {data:null,error:r.error};
+      return {data:r?.data||[],error:null};
+    } catch(e) { return {data:null,error:e}; }
+  };
+
+  const tafaV59LoadRows = async (userId) => {
+    // Query both known schemas in parallel. This avoids the old sequential
+    // 7s + 7s wait that made the page look permanently frozen.
+    const [primary,fallback] = await Promise.all([
+      tafaV59Rows('tafa_verification_requests',userId),
+      tafaV59Rows('badge_requests',userId)
+    ]);
+    const primaryRows=Array.isArray(primary.data)?primary.data:[];
+    const fallbackRows=Array.isArray(fallback.data)?fallback.data:[];
+    const rows=[...primaryRows,...fallbackRows];
+    const unique=new Map();
+    rows.forEach(r=>{ if(r?.id!=null) unique.set(String(r.id),r); });
+    return {rows:[...unique.values()].sort((a,b)=>String(b?.created_at||'').localeCompare(String(a?.created_at||''))),primary,fallback};
+  };
+
+  loadVerificationRequests = async function(){
+    if(!state.user) return [];
+    const result=await tafaV59LoadRows(state.user.id);
+    state.verificationRequests=result.rows.map(r=>({
+      ...r,
+      identity_name:r.identity_name||r.reason||'',
+      category:r.category||r.badge_type||'Autre',
+      proof_path:r.proof_path||r.document_url||'',
+      payment_method:r.payment_method||r.provider||'',
+      payment_reference:r.payment_reference||r.provider_payment_id||''
+    }));
+    return state.verificationRequests;
+  };
+
+  submitVerificationRequest = async function(data,proofFile){
+    if(!state.user) throw new Error('Connexion requise.');
+    const uid=state.user.id;
+    const loaded=await tafaV59LoadRows(uid);
+    const pending=loaded.rows.find(x=>String(x.status).toLowerCase()==='pending');
+    if(pending) throw new Error('Une demande de badge est déjà en attente de validation.');
+    let proofPath='';
+    if(proofFile){
+      if(proofFile.size>15*1024*1024) throw new Error('Le justificatif dépasse 15 Mo.');
+      const ext=(proofFile.name.split('.').pop()||'bin').toLowerCase().replace(/[^a-z0-9]/g,'')||'bin';
+      proofPath=`${uid}/${crypto.randomUUID()}.${ext}`;
+      const up=await tafaV59Race(sb.storage.from('badge-proofs').upload(proofPath,proofFile,{upsert:false,contentType:proofFile.type||undefined}),15000,'Le stockage du justificatif ne répond pas.');
+      if(up.error) throw new Error('Justificatif : '+up.error.message);
+    }
+    try{
+      const rpc=await tafaV59Race(sb.rpc('tafa_create_badge_request',{
+        p_category:String(data.category||'Autre'),
+        p_identity_name:String(data.identity||''),
+        p_proof_path:proofPath||'',
+        p_payment_method:String(data.method||''),
+        p_payment_reference:String(data.ref||'')
+      }),12000,'Le serveur de vérification ne répond pas.');
+      if(!rpc.error) return rpc.data;
+      console.warn('Tafaß V59 badge RPC:',rpc.error.message||rpc.error);
+    }catch(rpcError){ console.warn('Tafaß V59 badge RPC indisponible:',rpcError?.message||rpcError); }
+    const direct=await tafaV59Race(sb.from('badge_requests').insert({
+      user_id:uid,badge_type:String(data.category||'Autre'),page_id:null,
+      reason:String(data.identity||''),document_url:proofPath||'',status:'pending'
+    }).select('*').single(),12000,'La demande de badge ne répond pas. Vérifiez la policy INSERT de badge_requests.');
+    if(direct.error){
+      if(proofPath) try{await sb.storage.from('badge-proofs').remove([proofPath]);}catch(_){ }
+      throw direct.error;
+    }
+    try{await sb.from('payments').insert({user_id:uid,provider:String(data.method||''),provider_payment_id:String(data.ref||''),purpose:'badge',status:'pending'});}catch(_){ }
+    return direct.data;
+  };
+
+  verificationPage = async function(){
+    const token=++state.verificationRenderToken;
+    // IMPORTANT: paint the complete page before any Supabase request.
+    simplePage('Vérification',`<section class="verification-page-v59">
+      <section class="v59-hero"><div class="v59-brand"><span class="v59-mark">✓</span><div><span class="v59-kicker">TAFAß · BADGE OFFICIEL</span><h3>Badge bleu vérifié</h3><p>Un parcours sécurisé pour demander, suivre et obtenir votre badge officiel. Votre dossier est contrôlé par l’administration Tafaß.</p></div></div></section>
+      <section id="v59VerificationBody"><section class="v59-status v59-status-ready"><div class="v59-status-main"><small>VOTRE ESPACE</small><b>Vérification prête</b><p>Votre espace est disponible. Nous vérifions votre dossier en arrière-plan.</p></div><span class="v59-status-dot"></span></section></section>
+    </section>`);
+
+    // Never make navigation wait for the database. The page is already usable.
+    try{
+      const rows=await loadVerificationRequests();
+      if(token!==state.verificationRenderToken || state.route!=='verification') return;
+      const latest=(rows||[])[0];
+      const status=String(latest?.status||'none').toLowerCase();
+      const statusLabel=latest?verificationStatusLabel(status):'Aucune demande';
+      const cls=latest?verificationStatusClass(status):'empty';
+      const action=status==='pending'?'Voir le suivi':status==='approved'?'Voir mon statut':'Commencer la vérification';
+      const body=$('v59VerificationBody'); if(!body)return;
+      body.innerHTML=`${latest?`<section class="v59-status"><div class="v59-status-main"><small>STATUT DU DOSSIER</small><b>${esc(statusLabel)}</b><p>${esc(status==='approved'?'Votre badge bleu est actif.':status==='rejected'?'Votre demande a été refusée. Vous pouvez constituer un nouveau dossier.':'Votre dossier est enregistré et attend le contrôle de l’administration.')}</p></div><span class="v59-status-dot ${cls}"></span></section>`:`<section class="v59-status v59-status-ready"><div class="v59-status-main"><small>VOTRE DOSSIER</small><b>Aucune demande en cours</b><p>Vous pouvez commencer une nouvelle demande de badge officiel lorsque votre dossier est prêt.</p></div><span class="v59-status-dot empty"></span></section>`}
+        <section class="v59-grid"><article class="v59-mini"><span>🪪</span><b>Identité</b><small>Informations publiques cohérentes.</small></article><article class="v59-mini"><span>🔐</span><b>Justificatif</b><small>Document envoyé dans l’espace sécurisé.</small></article><article class="v59-mini"><span>✓</span><b>Validation</b><small>Contrôle final par l’administration.</small></article></section>
+        ${verificationTimeline(status)}
+        <section class="v59-action"><div class="v59-action-copy"><b>${status==='pending'?'Dossier en cours de traitement':status==='approved'?'Badge bleu actif':'Demander la vérification'}</b><small>${status==='pending'?'Une seule demande en attente est autorisée.':status==='approved'?'Votre compte est actuellement vérifié.':'Frais de vérification : 25 000 Ar / mois. La décision finale appartient à l’administration.'}</small></div><button class="primary big" data-action="verification-start">${esc(action)}</button></section>`;
+    }catch(error){
+      if(token!==state.verificationRenderToken || state.route!=='verification')return;
+      const body=$('v59VerificationBody'); if(!body)return;
+      body.innerHTML=`<section class="v59-status v59-status-error"><div class="v59-status-main"><small>CONNEXION AU DOSSIER</small><b>Votre espace reste disponible</b><p>Le serveur met plus de temps que prévu. Vous pouvez réessayer sans quitter cette page.</p></div><button class="ghost-action" data-action="verification">Réessayer</button></section>`;
+    }
+  };
+
+
+  /* ============================================================
+     TAFAß V69 — BADGE BLEU PAYÉ PAR PAPI
+     Le paiement est créé côté serveur et la validation admin est
+     impossible tant que Papi n'a pas confirmé SUCCESS.
+     ============================================================ */
+  (() => {
+    const BADGE_PRICE_MGA = 25000;
+
+    loadVerificationRequests = async function(){
+      if(!state.user) return [];
+      const result=await tafaV59LoadRows(state.user.id);
+      state.verificationRequests=result.rows.map(r=>({...r,
+        identity_name:r.identity_name||r.reason||'',
+        category:r.category||r.badge_type||'Autre',
+        proof_path:r.proof_path||r.document_url||'',
+        payment_method:r.payment_method||r.provider||'',
+        payment_reference:r.payment_reference||r.provider_payment_id||'',
+        papi_payment:(r.payment_reference||r.papi_payment_link||r.payment_status)?{reference:r.payment_reference,payment_link:r.papi_payment_link,payment_status:r.payment_status,paid_at:r.paid_at,provider:r.payment_method,merchant_reference:r.papi_merchant_payment_reference,amount_mga:r.fee_mga||25000}:null
+      }));
+      return state.verificationRequests;
+    };
+
+    async function openPapiBadgePaymentForRequest(requestId,provider='MVOLA'){
+      const r=await tafaV59Race(sb.functions.invoke('tafa-papi-badge-payment',{body:{request_id:requestId,provider:String(provider||'MVOLA').toUpperCase()}}),20000,'Le service Papi ne répond pas.');
+      if(r.error) throw new Error(r.error.message||'Impossible de créer le paiement Papi.');
+      if(!r.data?.ok||!r.data?.paymentLink) throw new Error(r.data?.error||'Papi n’a pas retourné le lien de paiement.');
+      const w=window.open(r.data.paymentLink,'_blank','noopener,noreferrer');
+      if(!w) window.location.href=r.data.paymentLink;
+      return r.data;
+    }
+
+    async function submitVerificationRequestV69(data,proofFile){
+      if(!state.user) throw new Error('Connexion requise.');
+      const uid=state.user.id;
+      const loaded=await tafaV59LoadRows(uid);
+      const pending=loaded.rows.find(x=>String(x.status).toLowerCase()==='pending');
+      if(pending) throw new Error('Une demande de badge est déjà en attente de validation.');
+      let proofPath='';
+      let createdRequestId='';
+      if(proofFile){
+        if(proofFile.size>15*1024*1024) throw new Error('Le justificatif dépasse 15 Mo.');
+        const ext=(proofFile.name.split('.').pop()||'bin').toLowerCase().replace(/[^a-z0-9]/g,'')||'bin';
+        proofPath=`${uid}/${crypto.randomUUID()}.${ext}`;
+        const up=await tafaV59Race(sb.storage.from('badge-proofs').upload(proofPath,proofFile,{upsert:false,contentType:proofFile.type||undefined}),15000,'Le stockage du justificatif ne répond pas.');
+        if(up.error) throw new Error('Justificatif : '+up.error.message);
+      }
+      const reference=`TAFASS-BADGE-${uid.slice(0,8)}-${crypto.randomUUID().replaceAll('-','').slice(0,16)}`;
+      try{
+        const rpc=await tafaV59Race(sb.rpc('tafa_create_badge_request',{
+          p_category:String(data.category||'Autre'),
+          p_identity_name:String(data.identity||''),
+          p_proof_path:proofPath||'',
+          p_payment_method:'Papi',
+          p_payment_reference:reference
+        }),12000,'Le serveur de vérification ne répond pas.');
+        if(rpc.error) throw rpc.error;
+        const requestId=rpc.data?.id||rpc.data?.request_id||rpc.data;
+        createdRequestId=String(requestId||'');
+        if(!requestId) throw new Error('La demande de vérification n’a pas retourné son identifiant.');
+        const payment=await tafaV59Race(sb.functions.invoke('tafa-papi-badge-payment',{body:{request_id:requestId,provider:String(data.method||'')}}),20000,'Le service Papi ne répond pas.');
+        if(payment.error) throw new Error(payment.error.message||'Impossible de créer le paiement Papi.');
+        if(!payment.data?.ok || !payment.data?.paymentLink) throw new Error(payment.data?.error||'Papi n’a pas retourné le lien de paiement.');
+        return {request_id:requestId, ...payment.data};
+      }catch(e){
+        if(proofPath && !createdRequestId) try{await sb.storage.from('badge-proofs').remove([proofPath]);}catch(_){ }
+        throw e;
+      }
+    }
+
+    openVerificationRequest = async function(){
+      if(isAdminProfile(state.profile)) return toast("L’administrateur possède automatiquement son badge rouge.");
+      await loadVerificationRequests();
+      const latest=(state.verificationRequests||[])[0];
+      if(latest?.status==='pending'){
+        if(latest?.papi_payment?.payment_status==='PENDING' && latest.papi_payment.payment_link){
+          return openModal(`<div class="modal-box v69-payment-modal"><div class="v69-payment-head"><span class="v69-payment-mark">💳</span><div><span class="eyebrow">TAFAß · PAPI</span><h3>Paiement du badge bleu</h3><p>Votre dossier existe déjà. Finalisez le paiement de <b>${BADGE_PRICE_MGA.toLocaleString('fr-FR')} Ar</b>.</p></div><button class="modal-close" data-action="close-modal">×</button></div><div class="v69-payment-card"><div><b>Paiement sécurisé</b><small>MVola · Orange Money · Airtel Money</small></div><button class="primary big wide" id="v69PayAgain">Ouvrir le paiement Papi</button><small class="v69-payment-note">Après le paiement, revenez dans Tafaß. La confirmation sera reçue automatiquement.</small></div></div>`),setTimeout(()=>{const b=$('v69PayAgain');if(b)b.onclick=()=>{const u=latest.papi_payment.payment_link;const w=window.open(u,'_blank','noopener,noreferrer');if(!w)window.location.href=u;}},0);
+        }
+        return openModal(`<div class="modal-box v69-payment-modal"><div class="v69-payment-head"><span class="v69-payment-mark">💳</span><div><span class="eyebrow">TAFAß · PAPI</span><h3>Relancer le paiement</h3><p>Le dossier est enregistré. Choisissez un moyen de paiement pour régler <b>${BADGE_PRICE_MGA.toLocaleString('fr-FR')} Ar</b>.</p></div><button class="modal-close" data-action="close-modal">×</button></div><div class="verification-payments-v41 v69-retry-providers">${[['MVOLA','MVola'],['ORANGE_MONEY','Orange Money'],['AIRTEL_MONEY','Airtel Money']].map(([v,l])=>`<button type="button" data-v69-provider="${v}"><b>${l}</b><small>Paiement via Papi</small></button>`).join('')}</div><button class="primary big wide" id="v69RetryPay">Continuer vers Papi</button></div>`),setTimeout(()=>{let selected='MVOLA';document.querySelectorAll('[data-v69-provider]').forEach(b=>b.onclick=()=>{selected=b.dataset.v69Provider;document.querySelectorAll('[data-v69-provider]').forEach(x=>x.classList.toggle('active',x===b));});const first=document.querySelector('[data-v69-provider]');if(first)first.classList.add('active');const b=$('v69RetryPay');if(b)b.onclick=async()=>{b.disabled=true;b.textContent='Création du paiement…';try{await openPapiBadgePaymentForRequest(latest.id,selected);closeModal();toast('Paiement Papi ouvert.');}catch(e){b.disabled=false;b.textContent='Continuer vers Papi';toast(e?.message||'Impossible de créer le paiement.');}}},0);
+      }
+      if(latest?.status==='approved') return verificationPage(false);
+      let step=1;
+      const data={identity:displayName(state.profile||state.user)||'',category:'',method:'MVOLA'};
+      let proofFile=null;
+      const titles=['Profil','Éligibilité','Justificatif','Paiement Papi'];
+      const categories=['Personnalité publique','Créateur de contenu','Artiste','Entreprise','Marque','Média','Journaliste','Sportif','Institution','Organisation','Professionnel','Autre'];
+      const providers=[['MVOLA','MVola'],['ORANGE_MONEY','Orange Money'],['AIRTEL_MONEY','Airtel Money']];
+      const show=()=>{
+        let body='';
+        if(step===1) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">01</div><span class="verification-kicker">PROFIL OFFICIEL</span><h3>Confirmez votre identité publique</h3><p>Le nom fourni sera comparé aux éléments de votre dossier.</p><label>Nom légal<input id="vIdentity" class="premium-input" maxlength="160" value="${esc(data.identity)}" placeholder="Nom complet"></label><div class="verification-readonly"><span>Nom d’utilisateur</span><b>@${esc(state.profile?.username||'—')}</b></div></div>`;
+        if(step===2) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">02</div><span class="verification-kicker">ÉLIGIBILITÉ</span><h3>Choisissez votre catégorie</h3><p>Sélectionnez le motif qui décrit le mieux votre présence publique.</p><label>Catégorie<select id="vCategory" class="premium-input">${categories.map(x=>`<option ${x===data.category?'selected':''}>${x}</option>`).join('')}</select></label><div class="verification-note-v41">✓ Le dossier sera contrôlé par l’administration avant activation du badge.</div></div>`;
+        if(step===3) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">03</div><span class="verification-kicker">JUSTIFICATIF</span><h3>Ajoutez une preuve vérifiable</h3><p>Importez une pièce pertinente au dossier. Elle reste réservée au processus de vérification.</p><label class="verification-upload-v41"><span>Choisir un document</span><input id="vProof" type="file" accept="image/*,.pdf"><small>${proofFile?`✓ ${esc(proofFile.name)}`:'Image ou PDF · 15 Mo maximum'}</small></label><div class="verification-note-v41">🔒 Stockage privé dédié aux vérifications.</div></div>`;
+        if(step===4) body=`<div class="verification-step-v41 v69-papi-step"><div class="verification-step-icon-v41">04</div><span class="verification-kicker">PAIEMENT SÉCURISÉ PAPI</span><h3>Payez votre badge bleu</h3><p>Frais de vérification : <strong class="verification-price-v41">${BADGE_PRICE_MGA.toLocaleString('fr-FR')} Ar / mois</strong>.</p><div class="verification-payments-v41">${providers.map(([v,l])=>`<button type="button" class="${data.method===v?'active':''}" data-vmethod="${v}"><b>${l}</b><small>Paiement via Papi</small></button>`).join('')}</div><div class="v69-papi-secure"><b>🔐 Paiement réel via Papi</b><small>Le montant est envoyé au compte marchand/règlement configuré dans votre application Papi. Tafaß ne valide le dossier qu’après confirmation SUCCESS.</small></div><div class="verification-final-check">✓ Après validation, vous serez redirigé vers le paiement Papi. Aucun numéro Mobile Money ni API key n’est demandé à Tafaß.</div></div>`;
+        openModal(`<div class="modal-box verification-wizard-v41"><div class="verification-v41-head"><div><span class="eyebrow">TAFAß · BADGE OFFICIEL</span><h3>Demande de badge bleu</h3><small>Étape ${step} sur 4 · ${titles[step-1]}</small></div><button class="modal-close" data-action="close-modal">×</button></div><div class="verification-progress-v41">${titles.map((t,i)=>`<span class="${i+1<=step?'active':''}"><b>${i+1}</b><small>${t}</small></span>`).join('')}</div>${body}<div class="verification-wizard-actions-v41"><button type="button" class="ghost-action" id="verificationBack">${step===1?'Annuler':'Retour'}</button><button type="button" class="primary big" id="verificationNext">${step===4?'Payer avec Papi':'Continuer'}</button></div></div>`);
+        document.querySelectorAll('[data-vmethod]').forEach(b=>b.addEventListener('click',()=>{data.method=b.dataset.vmethod;document.querySelectorAll('[data-vmethod]').forEach(x=>x.classList.toggle('active',x===b));}));
+        const back=$('verificationBack'),next=$('verificationNext');
+        if(back)back.onclick=()=>{if(step===1)closeModal();else{step--;show();}};
+        if(next)next.onclick=async()=>{
+          if(next.disabled)return;
+          if(step===1){data.identity=$('vIdentity')?.value.trim()||'';if(data.identity.length<2)return toast('Indiquez votre nom légal.');}
+          if(step===2){data.category=$('vCategory')?.value||'';if(!data.category)return toast('Choisissez une catégorie.');}
+          if(step===3){const f=$('vProof')?.files?.[0];if(f)proofFile=f;if(!proofFile)return toast('Ajoutez votre justificatif.');if(proofFile.size>15*1024*1024)return toast('Le justificatif dépasse 15 Mo.');}
+          if(step===4){next.disabled=true;next.textContent='Création du paiement…';try{const result=await submitVerificationRequestV69(data,proofFile);closeModal();toast('Dossier créé ✓ · Ouverture de Papi…');const w=window.open(result.paymentLink,'_blank','noopener,noreferrer');if(!w)window.location.href=result.paymentLink;setTimeout(()=>{navigate('verification');},800);}catch(e){next.disabled=false;next.textContent='Payer avec Papi';toast(e?.message||'Impossible de créer le paiement Papi.');}return;}
+          step++;show();
+        };
+      };
+      show();
+    };
+
+    verificationPage = async function(){
+      const token=++state.verificationRenderToken;
+      simplePage('Vérification',`<section class="verification-page-premium verification-page-v69"><section class="verification-hero verification-hero-v2"><div><span class="eyebrow">TAFAß · VÉRIFICATION OFFICIELLE</span><h3>Badge bleu vérifié</h3><p>Demande, paiement sécurisé Papi et validation administrative dans un seul parcours.</p></div><span class="verification-mark">✓</span></section><section id="v69VerificationBody"><section class="v59-status v59-status-ready"><div class="v59-status-main"><small>VOTRE ESPACE</small><b>Vérification prête</b><p>Chargement de votre dossier…</p></div><span class="v59-status-dot"></span></section></section></section>`);
+      try{
+        const rows=await loadVerificationRequests();
+        if(token!==state.verificationRenderToken||state.route!=='verification')return;
+        const latest=rows?.[0], status=String(latest?.status||'none').toLowerCase(), pay=latest?.papi_payment;
+        const paid=String(pay?.payment_status||latest?.payment_status||'').toUpperCase()==='SUCCESS';
+        const action=status==='pending'&&pay?.payment_status==='PENDING'&&pay?.payment_link?'Payer maintenant':status==='pending'&&pay?.payment_status!=='SUCCESS'?'Relancer le paiement':status==='pending'?'Voir le suivi':status==='approved'?'Voir mon statut':'Commencer la vérification';
+        const body=$('v69VerificationBody');if(!body)return;
+        const paymentText=paid?'Paiement confirmé par Papi ✓':pay?.payment_status==='FAILED'?'Paiement échoué · vous pouvez recommencer.':pay?.payment_status==='PENDING'?'Paiement en attente de confirmation Papi.':'Paiement non effectué';
+        body.innerHTML=`${latest?`<section class="v59-status"><div class="v59-status-main"><small>STATUT DU DOSSIER</small><b>${esc(verificationStatusLabel(status))}</b><p>${esc(status==='approved'?'Votre badge bleu est actif.':status==='rejected'?'Votre demande a été refusée. Vous pouvez constituer un nouveau dossier.':paymentText+' · Après paiement, l’administration examine votre dossier.')}</p><small>${latest.created_at?new Date(latest.created_at).toLocaleString('fr-FR'):'—'} · ${BADGE_PRICE_MGA.toLocaleString('fr-FR')} Ar</small></div><span class="v59-status-dot ${status==='approved'?'approved':status==='rejected'?'rejected':'pending'}"></span></section>`:`<section class="v59-status v59-status-ready"><div class="v59-status-main"><small>VOTRE DOSSIER</small><b>Aucune demande en cours</b><p>Commencez votre demande de badge officiel.</p></div><span class="v59-status-dot empty"></span></section>`}${latest?verificationTimeline(status):verificationTimeline('pending')}<section class="v59-action"><div class="v59-action-copy"><b>${esc(action)}</b><small>${esc(status==='approved'?'Votre compte est actuellement vérifié.':paid?'Paiement reçu · décision administrative à venir.':status==='pending'?'Finalisez le paiement Papi pour permettre le traitement du dossier.':`Frais de vérification : ${BADGE_PRICE_MGA.toLocaleString('fr-FR')} Ar / mois.`)}</small></div><button class="primary big" data-action="verification-start">${esc(action)}</button></section>`;
+        const btn=body.querySelector('[data-action="verification-start"]');
+        if(btn&&status==='pending'){if(pay?.payment_link&&pay?.payment_status==='PENDING')btn.onclick=()=>{const w=window.open(pay.payment_link,'_blank','noopener,noreferrer');if(!w)window.location.href=pay.payment_link;};else if(pay?.payment_status!=='SUCCESS')btn.onclick=()=>openVerificationRequest();}
+      }catch(e){const body=$('v69VerificationBody');if(body)body.innerHTML=`<section class="v59-status v59-status-error"><div class="v59-status-main"><small>CONNEXION AU DOSSIER</small><b>Votre espace reste disponible</b><p>Le serveur met plus de temps que prévu. Vous pouvez réessayer.</p></div><button class="ghost-action" data-action="verification">Réessayer</button></section>`;}
+    };
+
+    // L’admin ne peut approuver un badge que si Papi a confirmé le paiement.
+    adminSetVerificationStatus = async function(id,status){
+      if(!['approved','rejected'].includes(String(status)))return toast('Statut de vérification invalide.');
+      if(!(await premiumConfirm(status==='approved'?'Approuver la vérification':'Refuser la vérification',status==='approved'?'Le badge bleu sera activé uniquement si le paiement Papi est confirmé.':'La demande sera refusée.',status==='approved'?'Approuver':'Refuser',status!=='approved')))return;
+      const r=await sb.rpc('tafa_admin_set_verification_status',{p_id:id,p_status:status});
+      if(r.error)return toast(r.error.message);
+      toast(status==='approved'?'Badge bleu activé.':'Demande refusée.');
+      return adminTotalPage();
+    };
+  })();
+
+  /* ============================================================
+     TAFAß V61 — SINGLE PARA & CONF / NO LEGACY DUPLICATE
+     ============================================================ */
+  (() => {
+    // Keep only the V60 Command Center layer for Paramètres & confidentialité.
+    // Remove any legacy V52 dashboard if an older cached DOM survives a hot reload.
+    function removeLegacySettings(){
+      document.querySelectorAll('.tafa-v52-settings-dashboard').forEach(el=>el.remove());
+    }
+    removeLegacySettings();
+    window.addEventListener('pageshow', removeLegacySettings);
+  })();
+
+  /* ============================================================
+     TAFAß V60 — PARA & CONF / PREMIUM SETTINGS COMMAND CENTER
+     Complete option + sub-option information layer. No SQL change.
+     ============================================================ */
+  (() => {
+    const V60_META = {
+      'account-settings':['Votre compte','Identité, coordonnées, mot de passe, sécurité, vérification et préférences liées au compte.','Ces informations définissent votre identité Tafaß et les accès sensibles.'],
+      'privacy-settings':['Assistance confidentialité','Vue d’ensemble des principaux contrôles de visibilité, de contact et de protection.','Utilisez cette rubrique comme point de départ pour régler rapidement votre confidentialité.'],
+      'family-center':['Centre familial','Contrôles de sécurité, de contact et de visibilité destinés aux relations et à l’accompagnement familial.','Les réglages activés ici peuvent limiter certaines interactions.'],
+      'audience-defaults':['Audience par défaut','Choisissez qui peut voir vos nouvelles publications lorsque vous ne sélectionnez pas une audience différente.','Ce choix concerne l’audience par défaut, pas les contenus déjà publiés.'],
+      'reaction-settings':['Préférences des réactions','Gérez l’affichage des compteurs et la personnalisation de vos réactions.','Les préférences modifient l’expérience d’affichage sans supprimer les réactions existantes.'],
+      'notifications-settings':['Notifications','Contrôlez les alertes générales, messages, amis, réactions et commentaires.','Les notifications peuvent rester disponibles dans l’application même si certaines alertes sont désactivées.'],
+      'accessibility-settings':['Accessibilité','Adaptez la taille du texte, les animations et le contraste pour une utilisation plus confortable.','Les options d’accessibilité sont personnelles et n’affectent pas les autres comptes.'],
+      'language-settings':['Langue et région','Choisissez la langue et les conventions utilisées par l’interface.','Le changement peut nécessiter un rafraîchissement de certaines zones de l’application.'],
+      'media-settings':['Contenu multimédia','Contrôlez la lecture automatique, l’économie de données et la qualité des médias.','Une qualité plus élevée peut utiliser davantage de données mobiles et de stockage.'],
+      'time-management':['Gestion du temps','Suivez votre temps d’utilisation et les rappels de pause de Tafaß.','Les rappels sont conçus pour vous informer ; ils ne remplacent pas les réglages système de votre appareil.'],
+      'effects-settings':['Effets pour le visage et les mains','Activez ou désactivez les effets compatibles avec les capacités de votre appareil.','La disponibilité dépend du navigateur, de l’APK et des capacités matérielles.'],
+      'profile-lock':['Verrouillage du profil','Limitez l’accès aux éléments privés de votre profil et activez les protections disponibles.','Le verrouillage n’empêche pas les informations rendues publiques ailleurs de rester visibles.'],
+      'find-contact-settings':['Comment les autres peuvent vous trouver et vous contacter','Gérez les demandes d’amis, messages et possibilités de recherche par téléphone ou e-mail.','Désactiver un moyen de recherche réduit la découverte de votre compte par ce moyen.'],
+      'post-privacy':['Publications','Définissez l’audience par défaut et certains contrôles de partage de vos publications.','Les réglages futurs ne changent pas automatiquement l’audience de chaque ancienne publication.'],
+      'story-privacy':['Stories','Choisissez qui voit vos stories et contrôlez leur partage, archivage et mise en sourdine.','Les stories expirées suivent les règles d’archivage configurées.'],
+      'followers-public':['Followers et contenu public','Gérez qui peut vous suivre, la visibilité des abonnements et les règles de contenu public.','Les options publiques déterminent la découverte et les interactions autorisées sur le contenu public.'],
+      'profile-identification':['Profil et identification','Contrôlez les identifications, leur validation et l’indexation publique de votre profil.','La validation des tags vous permet de contrôler ce qui apparaît sur votre profil.'],
+      'blocking':['Blocage','Consultez les comptes bloqués et retirez un blocage lorsque vous le souhaitez.','Le blocage limite les interactions selon les protections Tafaß.'],
+      'online-status':['Statut En ligne','Contrôlez l’affichage de votre présence et de votre dernière activité dans la messagerie.','Masquer votre présence peut aussi limiter ce que vous voyez de la présence des autres selon les règles du service.'],
+      'payment-settings':['Paiements','Consultez les demandes et l’historique des opérations de paiement disponibles dans Tafaß.','Une demande de paiement reste en attente jusqu’à validation réelle.'],
+      'activity-settings':['Historique d’activité','Consultez vos recherches et les actions enregistrées sur votre compte.','Vous pouvez supprimer les recherches enregistrées sans supprimer les contenus d’origine.'],
+      'location-settings':['Localisation','Contrôlez la localisation du profil et, lorsque vous le demandez, la position GPS exacte.','La position précise n’est enregistrée que lorsqu’une autorisation et une action explicite le permettent.'],
+      'apps-web':['Applications et sites Web','Consultez les connexions externes ou sessions enregistrées et révoquez celles dont vous n’avez plus besoin.','Révoquer une connexion empêche son utilisation selon l’état enregistré par Tafaß.'],
+      'information-management':['Comment gérer vos informations','Accédez rapidement à l’activité, aux informations du profil et aux contrôles de confidentialité.','Cette rubrique sert de centre de gestion et ne supprime aucune donnée automatiquement.'],
+      'terms':['Conditions de service','Règles d’utilisation de Tafaß, responsabilités, restrictions et fonctionnement général du service.','Lisez cette section avant d’utiliser une fonction sensible ou professionnelle.'],
+      'privacy-policy':['Politique de confidentialité','Explique quelles informations peuvent être traitées, pourquoi et quels contrôles sont disponibles.','Les réglages de confidentialité restent le moyen principal de contrôler votre visibilité.'],
+      'cookies':['Politique d’utilisation des cookies','Explique les mécanismes locaux utilisés pour la session, les préférences et certaines fonctions.','Les réglages du navigateur peuvent limiter certaines données locales nécessaires au fonctionnement.'],
+      'community-standards':['Standards de la communauté','Règles concernant le respect, la sécurité, la vie privée, la fraude et les signalements.','Un signalement déclenche un examen ; il ne garantit pas automatiquement une mesure précise.'],
+      'about-tafass':['À propos','Présentation de Tafaß, de ses espaces sociaux, de la création, des Pages et des fonctions complémentaires.','La version disponible sur votre appareil détermine les fonctionnalités réellement accessibles.']
+    };
+
+    const V60_CATS = {
+      'Votre compte':['account-settings'],
+      'Confidentialité':['privacy-settings','family-center','audience-defaults','profile-lock','find-contact-settings','post-privacy','story-privacy','followers-public','profile-identification','blocking','online-status'],
+      'Préférences':['reaction-settings','notifications-settings','accessibility-settings','language-settings','media-settings','time-management','effects-settings'],
+      'Professionnel':['apps-web','payment-settings'],
+      'Activité & données':['activity-settings','location-settings','information-management'],
+      'Informations légales':['terms','privacy-policy','cookies','community-standards','about-tafass']
+    };
+
+    function v60CatFor(action){
+      for(const [cat,ids] of Object.entries(V60_CATS)) if(ids.includes(action)) return cat;
+      return 'Paramètre';
+    }
+    function v60ActionForRow(row){ return row?.dataset?.action || ''; }
+    function v60EnhanceHub(){
+      const root=document.querySelector('.fb-settings-page');
+      if(!root || root.dataset.v60Enhanced==='1') return;
+      root.dataset.v60Enhanced='1';
+      const rows=[...root.querySelectorAll('.fb-settings-row')];
+      rows.forEach(row=>{
+        const action=v60ActionForRow(row), meta=V60_META[action];
+        if(!meta) return;
+        row.classList.add('tafa-v60-setting-row');
+        row.dataset.v60Search=(meta[0]+' '+meta[1]+' '+v60CatFor(action)).toLowerCase();
+        const copy=row.querySelector('.fb-settings-copy');
+        if(copy && !copy.querySelector('.tafa-v60-row-meta')) copy.insertAdjacentHTML('beforeend',`<span class="tafa-v60-row-meta"><i>${esc(v60CatFor(action))}</i><em>Configurer</em></span>`);
+      });
+      const dash=root.querySelector('.tafa-v52-settings-dashboard');
+      if(dash && !dash.querySelector('.tafa-v60-dashboard-strip')){
+        const total=rows.length;
+        dash.insertAdjacentHTML('beforeend',`<div class="tafa-v60-dashboard-strip"><span><b>${total}</b><small>contrôles disponibles</small></span><span><b>6</b><small>espaces de réglage</small></span><span><b>24/7</b><small>centre accessible</small></span></div>`);
+      }
+      const search=root.querySelector('#settingsSearch');
+      if(search && !search.dataset.v60Bound){
+        search.dataset.v60Bound='1';
+        search.placeholder='Rechercher un réglage, une protection ou une fonction…';
+        search.addEventListener('input',()=>{
+          const q=search.value.trim().toLowerCase();
+          rows.forEach(row=>{row.hidden=!!q && !(row.dataset.v60Search||row.textContent.toLowerCase()).includes(q)});
+          root.querySelectorAll('.fb-settings-group').forEach(group=>{
+            const visible=[...group.querySelectorAll('.fb-settings-row')].some(r=>!r.hidden);
+            group.hidden=!!q && !visible;
+          });
+        });
+      }
+    }
+
+    const v60OriginalSettingsPage=settingsPage;
+    settingsPage=async function(...args){
+      await v60OriginalSettingsPage.apply(this,args);
+      if(state.route!=='settings') return;
+      requestAnimationFrame(v60EnhanceHub);
+    };
+
+    function v60EnhanceDetail(action){
+      const root=document.querySelector('.settings-detail-page');
+      if(!root || root.dataset.v60Detail===action) return;
+      root.dataset.v60Detail=action;
+      const meta=V60_META[action] || ['Paramètre Tafaß','Réglage de votre compte et de votre expérience Tafaß.','Les modifications sont enregistrées pour votre compte.'];
+      const blocks=[...root.querySelectorAll('.settings-section-block')];
+      blocks.forEach((block,i)=>{
+        if(block.querySelector('.tafa-v60-subinfo')) return;
+        const title=block.querySelector('h3')?.textContent?.trim() || `Sous-options ${i+1}`;
+        const count=block.querySelectorAll('.settings-control-row,.settings-link-row,.settings-info-card').length;
+        block.classList.add('tafa-v60-settings-block');
+        block.insertAdjacentHTML('afterbegin',`<div class="tafa-v60-subinfo"><span class="tafa-v60-subinfo-icon">✦</span><div><b>${esc(title)}</b><small>${count ? `${count} réglage${count>1?'s':''} disponible${count>1?'s':''} dans cette rubrique.` : 'Informations et contrôles disponibles dans cette rubrique.'}</small></div></div>`);
+      });
+      const intro=root.querySelector('.settings-detail-intro');
+      if(intro && !intro.querySelector('.tafa-v60-detail-hero')){
+        intro.insertAdjacentHTML('afterbegin',`<div class="tafa-v60-detail-hero"><div><span class="tafa-v60-kicker">TAFAß • ${esc(v60CatFor(action).toUpperCase())}</span><h2>${esc(meta[0])}</h2><p>${esc(meta[1])}</p></div><span class="tafa-v60-hero-badge">✓ SÉCURISÉ</span></div>`);
+        intro.insertAdjacentHTML('beforeend',`<div class="tafa-v60-detail-note"><span>ⓘ</span><div><b>À savoir</b><small>${esc(meta[2])}</small></div></div>`);
+      }
+      const save=root.querySelector('.settings-save');
+      if(save){save.classList.add('tafa-v60-save');save.textContent='Enregistrer les modifications';}
+    }
+
+    const v60OriginalOpenAdvancedSetting=openAdvancedSetting;
+    openAdvancedSetting=async function(action,...args){
+      await v60OriginalOpenAdvancedSetting.call(this,action,...args);
+      if(state.route!=='settings') return;
+      requestAnimationFrame(()=>v60EnhanceDetail(action));
+    };
+
+    // Keep the existing detailed pages authoritative; this layer only enriches their presentation.
+    v60EnhanceHub();
+  })();
+
+
+  /* ============================================================
+     TAFAß V64 — STABLE NAVIGATION & PAGE SCROLL SINGLE VERSION
+     Final presentation layer: one authoritative dashboard UI.
+     Legacy V50/V51 command bars are hidden; existing server actions
+     and realtime data remain authoritative.
+  ============================================================ */
+  (() => {
+    const applyAdminV63 = () => {
+      const root = document.querySelector('.admin-dashboard-premium');
+      if (!root) return;
+      root.classList.add('tafa-v63-dashboard');
+      root.querySelectorAll('.tafa-v50-command,.tafa-v51-command,.tafa-v51-command-bar').forEach(el => el.remove());
+      root.querySelectorAll('.admin-dashboard-columns').forEach(el => el.classList.add('tafa-v63-flatten'));
+      [...root.querySelectorAll('.admin-total-section')].forEach(section => {
+        const title = (section.querySelector('h3')?.textContent || '').trim();
+        section.classList.add('tafa-v63-panel');
+        if (/Comptes utilisateurs/i.test(title) || /Journal administratif/i.test(title)) section.classList.add('tafa-v63-wide');
+        if (/Évolution des comptes|Où se trouvent les comptes|Santé de l’application|Sécurité/i.test(title)) section.classList.add('tafa-v63-overview-panel');
+      });
+      root.dataset.v63Ready = '1';
+    };
+    const originalV63AdminTotalPage = adminTotalPage;
+    adminTotalPage = async function(...args) {
+      const result = await originalV63AdminTotalPage.apply(this, args);
+      requestAnimationFrame(applyAdminV63);
+      setTimeout(applyAdminV63, 80);
+      return result;
+    };
+    applyAdminV63();
+  })();
+
+
+  /* ============================================================
+     TAFAß V66 — PAGE NAVIGATION / MENU SINGLE VERSION
+     Page mode has no Friends. The Menu occupies that navigation slot.
+     The account navigation remains unchanged outside Page mode.
+  ============================================================ */
+  (() => {
+    const pageBottomNav = () => `
+      ${navButton("home","home","Actualités",true)}
+      ${navButton("messages","messages","Messages",true)}
+      ${navButton("notifications","notifications","Alertes",true)}
+      ${navButton("reels","reels","Reels",true)}
+      
+      ${navButton("menu","settings","Menu",true)}
+    `;
+    const pageSideNav = () => `
+      <button data-route="profile" class="profile-shortcut"><span id="sideAvatar" class="avatar">▣</span><span><b id="sideName">Page</b><small>Centre de la Page</small></span></button>
+      ${navButton("home","home","Actualités")}
+      ${navButton("messages","messages","Messages")}
+      ${navButton("notifications","notifications","Alertes")}
+      ${navButton("reels","reels","Reels")}
+      
+      ${navButton("menu","settings","Menu")}
+    `;
+    const accountBottomNav = () => `
+      ${navButton("home","home","Actualités",true)}
+      ${navButton("friends","friends","Amis",true)}
+      ${navButton("messages","messages","Messages",true)}
+      
+      ${navButton("groups","groups","Groupes",true)}
+      ${navButton("reels","reels","Reels",true)}
+    `;
+    const accountSideNav = () => `
+      <button data-route="profile" class="profile-shortcut"><span id="sideAvatar" class="avatar">T</span><span><b id="sideName">Mon profil</b><small>Voir mon profil</small></span></button>
+      ${navButton("home","home","Actualités")}
+      ${navButton("friends","friends","Amis")}
+      ${navButton("messages","messages","Messages")}
+      ${navButton("notifications","notifications","Notifications")}
+      
+      ${navButton("groups","groups","Groupes")}
+      ${navButton("reels","reels","Reels")}
+      ${navButton("tafab","tafab","Tafaß")}
+      ${navButton("saved","saved","Enregistrements")}
+      ${navButton("menu","settings","Menu")}
+    `;
+
+    const syncPageNavigationV66 = () => {
+      const left=document.querySelector('.left-sidebar');
+      const bottom=document.querySelector('.bottom-nav');
+      if(pageModeActive()){
+        if(left && left.dataset.navMode !== 'page-v66'){
+          left.innerHTML=pageSideNav();
+          left.dataset.navMode='page-v66';
+        }
+        if(bottom && bottom.dataset.navMode !== 'page-v66'){
+          bottom.innerHTML=pageBottomNav();
+          bottom.dataset.navMode='page-v66';
+        }
+        document.querySelectorAll('.tafa-premium-nav-item[data-route="friends"], .bottom-nav button[data-route="friends"], .left-sidebar button[data-route="friends"]').forEach(el=>el.remove());
+      } else {
+        if(left && left.dataset.navMode === 'page-v66'){
+          left.innerHTML=accountSideNav();
+          left.dataset.navMode='account-v66';
+        }
+        if(bottom && bottom.dataset.navMode === 'page-v66'){
+          bottom.innerHTML=accountBottomNav();
+          bottom.dataset.navMode='account-v66';
+        }
+      }
+    };
+
+    const previousSyncIdentityUI_V66 = syncIdentityUI;
+    syncIdentityUI = function(...args){
+      previousSyncIdentityUI_V66.apply(this,args);
+      syncPageNavigationV66();
+      const p=pageModeActive()?state.activePage:state.profile;
+      const nameEl=$("sideName"), avatarEl=$("sideAvatar");
+      if(nameEl) nameEl.textContent=pageModeActive()?(p?.name||'Page'):nameOf(p);
+      if(avatarEl && p){
+        const html=pageModeActive()
+          ? entityAvatarHTML(p,'page','avatar').replace('<div ','<span id="sideAvatar" ').replace('</div>','</span>')
+          : avatarHTML(p,'avatar').replace('<span ','<span id="sideAvatar" ');
+        if(avatarEl.outerHTML !== html) avatarEl.outerHTML=html;
+      }
+    };
+
+    // Keep Page navigation authoritative after render/realtime UI refreshes.
+    const observer=new MutationObserver(()=>{
+      if(!state.user) return;
+      if(pageModeActive()) syncPageNavigationV66();
+    });
+    observer.observe(document.body,{childList:true,subtree:true});
+    requestAnimationFrame(syncPageNavigationV66);
+  })();
+
+
+  /* ============================================================
+     TAFAß V69 — BADGE BLEU PAYÉ PAR PAPI
+     Paiement réel côté serveur. Aucun numéro Mobile Money ni clé API
+     n'est stocké dans le frontend. La demande reste pending jusqu'à
+     validation admin, mais l'approbation est impossible avant SUCCESS Papi.
+  ============================================================ */
+  const TAFASS_BADGE_FEE_MGA = 25000;
+  const TAFASS_BADGE_PROVIDERS = Object.freeze([
+    ['MVOLA','🟢 MVola'],
+    ['ORANGE_MONEY','🟠 Orange Money'],
+    ['AIRTEL_MONEY','🔴 Airtel Money']
+  ]);
+
+  function verificationPaymentLabel(row){
+    const ps=String(row?.payment_status||'').toUpperCase();
+    if(ps==='SUCCESS') return 'Paiement Papi confirmé';
+    if(ps==='FAILED') return 'Paiement Papi échoué';
+    if(ps==='PENDING') return 'Paiement Papi en attente';
+    return 'Paiement à effectuer';
+  }
+
+  async function waitForBadgePayment(requestId, timeoutMs=180000){
+    const started=Date.now();
+    while(Date.now()-started<timeoutMs){
+      const r=await sb.from('tafa_verification_requests')
+        .select('id,status,payment_status,payment_method,payment_reference,papi_payment_link,paid_at')
+        .eq('id',requestId).eq('user_id',state.user.id).maybeSingle();
+      if(!r.error && r.data){
+        const ps=String(r.data.payment_status||'').toUpperCase();
+        if(ps==='SUCCESS') return r.data;
+        if(ps==='FAILED') return r.data;
+      }
+      await new Promise(resolve=>setTimeout(resolve,3000));
+    }
+    return null;
+  }
+
+  async function startPapiBadgePayment(requestId, provider){
+    const {data,error}=await sb.functions.invoke('tafa-papi-badge-payment',{body:{request_id:requestId,provider}});
+    if(error){
+      const msg=String(error.message||'');
+      throw new Error(/failed to fetch|fetch failed|network/i.test(msg)
+        ? 'Impossible de joindre Papi. Vérifiez que l’Edge Function « tafa-papi-badge-payment » est déployée.'
+        : msg);
+    }
+    if(!data?.ok || !data?.paymentLink) throw new Error(data?.error||'Papi n’a pas retourné le lien de paiement.');
+    return data;
+  }
+
+  openVerificationRequest = async function(){
+    if(isAdminProfile(state.profile)) return toast("L’administrateur possède automatiquement son badge rouge.");
+    await loadVerificationRequests();
+    const latest=(state.verificationRequests||[])[0];
+    if(latest?.status==='approved') return verificationPage(false);
+    if(latest?.status==='pending' && String(latest?.payment_status||'').toUpperCase()==='SUCCESS') return verificationPage(false);
+    let step=1;
+    const data={identity:displayName(state.profile||state.user)||'',category:'',method:'MVOLA',ref:''};
+    let proofFile=null;
+    let requestId=latest?.status==='pending'?latest.id:null;
+    const titles=['Profil','Éligibilité','Justificatif','Paiement Papi'];
+    const categories=['Personnalité publique','Créateur de contenu','Artiste','Entreprise','Marque','Média','Journaliste','Sportif','Institution','Organisation','Professionnel','Autre'];
+    const show=()=>{
+      let body='';
+      if(step===1) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">01</div><span class="verification-kicker">PROFIL OFFICIEL</span><h3>Confirmez votre identité publique</h3><p>Le nom fourni sera comparé aux éléments de votre dossier. Utilisez une identité réelle et cohérente.</p><label>Nom légal<input id="vIdentity" class="premium-input" maxlength="160" value="${esc(data.identity)}" placeholder="Nom complet"></label><div class="verification-readonly"><span>Nom d’utilisateur</span><b>@${esc(state.profile?.username||'—')}</b></div></div>`;
+      if(step===2) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">02</div><span class="verification-kicker">ÉLIGIBILITÉ</span><h3>Choisissez votre catégorie</h3><p>Sélectionnez le motif qui décrit le mieux votre présence publique. L’administration examinera votre dossier après confirmation du paiement.</p><label>Catégorie<select id="vCategory" class="premium-input">${categories.map(x=>`<option ${x===data.category?'selected':''}>${x}</option>`).join('')}</select></label><div class="verification-note-v41">✓ Le paiement est traité sur la page sécurisée Papi.</div></div>`;
+      if(step===3) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">03</div><span class="verification-kicker">JUSTIFICATIF</span><h3>Ajoutez une preuve vérifiable</h3><p>Importez une pièce pertinente au dossier. Elle reste réservée au processus de vérification.</p><label class="verification-upload-v41"><span>Choisir un document</span><input id="vProof" type="file" accept="image/*,.pdf"><small>${proofFile?`✓ ${esc(proofFile.name)}`:'Image ou PDF · 15 Mo maximum'}</small></label><div class="verification-note-v41">🔒 Le fichier est envoyé dans l’espace privé dédié aux vérifications.</div></div>`;
+      if(step===4) body=`<div class="verification-step-v41"><div class="verification-step-icon-v41">04</div><span class="verification-kicker">TAFAß × PAPI</span><h3>Paiement sécurisé</h3><p>Frais de vérification : <strong class="verification-price-v41">${TAFASS_BADGE_FEE_MGA.toLocaleString('fr-FR')} Ar / mois</strong>. Vous serez redirigé vers Papi pour effectuer le paiement réel.</p><div class="verification-payments-v41 verification-papi-payments-v69">${TAFASS_BADGE_PROVIDERS.map(([value,label])=>`<button type="button" class="${data.method===value?'active':''}" data-vmethod="${value}"><b>${label}</b><small>Paiement sécurisé Papi</small></button>`).join('')}</div><div class="verification-final-check">🔐 Aucun numéro Mobile Money n’est saisi dans Tafaß. Papi traite directement le paiement et Tafaß attend sa confirmation serveur.</div></div>`;
+      openModal(`<div class="modal-box verification-wizard-v41 verification-wizard-v69"><div class="verification-v41-head"><div><span class="eyebrow">TAFAß · BADGE OFFICIEL</span><h3>Demande de badge bleu</h3><small>Étape ${step} sur 4 · ${titles[step-1]}</small></div><button class="modal-close" data-action="close-modal">×</button></div><div class="verification-progress-v41">${titles.map((t,i)=>`<span class="${i+1<=step?'active':''}"><b>${i+1}</b><small>${t}</small></span>`).join('')}</div>${body}<div class="verification-wizard-actions-v41"><button type="button" class="ghost-action" id="verificationBack">${step===1?'Annuler':'Retour'}</button><button type="button" class="primary big" id="verificationNext">${step===4?'Payer 25 000 Ar avec Papi':'Continuer'}</button></div></div>`);
+      document.querySelectorAll('[data-vmethod]').forEach(b=>b.addEventListener('click',()=>{data.method=b.dataset.vmethod;document.querySelectorAll('[data-vmethod]').forEach(x=>x.classList.toggle('active',x===b));}));
+      const back=$('verificationBack'), next=$('verificationNext');
+      if(back) back.onclick=()=>{if(step===1)closeModal();else{step--;show();}};
+      if(next) next.onclick=async()=>{
+        if(next.disabled)return;
+        if(step===1){data.identity=$('vIdentity')?.value.trim()||'';if(data.identity.length<2)return toast('Indiquez votre nom légal.');}
+        if(step===2){data.category=$('vCategory')?.value||'';if(!data.category)return toast('Choisissez une catégorie.');}
+        if(step===3){const f=$('vProof')?.files?.[0];if(f)proofFile=f;if(!proofFile)return toast('Ajoutez votre justificatif.');if(proofFile.size>15*1024*1024)return toast('Le justificatif dépasse 15 Mo.');}
+        if(step===4){
+          next.disabled=true; next.textContent='Création du paiement…';
+          try{
+            if(!requestId){
+              const created=await submitVerificationRequest({identity:data.identity,category:data.category,method:data.method,ref:''},proofFile);
+              requestId=created?.id||created?.request_id||created;
+            }
+            if(!requestId) throw new Error('Demande de vérification introuvable.');
+            const payment=await startPapiBadgePayment(requestId,data.method);
+            closeModal();
+            openModal(`<div class="modal-box verification-payment-wait-v69"><div class="payment-success-mark">✓</div><span class="eyebrow">TAFAß × PAPI</span><h3>Paiement sécurisé prêt</h3><p class="muted">Vous allez être redirigé vers Papi pour payer <b>${TAFASS_BADGE_FEE_MGA.toLocaleString('fr-FR')} Ar</b> avec <b>${esc(data.method)}</b>.</p><div class="verification-papi-ref-v69"><span>Référence</span><b>${esc(payment.reference||'—')}</b></div><button class="primary big" id="openBadgePapiPayment">Ouvrir Papi et payer</button><button class="ghost-action wide" data-action="close-modal">Annuler</button></div>`);
+            const openBtn=$('openBadgePapiPayment');
+            if(openBtn) openBtn.onclick=()=>{openBtn.disabled=true;openBtn.textContent='Ouverture de Papi…';window.location.assign(payment.paymentLink);};
+          }catch(e){next.disabled=false;next.textContent='Payer 25 000 Ar avec Papi';toast(e?.message||'Impossible de créer le paiement Papi.');}
+          return;
+        }
+        step++;show();
+      };
+    };
+    show();
+  };
+
+  submitVerificationRequest = async function(data,proofFile){
+    if(!state.user) throw new Error('Connexion requise.');
+    const uid=state.user.id;
+    const loaded=await tafaV59LoadRows(uid);
+    const pending=loaded.rows.find(x=>String(x.status).toLowerCase()==='pending');
+    if(pending){
+      const ps=String(pending.payment_status||'').toUpperCase();
+      if(ps==='SUCCESS') throw new Error('Votre paiement est déjà confirmé et le dossier attend l’administration.');
+      return pending;
+    }
+    let proofPath='';
+    if(proofFile){
+      if(proofFile.size>15*1024*1024) throw new Error('Le justificatif dépasse 15 Mo.');
+      const ext=(proofFile.name.split('.').pop()||'bin').toLowerCase().replace(/[^a-z0-9]/g,'')||'bin';
+      proofPath=`${uid}/${crypto.randomUUID()}.${ext}`;
+      const up=await tafaV59Race(sb.storage.from('badge-proofs').upload(proofPath,proofFile,{upsert:false,contentType:proofFile.type||undefined}),15000,'Le stockage du justificatif ne répond pas.');
+      if(up.error) throw new Error('Justificatif : '+up.error.message);
+    }
+    try{
+      const rpc=await tafaV59Race(sb.rpc('tafa_create_badge_request',{p_category:String(data.category||'Autre'),p_identity_name:String(data.identity||''),p_proof_path:proofPath||'',p_payment_method:String(data.method||'MVOLA'),p_payment_reference:''}),12000,'Le serveur de vérification ne répond pas.');
+      if(!rpc.error) return {id:rpc.data};
+      if(proofPath)try{await sb.storage.from('badge-proofs').remove([proofPath]);}catch(_){}
+      throw rpc.error;
+    }catch(e){
+      if(proofPath)try{await sb.storage.from('badge-proofs').remove([proofPath]);}catch(_){}
+      throw e;
+    }
+  };
+
+  verificationPage = async function(){
+    const token=++state.verificationRenderToken;
+    simplePage('Vérification',`<section class="verification-page-v59 verification-page-v69"><section class="v59-hero"><div class="v59-brand"><span class="v59-mark">✓</span><div><span class="v59-kicker">TAFAß · BADGE OFFICIEL</span><h3>Badge bleu vérifié</h3><p>Demande, paiement réel via Papi et validation administrative dans un seul parcours sécurisé.</p></div></div></section><section id="v59VerificationBody"><section class="v59-status v59-status-ready"><div class="v59-status-main"><small>VOTRE ESPACE</small><b>Vérification prête</b><p>Nous vérifions votre dossier et votre paiement en arrière-plan.</p></div><span class="v59-status-dot"></span></section></section></section>`);
+    try{
+      const rows=await loadVerificationRequests();
+      if(token!==state.verificationRenderToken || state.route!=='verification')return;
+      const latest=(rows||[])[0];
+      const status=String(latest?.status||'none').toLowerCase();
+      const ps=String(latest?.payment_status||'').toUpperCase();
+      const statusLabel=status==='approved'?'Badge bleu actif':status==='rejected'?'Demande refusée':ps==='SUCCESS'?'Paiement confirmé · en attente de validation':ps==='FAILED'?'Paiement échoué · vous pouvez réessayer':'Paiement à effectuer';
+      const body=$('v59VerificationBody'); if(!body)return;
+      const action= status==='approved'?'Voir mon statut' : (ps==='SUCCESS'?'Voir le suivi':(ps==='FAILED'?'Payer à nouveau':'Commencer la vérification'));
+      body.innerHTML=`${latest?`<section class="v59-status"><div class="v59-status-main"><small>STATUT DU DOSSIER</small><b>${esc(statusLabel)}</b><p>${esc(status==='approved'?'Votre badge bleu est actif.':status==='rejected'?'Votre demande a été refusée. Vous pouvez constituer un nouveau dossier.':ps==='SUCCESS'?'Le paiement de 25 000 Ar a été confirmé par Papi. L’administration peut maintenant examiner votre dossier.':ps==='FAILED'?'Le paiement Papi n’a pas été confirmé. Vous pouvez relancer le paiement sans recréer le dossier.':'Votre dossier est prêt. Le paiement Papi est requis avant l’examen administratif.')}</p><small>${latest.payment_method?esc(latest.payment_method)+' · ':''}${latest.created_at?new Date(latest.created_at).toLocaleString('fr-FR'):''}</small></div><span class="v59-status-dot ${ps==='SUCCESS'?'approved':ps==='FAILED'?'rejected':status==='approved'?'approved':'pending'}"></span></section>`:`<section class="v59-status v59-status-ready"><div class="v59-status-main"><small>VOTRE DOSSIER</small><b>Aucune demande en cours</b><p>Vous pouvez commencer une nouvelle demande de badge officiel.</p></div><span class="v59-status-dot empty"></span></section>`}<section class="v59-grid"><article class="v59-mini"><span>🪪</span><b>Identité</b><small>Informations publiques cohérentes.</small></article><article class="v59-mini"><span>🔐</span><b>Justificatif</b><small>Document envoyé dans l’espace sécurisé.</small></article><article class="v59-mini"><span>💳</span><b>Paiement Papi</b><small>25 000 Ar · confirmation serveur.</small></article></section>${verificationTimeline(status==='approved'?'approved':status==='pending'?'pending':'pending')}<section class="v59-action"><div class="v59-action-copy"><b>${esc(status==='approved'?'Badge bleu actif':ps==='SUCCESS'?'Dossier payé · en attente admin':ps==='FAILED'?'Relancer le paiement':'Demander la vérification')}</b><small>${esc(ps==='SUCCESS'?'Le paiement est confirmé. La décision finale appartient à l’administration.':'Frais : 25 000 Ar / mois · paiement sécurisé par Papi.')}</small></div><button class="primary big" data-action="verification-start" ${status==='approved'?'disabled':''}>${esc(action)}</button></section>`;
+    }catch(error){
+      if(token!==state.verificationRenderToken || state.route!=='verification')return;
+      const body=$('v59VerificationBody'); if(!body)return;
+      body.innerHTML=`<section class="v59-status v59-status-error"><div class="v59-status-main"><small>CONNEXION AU DOSSIER</small><b>Votre espace reste disponible</b><p>Le serveur met plus de temps que prévu. Vous pouvez réessayer sans quitter cette page.</p></div><button class="ghost-action" data-action="verification">Réessayer</button></section>`;
+    }
+  };
+
+  // Badge payment status is realtime as soon as Papi confirms it.
+  const previousV69SetupRealtime = setupRealtime;
+  setupRealtime = async function(...args){
+    const result=await previousV69SetupRealtime.apply(this,args);
+    try{
+      if(state.user && !state.__badgePapiChannel){
+        const ch=sb.channel(`tafass-badge-papi:${state.user.id}`)
+          .on('postgres_changes',{event:'*',schema:'public',table:'tafa_verification_requests',filter:`user_id=eq.${state.user.id}`},payload=>{
+            const rec=payload?.new||payload?.record;
+            if(!rec)return;
+            if(String(rec.payment_status||'').toUpperCase()==='SUCCESS') toast('✓ Paiement du badge bleu confirmé par Papi.');
+            if(String(rec.payment_status||'').toUpperCase()==='FAILED') toast('Paiement Papi échoué. Vous pouvez réessayer.');
+            if(state.route==='verification') verificationPage();
+          }).subscribe();
+        state.__badgePapiChannel=ch;
+      }
+    }catch(_){}
+    return result;
+  };
+
+
+  /* ============================================================
+     TAFAß V73 — FINAL STABLE RUNTIME / SINGLE ACTIVE UI
+     - instant navigation: no skeleton, no reconnect overlay
+     - silent foreground recovery
+     - resilient profile hydration after signup/OAuth
+     - profile PDP clipping/position is enforced in CSS
+     - presence refresh updates labels only, never reloads the whole profile
+     - search results are explicit: only shown after validation
+     ============================================================ */
+  (() => {
+    const baseLoadProfileV73 = loadProfile;
+    loadProfile = async function(){
+      if(!state.user) return;
+      const uid=String(state.user.id);
+      const meta=state.user.user_metadata||{};
+      const authEmail=String(state.user.email||"").trim();
+      let row=null;
+      try{
+        const r=await sb.from("profiles").select("*").eq("id",uid).maybeSingle();
+        row=r.data||null;
+      }catch(_){ row=null; }
+      const fallback={
+        id:state.user.id,
+        first_name:String(meta.first_name||meta.given_name||"").trim(),
+        last_name:String(meta.last_name||meta.family_name||"").trim(),
+        email:authEmail,
+        phone:String(meta.phone||"").trim(),
+        phone_code:String(meta.phone_code||"+261"),
+        country:String(meta.country||"Madagascar")
+      };
+      state.profile={...(row||{}),...fallback};
+      // Database values remain authoritative when present.
+      if(row){
+        state.profile={...fallback,...row};
+        if(!String(state.profile.email||"").trim() && authEmail) state.profile.email=authEmail;
+        if(!String(state.profile.first_name||"").trim() && fallback.first_name) state.profile.first_name=fallback.first_name;
+        if(!String(state.profile.last_name||"").trim() && fallback.last_name) state.profile.last_name=fallback.last_name;
+      }
+      const needsCreate=!row?.id;
+      const needsPatch=row && (
+        (!String(row.first_name||"").trim() && fallback.first_name) ||
+        (!String(row.last_name||"").trim() && fallback.last_name) ||
+        (!String(row.email||"").trim() && authEmail)
+      );
+      if(needsCreate || needsPatch){
+        const patch={
+          id:state.user.id,
+          first_name:state.profile.first_name||"",
+          last_name:state.profile.last_name||"",
+          email:authEmail||state.profile.email||null,
+          phone:state.profile.phone||null,
+          phone_code:state.profile.phone_code||"+261",
+          country:state.profile.country||"Madagascar",
+          updated_at:new Date().toISOString()
+        };
+        sb.from("profiles").upsert(patch,{onConflict:"id"}).then(({data,error})=>{
+          if(!error && data) state.profile={...state.profile,...(Array.isArray(data)?data[0]:data)};
+        }).catch(()=>{});
+      }
+      const sideName=$("sideName"); if(sideName) sideName.textContent=nameOf(state.profile);
+      const sideAvatar=$("sideAvatar");
+      if(sideAvatar) sideAvatar.outerHTML=avatarHTML(state.profile,"avatar").replace("<span ",'<span id="sideAvatar" ');
+      return state.profile;
+    };
+
+    // V73: entering an already authenticated account is immediate. The shell
+    // becomes visible first; profile/feed/realtime hydration continues silently.
+    const baseEnterAppV73=enterApp;
+    enterApp=async function(){
+      if(state.entering || !state.user) return;
+      state.entering=true;
+      try{
+        hideAppTransition();
+        document.body.classList.remove("modal-open","app-logging-out");
+        // Build a provisional identity from Auth metadata so a returning/new
+        // account never flashes as "Membre Tafaß" while the DB is loading.
+        if(!state.profile){
+          const m=state.user.user_metadata||{};
+          state.profile={id:state.user.id,first_name:m.first_name||m.given_name||"",last_name:m.last_name||m.family_name||"",email:state.user.email||"",phone:m.phone||"",country:m.country||"Madagascar"};
+        }
+        $("auth")?.classList.add("hidden");
+        $("app")?.classList.remove("hidden");
+        document.documentElement.classList.remove("app-boot");
+        hideAppTransition();
+        // Do not await the network before painting the application.
+        const hydrate=async()=>{
+          try{
+            await loadProfile();
+            if(!state.profile?.id) return;
+            await Promise.allSettled([loadPosts(),setupRealtime(),ensureLiveFeedRealtime()]);
+            if(state.route) await render();
+          }catch(e){ console.warn("Tafaß background hydration:",e); }
+          finally{ hideAppTransition(); }
+        };
+        void hydrate();
+      }finally{
+        state.entering=false;
+      }
+    };
+
+    // Instant route switch: keep the current page visible until the destination
+    // is ready instead of showing a blocking skeleton/loading screen.
+    const baseNavigateV73=navigate;
+    navigate=function(route, options={}){
+      if(!routes.includes(route)) route="home";
+      if(document.body.classList.contains("modal-open")) closeModal();
+      state.backOverride=null;
+      if(state.route===route && document.querySelector(`#content [data-page-route="${route}"]`)) return;
+      if(!options.replaceStack && state.route!==route){
+        const last=state.navStack[state.navStack.length-1];
+        if(last!==route) state.navStack.push(route);
+      }
+      if(options.replaceStack) state.navStack=[route];
+      state.renderToken++;
+      state.route=route;
+      markRouteBadgeSeen(route);
+      if(route==="profile") state.profileTab=state.profileTab||"posts";
+      if(route==="groups") state.groupsTab="mine";
+      state.selectedConversation=route==="messages"?state.selectedConversation:null;
+      history.replaceState(null,"","#"+route);
+      document.querySelectorAll("[data-route]").forEach(el=>el.classList.toggle("active",el.dataset.route===route));
+      // Do not blank the page. The async renderer replaces it when ready.
+      Promise.resolve(render()).catch(err=>console.warn("Tafaß navigation V73:",err));
+    };
+
+    // Remove the blocking transition if an older handler created it.
+    const killTransition=()=>document.getElementById("tafass-app-transition")?.remove();
+    killTransition();
+
+    // Foreground/online events are silent. Realtime can recover without making
+    // the user wait or seeing a reconnect page.
+    window.addEventListener("online",()=>{
+      networkBanner("");
+      if(state.user && !state.presenceChannel) setupRealtime().catch(()=>{});
+    },{passive:true});
+
+    // Presence events must update small labels only. Never refetch the whole
+    // profile for a single join/leave event; that was a major source of lag.
+    window.addEventListener("tafass:presence-change", ev=>{
+      const id=String(ev?.detail?.key||"");
+      if(!id) return;
+      document.querySelectorAll(`[data-presence-user="${CSS.escape(id)}"]`).forEach(el=>{
+        const online=!!ev?.detail?.online;
+        el.innerHTML=online?'<span class="tafa-presence-dot online" title="En ligne"></span>':'<span class="tafa-presence-offline">hors ligne</span>';
+      });
+    });
+
+    // Search: the search shell stays empty/clean until a real submit. Typing
+    // never triggers remote search requests.
+    const originalSearchPageV73=searchPage;
+    searchPage=async function(q="",category=searchCategory){
+      const term=String(q||"").trim();
+      if(!term){
+        return originalSearchPageV73("",category);
+      }
+      return originalSearchPageV73(term,category);
+    };
+
+    // Remove any old reconnect/transition nodes that may have been injected by
+    // previous builds and never allow them to block touch/scroll.
+    const cleanupRuntimeOverlays=()=>{
+      document.querySelectorAll("#tafass-app-transition,.tafa-reconnect-overlay,.reconnect-overlay,.app-reconnect-overlay").forEach(el=>el.remove());
+      const c=$("content"); if(c){c.style.pointerEvents="auto";c.classList.remove("v44-route-switching");}
+    };
+    cleanupRuntimeOverlays();
+    setInterval(cleanupRuntimeOverlays,2000);
+
+    // Static duplicate cleanup: keep only one shell/navigation/search surface.
+    const dedupeRuntime=(selector)=>{
+      const nodes=[...document.querySelectorAll(selector)];
+      nodes.slice(1).forEach(n=>n.remove());
+    };
+    dedupeRuntime('#tafaSearchForm');
+    dedupeRuntime('.tafa-bottom-nav');
+    dedupeRuntime('.bottom-nav');
+
+    // Never block touch because an old loading class survived a route switch.
+    document.addEventListener("touchstart",()=>{
+      document.documentElement.style.setProperty("--tafa-touch-ready","1");
+    },{passive:true});
+
+    // No advertisement slots are mounted by V73 runtime.
+    document.querySelectorAll('[data-ad-slot],.ad-slot,.advertisement-slot,.tafa-ad-slot').forEach(el=>el.remove());
+  })();
+
+})();
+
+
+/* ============================================================
+   TAFAß V78 — ADMIN SINGLE AUTHORITATIVE VERSION
+   Supersedes legacy V50/V51/V63/V75 presentation layers.
+============================================================ */
+(() => {
+  const cleanupLegacyAdmin = () => {
+    document.querySelectorAll('.tafa-v50-command,.tafa-v51-command,.tafa-v51-command-bar').forEach(el=>el.remove());
+    document.querySelectorAll('.admin-total-page .tafa-v63-flatten').forEach(el=>el.classList.remove('tafa-v63-flatten'));
+    const root=document.querySelector('.admin-total-page');
+    if(!root)return;
+    root.classList.add('tafa-v78-authoritative');
+    root.querySelectorAll('.admin-total-section').forEach(sec=>sec.classList.add('tafa-v78-panel'));
+  };
+  const baseAdminV78=adminTotalPage;
+  adminTotalPage=async function(...args){
+    const result=await baseAdminV78.apply(this,args);
+    requestAnimationFrame(cleanupLegacyAdmin);
+    setTimeout(cleanupLegacyAdmin,40);
+    return result;
+  };
+  document.addEventListener('click',e=>{
+    const b=e.target.closest?.('[data-v74-admin-jump]');
+    if(!b)return;
+    e.preventDefault(); e.stopPropagation();
+    const root=document.querySelector('.admin-total-page'); if(!root)return;
+    const groups={'Évolution des comptes':'evolution','Comptes utilisateurs':'users','Monétisation':'monetization','Signalements':'reports'};
+    const group=groups[b.dataset.v74AdminJump]||'evolution';
+    root.querySelectorAll('[data-v75-admin-section]').forEach(sec=>sec.hidden=sec.dataset.v75AdminSection!==group);
+    root.querySelectorAll('.tafa-v74-admin-tabs button').forEach(x=>x.classList.toggle('active',x===b));
+    cleanupLegacyAdmin();
+  },true);
+  cleanupLegacyAdmin();
+})();
+
+/* =========================================================
+   TAFAß V81 — PROFILE / FRIENDS / SEARCH / SETTINGS + ENTITY ACTIONS
+   Authoritative patch layered on V80. No legacy V79 code is used as base.
+   ========================================================= */
+(function installTafaV81(){
+  const v81GetFollowed = async (ids=[]) => {
+    if(!state.user?.id || !ids.length) return new Set();
+    const r=await sb.from('follows').select('following_id').eq('follower_id',state.user.id).in('following_id',ids);
+    return new Set((r.data||[]).map(x=>String(x.following_id)));
+  };
+
+  window.tafaV81FollowUser = async function(userId){
+    if(!state.user?.id || !userId || String(userId)===String(state.user.id)) return;
+    if(await denyIfBlocked(userId,'Action impossible : ce compte est bloqué.')) return;
+    const existing=await sb.from('follows').select('id').eq('follower_id',state.user.id).eq('following_id',userId).maybeSingle();
+    if(existing.error) return toast(existing.error.message);
+    if(existing.data){
+      const r=await sb.from('follows').delete().eq('id',existing.data.id);
+      if(r.error)return toast(r.error.message);
+      toast('Vous ne suivez plus ce compte.');
+    }else{
+      const r=await sb.from('follows').insert({follower_id:state.user.id,following_id:userId});
+      if(r.error)return toast(r.error.message);
+      toast('Vous suivez maintenant ce compte.');
+      await sb.from('notifications').insert({user_id:userId,actor_id:state.user.id,type:'follow',title:'Nouvel abonné',message:'Un membre vous suit maintenant.',entity_type:'profile',entity_id:userId});
+    }
+    if(state.route==='search') return searchPage(document.getElementById('searchInput')?.value||'',searchCategory);
+    if(state.viewingProfileId===userId) return openUserProfile(userId);
+    return friendsPage(state.friendsTab);
+  };
+
+  window.tafaV81TogglePageFollow = async function(id){
+    if(!state.user?.id)return toast('Connectez-vous pour suivre une Page.');
+    const pg=(await sb.from('pages').select('id,owner_id,name').eq('id',id).maybeSingle()).data;
+    if(!pg)return toast('Page introuvable.');
+    if(String(pg.owner_id)===String(state.user.id))return toast('Le propriétaire ne peut pas suivre sa propre Page.');
+    let followed=null;
+    const rpc=await sb.rpc('tafa_v81_toggle_page_follow',{p_page_id:id});
+    if(!rpc.error && rpc.data && typeof rpc.data.followed!=='undefined') followed=!!rpc.data.followed;
+    if(followed===null){
+      const q=await sb.from('page_followers').select('page_id,user_id').eq('page_id',id).eq('user_id',state.user.id).maybeSingle();
+      if(q.error)return toast(q.error.message);
+      if(q.data){ const r=await sb.from('page_followers').delete().eq('page_id',id).eq('user_id',state.user.id); if(r.error)return toast(r.error.message); followed=false; }
+      else { const r=await sb.from('page_followers').insert({page_id:id,user_id:state.user.id}); if(r.error)return toast(r.error.message); followed=true; }
+    }
+    if(followed) await sb.from('notifications').insert({user_id:pg.owner_id,actor_id:state.user.id,type:'page_follow',title:'Nouvel abonné',message:`Un membre suit maintenant ${pg.name}.`,entity_type:'page',entity_id:id});
+    toast(followed?'Vous suivez maintenant cette Page.':'Vous ne suivez plus cette Page.');
+    state.renderToken++;
+    return pagesV80Hub();
+  };
+
+  window.tafaV81ToggleGroupMember = async function(id){
+    if(!state.user?.id)return toast('Connectez-vous pour rejoindre un groupe.');
+    const g=(await sb.from('groups').select('id,owner_id,privacy,name').eq('id',id).maybeSingle()).data;
+    if(!g)return toast('Groupe introuvable.');
+    const q=await sb.from('group_members').select('id,role').eq('group_id',id).eq('user_id',state.user.id).maybeSingle();
+    if(q.error)return toast(q.error.message);
+    if(q.data){
+      if(String(g.owner_id)===String(state.user.id))return toast('Le propriétaire ne peut pas quitter son propre groupe.');
+      const rpc=await sb.rpc('tafa_v81_toggle_group_membership',{p_group_id:id});
+      if(rpc.error){const r=await sb.from('group_members').delete().eq('id',q.data.id);if(r.error)return toast(r.error.message);}
+      toast('Vous avez quitté le groupe.');
+    }else if(String(g.privacy||'public').toLowerCase()==='private'){
+      const reqRpc=await sb.rpc('tafa_v81_request_group_join',{p_group_id:id});
+      if(reqRpc.error){
+        const existing=await sb.from('group_join_requests').select('id,status').eq('group_id',id).eq('user_id',state.user.id).eq('status','pending').maybeSingle();
+        if(existing.error && !/column .*user_id.*does not exist|relation .*group_join_requests.*does not exist/i.test(existing.error.message||''))return toast(existing.error.message);
+        if(existing.data)return toast('Votre demande est déjà en attente.');
+        const r=await sb.from('group_join_requests').insert({group_id:id,user_id:state.user.id,status:'pending'});
+        if(r.error)return toast(r.error.message||'Impossible d’envoyer la demande.');
+      } else if(reqRpc.data?.requested===false && reqRpc.data?.joined===true){
+        toast('Vous avez rejoint le groupe.');
+      } else if(reqRpc.data?.already_requested){ return toast('Votre demande est déjà en attente.'); }
+      toast('Demande envoyée au groupe.');
+      await sb.from('notifications').insert({user_id:g.owner_id,actor_id:state.user.id,type:'group_join_request',title:'Demande pour rejoindre le groupe',message:`Une personne demande à rejoindre ${g.name}.`,entity_type:'group',entity_id:id});
+    }else{
+      const rpc=await sb.rpc('tafa_v81_toggle_group_membership',{p_group_id:id});
+      if(rpc.error){ const r=await sb.from('group_members').insert({group_id:id,user_id:state.user.id,role:'member'}); if(r.error)return toast(r.error.message); }
+      toast('Vous avez rejoint le groupe.');
+      await sb.from('notifications').insert({user_id:g.owner_id,actor_id:state.user.id,type:'group_join',title:'Nouveau membre',message:`Un membre a rejoint ${g.name}.`,entity_type:'group',entity_id:id});
+    }
+    state.renderToken++;
+    return groupsV80Hub();
+  };
+
+  /* V81: reliable Friends hub with all relationship states. */
+  window.friendsPage = async function(tab=state.friendsTab){
+    state.friendsTab=tab||'suggestions';
+    const token=state.renderToken;
+    await getBlockedIds();
+    const peopleR=await sb.from('profiles').select('*').neq('id',state.user.id).order('created_at',{ascending:false}).limit(150);
+    if(token!==state.renderToken)return;
+    if(peopleR.error)return simplePage('Amis',`<div class="empty">${esc(peopleR.error.message)}</div>`);
+    const people=filterBlocked(peopleR.data||[],'id');
+    const ids=people.map(p=>p.id);
+    const [inR,sentR,friendR,followersR,followingR]=await Promise.all([
+      sb.from('friend_requests').select('id,sender_id').eq('receiver_id',state.user.id).eq('status','pending'),
+      sb.from('friend_requests').select('id,receiver_id').eq('sender_id',state.user.id).eq('status','pending'),
+      sb.from('friendships').select('friend_id').eq('user_id',state.user.id),
+      sb.from('follows').select('follower_id').eq('following_id',state.user.id),
+      sb.from('follows').select('following_id').eq('follower_id',state.user.id)
+    ]);
+    const incoming=new Set((inR.data||[]).map(x=>String(x.sender_id)));
+    const sent=new Set((sentR.data||[]).map(x=>String(x.receiver_id)));
+    const friends=new Set((friendR.data||[]).map(x=>String(x.friend_id)));
+    const followers=new Set((followersR.data||[]).map(x=>String(x.follower_id)));
+    const following=new Set((followingR.data||[]).map(x=>String(x.following_id)));
+    const map=new Map(people.map(p=>[String(p.id),p]));
+    const rows=(set)=>[...set].map(id=>map.get(id)).filter(Boolean);
+    const suggestions=people.filter(p=>!friends.has(String(p.id))&&!incoming.has(String(p.id))&&!sent.has(String(p.id)));
+    const commonMap=new Map();
+    if(ids.length){const r=await sb.rpc('tafa_common_friend_counts',{p_user_ids:ids});(r.data||[]).forEach(x=>commonMap.set(String(x.user_id),Number(x.common_count||0)));}
+    const tabs=[['suggestions','Suggestions',suggestions.length],['friends','Amis',friends.size],['requests','Demandes reçues',incoming.size],['sent','Demandes envoyées',sent.size],['followers','Abonnés',followers.size],['following','Abonnements',following.size]];
+    const personRow=(p)=>{
+      const pid=String(p.id), isFriend=friends.has(pid), isIn=incoming.has(pid), isSent=sent.has(pid), isFollowing=following.has(pid);
+      let action='';
+      if(isFriend) action=`<button class="ghost-action" data-action="view-profile" data-id="${esc(p.id)}">Profil</button>`;
+      else if(isIn) action=`<div class="friend-actions"><button class="small-action" data-action="accept-friend" data-id="${esc(p.id)}">Confirmer</button><button class="ghost-action" data-action="decline-friend" data-id="${esc(p.id)}">Refuser</button></div>`;
+      else if(isSent) action=`<button class="ghost-action" disabled>Demande envoyée</button>`;
+      else action=`<button class="small-action" data-action="add-friend" data-id="${esc(p.id)}">Ajouter</button>`;
+      if(!isFriend && !isIn) action+=`<button class="ghost-action" data-action="v81-follow-user" data-id="${esc(p.id)}">${isFollowing?'Ne plus suivre':'Suivre'}</button>`;
+      return `<div class="list-row friend-row v81-friend-row">${avatarHTML(p)}<div class="grow">${displayNameHTML(p)}${commonMap.get(pid)?`<small class="mutual-friends">${commonMap.get(pid)} ami${commonMap.get(pid)>1?'s':''} en commun</small>`:''}</div><div class="v81-friend-actions">${action}</div></div>`;
+    };
+    let list=[];
+    if(state.friendsTab==='friends')list=rows(friends);
+    else if(state.friendsTab==='requests')list=rows(incoming);
+    else if(state.friendsTab==='sent')list=rows(sent);
+    else if(state.friendsTab==='followers')list=rows(followers);
+    else if(state.friendsTab==='following')list=rows(following);
+    else list=suggestions;
+    const body=list.length?list.map(personRow).join(''):`<div class="empty">Aucun résultat dans cette section.</div>`;
+    const tabHtml=tabs.map(([k,l,c])=>`<button class="${state.friendsTab===k?'active':''}" data-action="friends-tab" data-tab="${k}">${l}<span class="tab-count">${c}</span></button>`).join('');
+    simplePage('Amis',`<section class="v81-friends-shell"><div class="v81-friends-hero"><div><span class="eyebrow">TAFAß • MON RÉSEAU</span><h2>Amis</h2><p>Gérez vos amis, demandes, abonnés et abonnements au même endroit.</p></div><div class="v81-network-stats"><b>${friends.size}</b><small>Amis</small><b>${followers.size}</b><small>Abonnés</small></div></div><div class="friends-filter v81-friends-tabs">${tabHtml}</div><div class="clean-section"><h3 class="menu-section-title">${esc(tabs.find(x=>x[0]===state.friendsTab)?.[1]||'Amis')}</h3><div class="friends-list">${body}</div></div></section>`);
+  };
+
+  /* Search: actions are available immediately from result rows. */
+  window.searchPage = async function(q='',category=searchCategory){
+    searchCategory=category||searchCategory; const token=state.renderToken; const term=q.trim();
+    let people=[],posts=[],groups=[];
+    if(term){
+      const safe=term.replace(/[%_]/g,'').trim(); if(!safe)return searchPage('',searchCategory);
+      const [pr,por,gr]=await Promise.all([
+        sb.from('profiles').select('*').or(`first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,username.ilike.%${safe}%`).limit(40),
+        sb.from('posts').select('*').or(`content.ilike.%${safe}%`).order('created_at',{ascending:false}).limit(30),
+        sb.from('groups').select(`${GROUP_FIELDS},deletion_status`).or(`name.ilike.%${safe}%,description.ilike.%${safe}%`).neq('deletion_status','deleted').limit(30)
+      ]);
+      await getBlockedIds(); people=filterBlocked(pr.data||[],'id'); posts=filterBlocked(por.data||[],'user_id'); groups=gr.data||[];
+      if(state.user&&safe.length>=2){const h=await sb.from('search_history').select('id').eq('user_id',state.user.id).eq('search_text',term).limit(1);if(!(h.data||[]).length)await sb.from('search_history').insert({user_id:state.user.id,search_text:term,result_type:'all'});}
+      const pids=[...new Set(posts.map(x=>x.user_id).filter(Boolean))];const pp=pids.length?await sb.from('profiles').select('*').in('id',pids):{data:[]};const pm=new Map((pp.data||[]).map(x=>[String(x.id),x]));posts=posts.map(x=>({...x,author:pm.get(String(x.user_id))}));
+    }
+    if(token!==state.renderToken||state.route!=='search')return;
+    const followed=await v81GetFollowed(people.map(p=>p.id));
+    const peopleHtml=people.length?people.map(p=>`<div class="list-row search-result-row v81-search-person">${avatarHTML(p)}<div class="grow">${displayNameHTML(p)}<small>${esc([p.city_current,p.country].filter(Boolean).join(' · ')||'Compte Tafaß')}</small></div><div class="v81-search-actions"><button class="small-action" data-action="v81-follow-user" data-id="${esc(p.id)}">${followed.has(String(p.id))?'Ne plus suivre':'Suivre'}</button><button class="ghost-action" data-action="view-profile" data-id="${esc(p.id)}">Profil</button></div></div>`).join(''):`<div class="empty">Aucun compte trouvé.</div>`;
+    const postHtml=posts.length?posts.map(p=>`<div class="list-row search-result-row"><div class="grow"><b>${esc(nameOf(p.author||{}))}</b><small>${esc((p.content||'Publication sans texte').slice(0,160))}</small></div><button class="small-action" data-action="search-post" data-id="${esc(p.id)}">Voir</button></div>`).join(''):`<div class="empty">Aucune publication trouvée.</div>`;
+    const groupHtml=groups.length?groups.map(x=>`<div class="list-row search-result-row"><div class="entity-search-icon">◎</div><div class="grow"><b>${esc(x.name)}</b><small>${esc(x.privacy==='private'?'Privé':'Public')} · ${esc(x.description||'')}</small></div><div class="v81-search-actions"><button class="small-action" data-action="toggle-group-member" data-id="${esc(x.id)}">${x.privacy==='private'?'Demander':'Rejoindre'}</button><button class="ghost-action" data-action="group-open" data-id="${esc(x.id)}">Ouvrir</button></div></div>`).join(''):`<div class="empty">Aucun groupe trouvé.</div>`;
+    const categories=[['accounts','Comptes',people.length],['posts','Publications',posts.length],['groups','Groupes',groups.length]];
+    const categoryTabs=term?`<div class="search-category-bar" role="tablist">${categories.map(([k,l,c])=>`<button type="button" class="search-category-tab ${searchCategory===k?'active':''}" data-action="search-category" data-category="${k}"><span>${k==='accounts'?'♙':k==='posts'?'▤':k==='pages'?'▣':'◎'}</span><span>${l}</span><b>${c}</b></button>`).join('')}</div>`:'';
+    const map={accounts:['Comptes',peopleHtml],posts:['Publications',postHtml],groups:['Groupes',groupHtml]};const active=term?map[searchCategory]||map.accounts:['','<div class="search-ready-hint"><span>⌕</span><div><b>Commencez votre recherche</b><small>Recherchez un compte, une publication ou un groupe.</small></div></div>'];
+    simplePage('Rechercher',`<section class="search-page-v81"><div class="page-header clean-page-header"><div><span class="eyebrow">TAFAß • EXPLORER</span><h2>Rechercher</h2><p class="page-kicker">Personnes, Groupes et publications.</p></div></div><form id="tafaSearchForm" class="clean-search searchbox premium-searchbox"><span class="icon">⌕</span><input id="searchInput" value="${esc(term)}" placeholder="Rechercher…" autocomplete="off"><button type="submit">→</button></form>${categoryTabs}<div class="search-active-result"><div class="search-result-heading"><div><span class="eyebrow">RÉSULTATS</span><h3>${esc(active[0]||'Recherche')}</h3></div><span class="search-result-count">${term?(categories.find(x=>x[0]===searchCategory)?.[2]||0):0}</span></div><div class="clean-list search-results-list">${active[1]}</div></div></section>`);
+    $('tafaSearchForm')?.addEventListener('submit',e=>{e.preventDefault();const v=$('searchInput')?.value.trim()||'';if(v)searchPage(v,searchCategory);});
+  };
+
+  /* Route handlers call these wrappers, so V80 buttons no longer enter broken legacy detail flows after a mutation. */
+  window.__tafaV81Installed=true;
+  try{ togglePageFollow=window.tafaV81TogglePageFollow; toggleGroupMember=window.tafaV81ToggleGroupMember; }catch(_e){}
+
+  /* ============================================================
+     TAFAß V83 — CLEAN PRODUCTION CORE / PAGES UI
+     New mobile-first Page hub/detail. The old Page presentation is
+     no longer used. The detail view is a real scroll container so
+     touch/trackpad can move from top to bottom and back without the
+     modal locking the content.
+  ============================================================ */
+  async function pagesV82Hub(){
+    const token=state.renderToken;
+    const tab=state.pagesTab||"mine";
+    const q=sb.from('pages')
+      .select(`${PAGE_FIELDS},deletion_status,deletion_requested_at,deletion_scheduled_at`)
+      .neq('deletion_status','deleted')
+      .order('created_at',{ascending:false}).limit(100);
+    const {data,error}=tab==='mine'?await q.eq('owner_id',state.user.id):await q;
+    if(token!==state.renderToken||state.route!=='pages')return;
+    if(error)return simplePage('Pages',`<section class="tafass-v82-pages"><div class="v82-error"><b>Impossible de charger les Pages</b><span>${esc(error.message)}</span><button class="v82-primary" data-action="retry-route" data-route-target="pages">Réessayer</button></div></section>`);
+    const rows=data||[], ids=rows.map(x=>x.id);
+    let followerRows=[];
+    if(ids.length){const f=await sb.from('page_followers').select('page_id,user_id').in('page_id',ids);if(!f.error)followerRows=f.data||[];}
+    if(token!==state.renderToken||state.route!=='pages')return;
+    const followerCount=new Map(), following=new Set();
+    followerRows.forEach(x=>{followerCount.set(x.page_id,(followerCount.get(x.page_id)||0)+1);if(String(x.user_id)===String(state.user.id))following.add(x.page_id);});
+    const mine=rows.filter(x=>String(x.owner_id)===String(state.user.id));
+    const discover=rows.filter(x=>String(x.owner_id)!==String(state.user.id));
+    const list=tab==='mine'?mine:discover;
+    const cards=list.map(p=>{
+      const own=String(p.owner_id)===String(state.user.id), fol=following.has(p.id);
+      return `<article class="v82-page-card">
+        <button type="button" class="v82-page-main" data-action="page-open" data-id="${esc(p.id)}">
+          <span class="v82-page-avatar">${entityAvatarHTML(p,'page','v82-entity-avatar')}</span>
+          <span class="v82-page-copy"><strong>${esc(p.name)}</strong><small>${followerCount.get(p.id)||0} abonnés${p.category?` · ${esc(p.category)}`:''}</small><em>${esc(p.bio||'Page Tafaß')}</em></span>
+          <span class="v82-chevron">›</span>
+        </button>
+        <div class="v82-page-actions">
+          ${own?`<button type="button" class="v82-secondary" data-action="page-switch" data-id="${esc(p.id)}">⇄ Basculer</button><button type="button" class="v82-secondary icon" data-action="edit-page" data-id="${esc(p.id)}" aria-label="Gérer la Page">⚙</button>`:
+          `<button type="button" class="${fol?'v82-secondary':'v82-primary'}" data-action="toggle-page-follow" data-id="${esc(p.id)}">${fol?'✓ Suivie':'＋ Suivre'}</button>`}
+        </div>
+      </article>`;
+    }).join('');
+    const empty=tab==='mine'?`<div class="v82-empty"><div class="v82-empty-mark">▣</div><strong>Aucune Page pour le moment</strong><span>Créez votre première Page et gérez-la avec la nouvelle interface Tafaß.</span><button type="button" class="v82-primary" data-action="create-page">＋ Créer une Page</button></div>`:`<div class="v82-empty"><div class="v82-empty-mark">⌕</div><strong>Aucune Page à découvrir</strong><span>Les Pages publiques disponibles apparaîtront ici.</span></div>`;
+    simplePage('Pages',`<section class="tafass-v82-pages">
+      <header class="v82-pages-head">
+        <div class="v82-brand-line"><span class="v82-mark">ß</span><div><span class="v82-eyebrow">TAFAß · PAGES</span><h2>Pages</h2></div></div>
+        <button type="button" class="v82-primary v82-create" data-action="create-page">＋ Créer</button>
+      </header>
+      <p class="v82-intro">Créez, suivez et gérez des Pages. Tout le contenu reste accessible dans un espace fluide et défilable.</p>
+      <div class="v82-tabs" role="tablist"><button type="button" class="${tab==='mine'?'active':''}" data-action="pages-tab" data-tab="mine">Mes Pages <b>${mine.length}</b></button><button type="button" class="${tab==='discover'?'active':''}" data-action="pages-tab" data-tab="discover">Découvrir <b>${discover.length}</b></button></div>
+      <div class="v82-section-head"><div><span>${tab==='mine'?'ESPACE PERSONNEL':'EXPLORATION'}</span><h3>${tab==='mine'?'Vos Pages':'Découvrir les Pages'}</h3></div><button type="button" class="v82-link" data-action="page-business">Business Suite</button></div>
+      <div class="v82-page-list">${cards||empty}</div>
+    </section>`);
+  }
+
+  async function openPageDetailV82(id){
+    const {data:x,error:xerr}=await fetchPageById(id);
+    if(xerr)return toast(xerr.message);
+    if(!x)return toast('Page introuvable.');
+    const [follow,followers,owner,members,posts]=await Promise.all([
+      sb.from('page_followers').select('page_id,user_id').eq('page_id',id).eq('user_id',state.user.id).maybeSingle(),
+      sb.from('page_followers').select('page_id',{count:'exact',head:true}).eq('page_id',id),
+      sb.from('profiles').select('first_name,last_name,username,avatar_url,email,phone,country,city_current,bio').eq('id',x.owner_id).maybeSingle(),
+      sb.from('page_members').select('user_id,role,profiles(first_name,last_name,username,avatar_url)').eq('page_id',id).order('created_at',{ascending:true}),
+      sb.from('page_posts').select('*,page_post_reactions(id,user_id,reaction_type),page_post_comments(id,user_id,content,created_at,profiles(first_name,last_name,username,avatar_url)),page_post_shares(id,user_id)').eq('page_id',id).order('created_at',{ascending:false}).limit(50)
+    ]);
+    if(posts.error)return toast(posts.error.message);
+    const ownerMe=String(x.owner_id)===String(state.user.id);
+    const myRole=(members.data||[]).find(m=>String(m.user_id)===String(state.user.id))?.role||null;
+    const canManage=ownerMe;
+    const canPublish=ownerMe;
+    const followerCount=followers.count||0;
+    const postsRows=posts.data||[];
+    const postRows=postsRows.map(p=>{
+      const reactions=p.page_post_reactions||[], comments=p.page_post_comments||[], shares=p.page_post_shares||[];
+      const mine=reactions.some(r=>String(r.user_id)===String(state.user.id));
+      const preview=comments.slice(-2).map(c=>`<div class="v82-comment"><span>${avatarHTML(c.profiles||{},'avatar v82-comment-avatar')}</span><div><b>${esc(nameOf(c.profiles||{}))}</b><p>${esc(c.content||'')}</p><small>${timeAgo(c.created_at)}</small></div></div>`).join('');
+      return `<article class="v82-post" data-page-post="${esc(p.id)}">
+        <header class="v82-post-head"><div>${entityAvatarHTML(x,'page','v82-post-avatar')}<div><b>${esc(x.name)}</b><small>${timeAgo(p.created_at)} · Page</small></div></div><button type="button" class="v82-icon p89-post-options" data-action="page-post-menu" data-id="${esc(p.id)}" data-entity-id="${esc(id)}" aria-label="Options de la publication">•••</button></header>
+        ${p.content?`<div class="v82-post-text">${esc(p.content)}</div>`:''}
+        ${p.media_url?(String(p.media_type||'').startsWith('video')?`<video class="v82-post-media" src="${esc(p.media_url)}" controls playsinline preload="metadata"></video>`:`<img class="v82-post-media" src="${esc(p.media_url)}" alt="Publication" loading="lazy">`):''}
+        <div class="v82-post-stats"><span>${reactions.length} réaction${reactions.length===1?'':'s'}</span><span>${comments.length} commentaire${comments.length===1?'':'s'}</span><span>${shares.length} partage${shares.length===1?'':'s'}</span></div>
+        <div class="v82-post-actions"><button type="button" class="${mine?'active':''}" data-action="page-post-like" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">${mine?'♥':'♡'} J’aime</button><button type="button" data-action="page-post-comment" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">💬 Commenter</button><button type="button" data-action="share-page-post" data-id="${esc(p.id)}" data-entity-id="${esc(id)}">↗ Partager</button></div>
+        ${preview?`<div class="v82-comments">${preview}</div>`:''}
+      </article>`;
+    }).join('')||`<div class="v82-empty v82-empty-inline"><div class="v82-empty-mark">✦</div><strong>Aucune publication</strong><span>Les publications de cette Page apparaîtront ici.</span></div>`;
+    const team=(members.data||[]).map(m=>`<div class="v82-team-row">${avatarHTML(m.profiles||{},'avatar v82-team-avatar')}<div><b>${esc(nameOf(m.profiles||{}))}</b><small>${esc(m.role||'editor')}</small></div>${canManage&&String(m.user_id)!==String(state.user.id)?`<button type="button" class="v82-icon" data-action="page-member-menu" data-id="${esc(m.user_id)}" data-entity-id="${esc(id)}">•••</button>`:''}</div>`).join('')||`<div class="v82-muted">Aucun gestionnaire supplémentaire.</div>`;
+    const about=`<div class="v82-info-grid"><div><small>Catégorie</small><b>${esc(x.category||'Autre')}</b></div><div><small>Créée le</small><b>${new Date(x.created_at).toLocaleDateString('fr-FR')}</b></div><div><small>Responsable</small><b>${esc(owner.data?nameOf(owner.data):'Membre Tafaß')}</b></div><div><small>Adresse</small><b>${esc(x.address||owner.data?.city_current||'Non renseignée')}</b></div>${x.contact_email?`<div><small>E-mail</small><b>${esc(x.contact_email)}</b></div>`:''}${x.contact_phone?`<div><small>Téléphone</small><b>${esc(x.contact_phone)}</b></div>`:''}${x.website_url?`<div class="wide"><small>Site web</small><b>${esc(x.website_url)}</b></div>`:''}</div>`;
+    setupTafaV80Realtime('page',id);
+    openModal(`<div class="modal-box page-detail tafass-v91-page-modal ${ownerMe?'p91-page-owner-view':'p91-page-visitor-view'}" data-page-id="${esc(id)}">
+      <header class="p91-page-topbar">
+        <button type="button" class="p91-page-back" data-action="close-entity" data-route-back="${esc(state.entityBackRoute||'pages')}" aria-label="Retour"><span>‹</span><b>Retour</b></button>
+        <div class="p91-page-top-title"><span>${ownerMe?'TAFAß · GESTION DE PAGE':'TAFAß · PAGE PUBLIQUE'}</span><strong>${esc(x.name)}</strong></div>
+      </header>
+      <div class="p91-page-scroll">
+        <section class="p91-cover" ${x.cover_url?`style="background-image:url('${esc(x.cover_url)}')"`:''}>
+          <div class="p91-cover-shade"></div>
+          <div class="p91-cover-meta"><span>${ownerMe?'ESPACE PROPRIÉTAIRE':'ESPACE PUBLIC'}</span><b>${esc(x.category||'Communauté')}</b></div>
+        </section>
+        <section class="p91-identity">
+          <div class="p91-avatar-wrap">${entityAvatarHTML(x,'page','p91-page-avatar')}<span class="p91-verified">✓</span></div>
+          <div class="p91-identity-main">
+            <h1>${esc(x.name)}</h1>
+            <p class="p91-category">${esc(x.category||'Page')} · ${followerCount} abonné${followerCount===1?'':'s'}</p>
+            <p class="p91-bio">${esc(x.bio||'Présentez votre activité, votre communauté et vos actualités.')}</p>
+          </div>
+        </section>
+        <section class="p91-stats">
+          <div><b>${followerCount}</b><span>Abonnés</span></div>
+          <div><b>${postsRows.length}</b><span>Publications</span></div>
+          <div><b>${esc(x.category||'Page')}</b><span>Catégorie</span></div>
+        </section>
+        <section class="p91-page-actions">
+          ${ownerMe
+            ? `<button type="button" class="p91-action p91-action-primary" data-action="page-switch" data-id="${esc(id)}"><span>⇄</span><b>Basculer</b></button>
+               <button type="button" class="p91-action" data-action="edit-page" data-id="${esc(id)}"><span>⚙</span><b>Gérer</b></button>
+               <button type="button" class="p91-action" data-action="page-invite-friends" data-id="${esc(id)}"><span>♙</span><b>Inviter</b></button>`
+            : `<button type="button" class="p91-action p91-action-primary" data-action="toggle-page-follow" data-id="${esc(id)}"><span>${follow.data?'✓':'＋'}</span><b>${follow.data?'Suivie':'Suivre'}</b></button>
+               <button type="button" class="p91-action" data-action="page-contact" data-id="${esc(id)}"><span>✉</span><b>Message</b></button>
+               <button type="button" class="p91-action" data-action="page-share" data-id="${esc(id)}"><span>↗</span><b>Partager</b></button>`}
+        </section>
+        ${ownerMe?`<section class="p91-owner-tools">
+          <button data-action="edit-page" data-id="${esc(id)}"><span>▣</span><div><b>Profil de la Page</b><small>Identité, visuels et informations</small></div><i>›</i></button>
+          <button data-action="page-invite-friends" data-id="${esc(id)}"><span>♙</span><div><b>Inviter des amis</b><small>Développer la communauté</small></div><i>›</i></button>
+          <button data-action="page-team" data-id="${esc(id)}"><span>♛</span><div><b>Outils de la Page</b><small>Équipe, rôles et gestion</small></div><i>›</i></button>
+          <button data-action="edit-page" data-id="${esc(id)}"><span>⚙</span><div><b>Paramètres</b><small>Configurer votre Page</small></div><i>›</i></button>
+        </section>`:''}
+        <nav class="p91-page-tabs" role="tablist">
+          <button type="button" class="active" data-action="page-tab" data-tab="posts" data-id="${esc(id)}">Publications</button>
+          <button type="button" data-action="page-tab" data-tab="about" data-id="${esc(id)}">À propos</button>
+          ${ownerMe?`<button type="button" data-action="page-tab" data-tab="team" data-id="${esc(id)}">Équipe</button>`:`<button type="button" data-action="page-tab" data-tab="community" data-id="${esc(id)}">Communauté</button>`}
+        </nav>
+        ${canPublish?`<section class="p89-page-composer"><div class="p89-composer-title"><span>✦</span><div><b>Publier en tant que ${esc(x.name)}</b><small>${myRole==='editor'?'Éditeur':'Gestionnaire'}</small></div></div><textarea id="pagePostText" maxlength="5000" placeholder="Partagez une actualité avec vos abonnés…"></textarea><div class="p89-composer-tools"><label class="p89-media"><span>＋</span>Média<input id="pagePostMedia" type="file" accept="image/*,video/*" hidden></label><span id="pagePostMediaName">Aucun fichier</span><button type="button" class="p89-publish" data-action="page-publish" data-id="${esc(id)}">Publier</button></div></section>`:''}
+        <section class="p89-page-tab-panel" data-tab="posts">
+          <div class="p89-section-head"><div><span>ACTUALITÉ</span><h2>Publications</h2></div><small>● ACTIF</small></div>
+          <div class="p89-post-list">${postRows.replace(/v82-/g,'p89-')}</div>
+        </section>
+        <section class="p89-page-tab-panel p89-hidden" data-tab="about">
+          <div class="p89-section-head"><div><span>INFORMATIONS</span><h2>À propos</h2></div></div>
+          <div class="p89-info-grid">${about.replace(/v82-info-grid/g,'p89-info-grid')}</div>
+        </section>
+        <section class="p89-page-tab-panel p89-hidden p91-community-panel" data-tab="team">
+          <div class="p89-section-head"><div><span>GESTION</span><h2>Équipe</h2></div>${canManage?`<button type="button" class="p89-add" data-action="page-add-member" data-id="${esc(id)}">＋ Ajouter</button>`:''}</div>
+          <div class="p89-team-list">${team.replace(/v82-/g,'p89-')}</div>
+        </section>
+        <section class="p89-page-tab-panel p89-hidden p91-community-panel" data-tab="community">
+          <div class="p89-section-head"><div><span>COMMUNAUTÉ</span><h2>Abonnés de la Page</h2></div></div>
+          <div class="p91-community-card"><span>◉</span><div><b>Une communauté autour de ${esc(x.name)}</b><small>Suivez la Page pour recevoir ses nouvelles publications et échanger avec elle.</small></div></div>
+        </section>
+        <div class="p89-page-bottom"></div>
+      </div>
+    </div>`);
+    const media=$('pagePostMedia'); media?.addEventListener('change',()=>{const f=media.files?.[0];const el=$('pagePostMediaName');if(el)el.textContent=f?f.name:'Aucun fichier';});
+    requestAnimationFrame(()=>{const root=document.querySelector('.tafass-v89-page-modal .p89-page-scroll');if(root)root.scrollTop=0;});
+  }
+
+  // V83 becomes the only active Page hub/detail implementation. Legacy names
+  // are retained only as internal compatibility aliases for existing routes.
+  pagesV80Hub=pagesV82Hub;
+  openPageDetail=openPageDetailV82;
+  window.__TAFA_V83__={version:'83',core:'clean-production',pages:'v83',realtime:'coalesced'};
+
+})();
+
+
+/* TAFAß V98 — FINAL PAGE UI PURGE / ALERTES NAVIGATION */
+(() => {
+  const purge = () => {
+    document.querySelectorAll('[data-route="pages"], [data-action="page-open"], [data-action="page-profile"], [data-action="page-switch"], [data-action="toggle-page-follow"], [data-action="create-page"], [data-action="edit-page"], [data-action="new-page-menu"], [data-action="business-open-pages"], [data-v49-page], [data-v49-search-all]').forEach(el => {
+      el.remove();
+    });
+    document.querySelectorAll('.tafass-v82-pages,.page-detail,.page-premium-modal,.page-mode-feed,.page-context-banner,.page-menu-dashboard,.p91-page-menu,.tbs-page-main,.tbs-page-card').forEach(el => el.remove());
+    document.querySelectorAll('.fb-settings-row,[data-action]').forEach(el => {
+      const a=String(el.dataset?.action||'');
+      if (/^(professional-mode|page-privacy|professional-integrations|page-business)$/i.test(a)) el.remove();
+    });
+  };
+  purge();
+  new MutationObserver(purge).observe(document.body,{childList:true,subtree:true});
+  window.addEventListener('hashchange',()=>{ if(location.hash==='#pages') history.replaceState(null,'','#notifications'); });
+})();
