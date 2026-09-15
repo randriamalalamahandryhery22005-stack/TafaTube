@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { supabase } from './lib/supabase'
 import {
   Bell, Compass, Home, Menu, Moon, Search, Settings, Sun,
   Upload, UserCircle2, X, Play, Sparkles, ChevronRight
@@ -13,10 +14,27 @@ const demoVideos = [
 
 function App() {
   const [dark, setDark] = useState(true)
+  const [videos, setVideos] = useState<any[]>([])
+  const [selectedVideo, setSelectedVideo] = useState<any | null>(null)
   const [search, setSearch] = useState('')
   const [menu, setMenu] = useState(false)
   const [auth, setAuth] = useState<'login' | 'register' | null>(null)
   const [uploadOpen, setUploadOpen] = useState(false)
+  useEffect(() => {
+    loadVideos()
+  }, [])
+
+  async function loadVideos() {
+    if (!supabase) return
+    const { data } = await supabase
+      .from('videos')
+      .select('*')
+      .eq('visibility', 'public')
+      .order('created_at', { ascending: false })
+      .limit(40)
+    if (data) setVideos(data)
+  }
+
 
   const bg = dark ? 'bg-[#090b10] text-white' : 'bg-[#f7f8fa] text-slate-900'
   const panel = dark ? 'bg-white/[.055] border-white/10' : 'bg-white border-slate-200 shadow-sm'
@@ -84,16 +102,16 @@ function App() {
           </div>
 
           <section className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-            {demoVideos.map(v=>(
-              <article key={v.id} className="group overflow-hidden rounded-2xl">
+            (videos.length ? videos : demoVideos).map(v=>(
+              <article key={v.id} onClick={()=>videos.length && setSelectedVideo(v)} className="group cursor-pointer overflow-hidden rounded-2xl">
                 <div className="relative aspect-video overflow-hidden rounded-2xl bg-black">
-                  <img src={v.thumb} alt="" className="h-full w-full object-cover transition duration-500 group-hover:scale-105"/>
-                  <span className="absolute bottom-2 right-2 rounded-md bg-black/80 px-2 py-1 text-xs font-bold">{v.time}</span>
+                  <img src={v.thumbnail_path && supabase ? supabase.storage.from('videos').getPublicUrl(v.thumbnail_path).data.publicUrl : v.thumb} alt="" className="h-full w-full object-cover transition duration-500 group-hover:scale-105"/>
+                  <span className="absolute bottom-2 right-2 rounded-md bg-black/80 px-2 py-1 text-xs font-bold">VIDEO</span>
                   <button className="absolute inset-0 m-auto grid h-12 w-12 scale-90 place-items-center rounded-full bg-orange-500 text-white opacity-0 transition group-hover:scale-100 group-hover:opacity-100"><Play size={20} fill="currentColor"/></button>
                 </div>
                 <div className="flex gap-3 py-3">
                   <div className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-gradient-to-br from-orange-400 to-orange-700 text-xs font-black">T</div>
-                  <div className="min-w-0"><h3 className="truncate text-sm font-bold">{v.title}</h3><p className="mt-1 text-xs opacity-55">{v.creator} · {v.views} vues</p></div>
+                  <div className="min-w-0"><h3 className="truncate text-sm font-bold">{v.title}</h3><p className="mt-1 text-xs opacity-55">{v.creator || 'TafaTube Creator'} · {(v.views_count ?? v.views ?? 0).toLocaleString?.() || 0} vues</p></div>
                 </div>
               </article>
             ))}
@@ -101,6 +119,7 @@ function App() {
         </main>
       </div>
 
+      {selectedVideo && <VideoModal video={selectedVideo} onClose={()=>setSelectedVideo(null)} dark={dark}/>}
       {auth && <AuthModal type={auth} onClose={()=>setAuth(null)} onSwitch={()=>setAuth(auth==='login'?'register':'login')} dark={dark}/>}
       {uploadOpen && <UploadModal onClose={()=>setUploadOpen(false)} dark={dark}/>}
     </div>
@@ -128,17 +147,41 @@ function AuthModal({type,onClose,onSwitch,dark}:{type:'login'|'register',onClose
 export default App
 
 
+
 function UploadModal({onClose,dark}:{onClose:()=>void,dark:boolean}) {
-  const [fileName,setFileName]=useState('')
+  const [file,setFile]=useState<File|null>(null)
   const [title,setTitle]=useState('')
   const [description,setDescription]=useState('')
   const [category,setCategory]=useState('Général')
+  const [progress,setProgress]=useState(0)
   const [message,setMessage]=useState('')
+  const [busy,setBusy]=useState(false)
 
-  function submit(e:React.FormEvent){
+  async function submit(e:React.FormEvent){
     e.preventDefault()
-    if(!fileName || !title.trim()){ setMessage('Sélectionnez une vidéo et renseignez son titre.'); return }
-    setMessage('Formulaire prêt. Connectez Supabase Storage pour publier réellement la vidéo.')
+    if(!file || !title.trim()){ setMessage('Sélectionnez une vidéo et renseignez son titre.'); return }
+    if(!supabase){ setMessage('Supabase n’est pas encore configuré dans le fichier .env.'); return }
+    if(!file.type.startsWith('video/')){ setMessage('Seuls les fichiers vidéo sont acceptés.'); return }
+    setBusy(true); setMessage('')
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      if(!user){ setMessage('Connectez-vous pour publier une vidéo.'); setBusy(false); return }
+      const ext=file.name.split('.').pop()?.toLowerCase() || 'mp4'
+      const path=`${user.id}/${crypto.randomUUID()}.${ext}`
+      const { error:uploadError }=await supabase.storage.from('videos').upload(path,file,{contentType:file.type,upsert:false})
+      if(uploadError) throw uploadError
+      setProgress(70)
+      const { error:dbError }=await supabase.from('videos').insert({
+        owner_id:user.id,title:title.trim(),description,category,
+        storage_path:path,mime_type:file.type,file_size:file.size,visibility:'public'
+      })
+      if(dbError) throw dbError
+      setProgress(100)
+      setMessage('Vidéo publiée avec succès.')
+      setTimeout(onClose,700)
+    } catch(err:any) {
+      setMessage(err?.message || 'Impossible de publier la vidéo.')
+    } finally { setBusy(false) }
   }
 
   return <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-md">
@@ -151,18 +194,37 @@ function UploadModal({onClose,dark}:{onClose:()=>void,dark:boolean}) {
         <label className="block rounded-2xl border border-dashed border-orange-500/50 p-6 text-center">
           <Upload className="mx-auto mb-2 text-orange-500"/>
           <span className="block text-sm font-bold">Choisir une vidéo</span>
-          <span className="mt-1 block text-xs opacity-60">MP4, WebM ou MOV</span>
-          <input type="file" accept="video/*" className="mt-4 block w-full text-sm" onChange={e=>setFileName(e.target.files?.[0]?.name||'')}/>
-          {fileName && <p className="mt-2 text-xs text-orange-500">{fileName}</p>}
+          <span className="mt-1 block text-xs opacity-60">MP4, WebM, MOV...</span>
+          <input required type="file" accept="video/*" className="mt-4 block w-full text-sm" onChange={e=>setFile(e.target.files?.[0]||null)}/>
+          {file && <p className="mt-2 truncate text-xs text-orange-500">{file.name}</p>}
         </label>
         <input required value={title} onChange={e=>setTitle(e.target.value)} placeholder="Titre de la vidéo" className="w-full rounded-xl border border-white/10 bg-black/10 px-4 py-3 outline-none focus:border-orange-500"/>
         <textarea value={description} onChange={e=>setDescription(e.target.value)} placeholder="Description" rows={3} className="w-full rounded-xl border border-white/10 bg-black/10 px-4 py-3 outline-none focus:border-orange-500"/>
         <select value={category} onChange={e=>setCategory(e.target.value)} className="w-full rounded-xl border border-white/10 bg-black/10 px-4 py-3 outline-none">
           <option>Général</option><option>Musique</option><option>Éducation</option><option>Divertissement</option><option>Sport</option><option>Actualités</option>
         </select>
+        {busy && <div className="h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full bg-orange-500 transition-all" style={{width:`${progress}%`}}/></div>}
         {message && <p className="rounded-xl bg-orange-500/10 p-3 text-sm text-orange-500">{message}</p>}
-        <button className="w-full rounded-xl bg-orange-500 py-3 font-bold text-white">Préparer la publication</button>
+        <button disabled={busy} className="w-full rounded-xl bg-orange-500 py-3 font-bold text-white disabled:opacity-50">{busy?'Publication...':'Publier la vidéo'}</button>
       </div>
     </form>
+  </div>
+}
+
+function VideoModal({video,onClose,dark}:{video:any,onClose:()=>void,dark:boolean}) {
+  const url=supabase?.storage.from('videos').getPublicUrl(video.storage_path).data.publicUrl
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-3 md:p-8">
+    <div className={`w-full max-w-5xl overflow-hidden rounded-3xl border ${dark?'border-white/10 bg-[#10131a]':'border-slate-200 bg-white'}`}>
+      <div className="flex items-center justify-between p-3">
+        <div className="truncate px-2 text-sm font-bold">{video.title}</div>
+        <button onClick={onClose} className="rounded-xl p-2 hover:bg-white/10"><X size={20}/></button>
+      </div>
+      <video src={url} controls autoPlay playsInline className="max-h-[70vh] w-full bg-black"/>
+      <div className="p-4">
+        <h3 className="text-lg font-black">{video.title}</h3>
+        <p className="mt-2 text-sm opacity-60">{video.description}</p>
+        <a href={url} download className="mt-4 inline-flex items-center rounded-xl bg-orange-500 px-4 py-2 text-sm font-bold text-white">Télécharger la vidéo</a>
+      </div>
+    </div>
   </div>
 }
