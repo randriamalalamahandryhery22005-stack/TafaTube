@@ -1,18 +1,26 @@
-# TafaTube v3 — Real Video System
+# TafaTube v4 — Profile + Creator Studio
 
-## Setup
-1. `npm install`
-2. Copy `.env.example` to `.env`
-3. Add Supabase URL + anon key.
-4. Run `supabase/001_videos.sql`
-5. Run `supabase/002_storage_policies.sql`
-6. `npm run dev`
+This package adds the real profile system and creator dashboard on top of v3.
 
 ## Included
-- Real video upload to Supabase Storage (`videos` bucket)
-- Video metadata stored in `public.videos`
-- Public video feed
-- Video player modal
-- Download button
-- Authenticated owner folder policies
-- Only video MIME types accepted by the UI
+- `profiles` table linked to Supabase Auth
+- automatic profile creation trigger
+- profile RLS
+- real profile loading/updating
+- avatar upload to `avatars` bucket
+- Creator Studio
+- My Videos list
+- edit title/description/category/visibility
+- delete video + storage file
+- view counter RPC
+- dashboard statistics
+- owner-only management policies
+
+## Setup
+1. Keep the v3 project as the base.
+2. Replace/add the files from this ZIP.
+3. Run `supabase/003_profiles_creator_studio.sql` in Supabase SQL Editor.
+4. Refresh the app.
+
+### Important
+The SQL creates the `profiles` table and an `avatars` storage bucket. It does not remove existing tables.
