@@ -1,24 +1,22 @@
-# TafaTube v6 — Notifications Realtime
+# TafaTube v7 — PWA + Background Push Foundation
 
-## Added
-- Real `notifications` table
-- RLS: users only read/update/delete their own notifications
-- Automatic DB triggers for:
-  - Likes
-  - Comments
-  - Subscriptions
-- Realtime INSERT delivery
-- Unread counter
-- Mark one / mark all as read
-- Instant notification sound while the web app is open
-- Notification center UI
+Added:
+- PWA manifest
+- Service Worker
+- Background push handler
+- Notification click/focus
+- Push subscription table + RLS
+- UI to request permission and register a browser push subscription
 
-## Setup
-1. Keep v1-v5.
-2. Add `src/notifications.ts`.
-3. Add `src/components/NotificationsPanel.tsx`.
-4. Run `supabase/005_notifications_realtime.sql`.
-5. Open the panel from your notification/bell button.
+Setup:
+1. Keep v1-v6.
+2. Add these files.
+3. Run `supabase/006_push_subscriptions.sql`.
+4. Add `PushSettings` to Settings.
+5. Call `registerTafaTubePWA()` once in `src/main.tsx`.
+6. Configure `VITE_VAPID_PUBLIC_KEY`.
 
-## Important
-Browser/app-closed push notifications are a separate step. This v6 provides realtime + sound while the web app is active. True background push needs a Web Push/Service Worker setup and notification permission; that will be handled in a later step.
+IMPORTANT:
+This is the client/storage foundation. A server-side Supabase Edge Function is still required to send encrypted Web Push messages. Never expose the VAPID private key in frontend code. The next stage should add the Edge Function that reads `push_subscriptions` and sends pushes when `notifications` receives a new row.
+
+Also add real `icon-192.png` and `icon-512.png` to `public/`.
